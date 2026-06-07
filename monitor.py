@@ -112,7 +112,10 @@ class Monitor:
                 if not (needs_analysis or needs_timelapse):
                     continue
 
-                frame = self.camera.capture_frame() if self.camera else None
+                # Open, grab one frame, release immediately — this prevents
+                # OpenCV's internal capture thread from running continuously
+                # at 30 fps between monitoring intervals.
+                frame = self.camera.snapshot() if self.camera else None
 
                 if frame is None:
                     with self._lock:
@@ -192,11 +195,8 @@ class Monitor:
 
         finally:
             self.metrics.monitoring_active.set(0)
-            # Release the camera here so completion-triggered exits clean up
-            # without requiring an explicit stop() call from the main thread.
-            if self.camera:
-                self.camera.release()
-                self.camera = None
+            # snapshot() releases the camera after every frame, so nothing
+            # persistent to clean up here.
 
     def _send_alert(self, result: AnalysisResult, frame: np.ndarray) -> None:
         try:
@@ -228,10 +228,10 @@ class Monitor:
             idx = self.config.camera_index
 
         self.camera = CameraManager(idx)
-        try:
-            self.camera.open()
-        except RuntimeError as exc:
-            print(f"  Camera error: {exc}")
+        # Verify the camera is reachable before starting the thread
+        if self.camera.snapshot() is None:
+            print(f"  Camera error: cannot read from camera {idx}.")
+            self.camera = None
             return
 
         self.timelapse.reset_session()
