@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
+import cv2
 import numpy as np
 
 from config import Config
@@ -18,6 +19,17 @@ from timelapse import TimelapseManager
 
 CAPTURE_INTERVAL = 30       # seconds between analysis frames
 TIMELAPSE_INTERVAL = 60     # seconds between timelapse frames
+
+# Print-complete detection: stop after this many consecutive still frames
+NO_MOTION_LIMIT = 4         # 4 × 30 s = 2 minutes
+MOTION_THRESHOLD = 5.0      # mean absolute pixel difference (0–255) to count as "changed"
+
+
+def _frames_differ(f1: np.ndarray, f2: np.ndarray, threshold: float = MOTION_THRESHOLD) -> bool:
+    """Return True if the two frames differ significantly (motion / print activity)."""
+    gray1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY)
+    return float(cv2.absdiff(gray1, gray2).mean()) >= threshold
 
 
 def _clear_line() -> None:
@@ -65,6 +77,10 @@ class Monitor:
         self.failure_count = 0
         self.last_frame_time: Optional[datetime] = None
 
+        # Print-complete detection
+        self._no_motion_count: int = 0
+        self._prev_analysis_frame: Optional[np.ndarray] = None
+
     # ------------------------------------------------------------------ #
     # Monitoring loop                                                       #
     # ------------------------------------------------------------------ #
@@ -93,6 +109,36 @@ class Monitor:
                 # Analysis frame every 30 s
                 if now - last_capture >= CAPTURE_INTERVAL:
                     last_capture = now
+
+                    # ── Motion / completion detection ──────────────────── #
+                    if self._prev_analysis_frame is not None:
+                        if _frames_differ(frame, self._prev_analysis_frame):
+                            if self._no_motion_count > 0:
+                                print(
+                                    f"\n  [MOTION] Change detected — "
+                                    f"resetting idle counter (was {self._no_motion_count})"
+                                )
+                            self._no_motion_count = 0
+                        else:
+                            self._no_motion_count += 1
+                            print(
+                                f"\n  [MOTION] No change detected "
+                                f"({self._no_motion_count}/{NO_MOTION_LIMIT} frames)"
+                            )
+                            if self._no_motion_count >= NO_MOTION_LIMIT:
+                                with self._lock:
+                                    self.status = "Print Complete"
+                                    self._running = False
+                                print(
+                                    "\n  ✓ Print appears complete — "
+                                    "no change for 4 consecutive frames (2 min)."
+                                )
+                                self._send_completion(frame)
+                                _print_status(self)
+                                break
+                    self._prev_analysis_frame = frame.copy()
+
+                    # ── LLM analysis ───────────────────────────────────── #
                     with self._lock:
                         self.status = "Analyzing frame…"
                     try:
@@ -118,6 +164,8 @@ class Monitor:
                         ):
                             self.failure_count += 1
                             self.status = f"FAILURE DETECTED – {result.failure_type}"
+                            # A live failure resets the idle counter — print is not done
+                            self._no_motion_count = 0
                             self._send_alert(result, frame)
                         else:
                             self.status = "Monitoring…"
@@ -127,11 +175,23 @@ class Monitor:
                 time.sleep(1)
         finally:
             self.metrics.monitoring_active.set(0)
+            # Release the camera here so completion-triggered exits clean up
+            # without requiring an explicit stop() call from the main thread.
+            if self.camera:
+                self.camera.release()
+                self.camera = None
 
     def _send_alert(self, result: AnalysisResult, frame: np.ndarray) -> None:
         try:
             self.notifier.send_alert(result, frame)
             print(f"\n  [EMAIL] Alert sent to {self.config.smtp_recipient}")
+        except Exception as exc:
+            print(f"\n  [EMAIL ERROR] {exc}")
+
+    def _send_completion(self, frame: np.ndarray) -> None:
+        try:
+            self.notifier.send_completion(frame, self.frame_count)
+            print(f"\n  [EMAIL] Completion notice sent to {self.config.smtp_recipient}")
         except Exception as exc:
             print(f"\n  [EMAIL ERROR] {exc}")
 
@@ -163,6 +223,8 @@ class Monitor:
         self.failure_count = 0
         self.last_result = None
         self.status = "Monitoring…"
+        self._no_motion_count = 0
+        self._prev_analysis_frame = None
 
         self._monitor_thread = threading.Thread(
             target=self._monitoring_loop, daemon=True
@@ -172,15 +234,20 @@ class Monitor:
 
     def stop(self) -> None:
         if not self._running:
-            print("  Not currently monitoring.")
+            if self.status == "Print Complete":
+                print("  Print already marked as complete — monitor has stopped.")
+            else:
+                print("  Not currently monitoring.")
             return
         self._running = False
-        if self._monitor_thread:
+        if self._monitor_thread and self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=5)
+        # Camera may already be released by the monitoring thread's finally block
         if self.camera:
             self.camera.release()
             self.camera = None
-        self.status = "Idle"
+        if self.status != "Print Complete":
+            self.status = "Idle"
         print("  Monitoring stopped.")
 
     def compile_timelapse(self) -> None:

@@ -60,3 +60,37 @@ Please check your printer immediately.
             server.starttls()
             server.login(self.username, self.password)
             server.sendmail(self.sender, self.recipient, msg.as_string())
+
+    def send_completion(self, frame: np.ndarray, frames_analyzed: int) -> None:
+        """Send a print-complete notification with the final frame attached."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        subject = "[Ender3Monitor] 3D Print Appears Complete"
+
+        body = f"""3D Print Completion Notice
+
+Time: {timestamp}
+Frames Analyzed: {frames_analyzed}
+Status: No change detected for 4 consecutive frames (≥ 2 minutes)
+
+Your print appears to have finished. The monitor has been stopped automatically.
+A snapshot from the final frame is attached.
+"""
+
+        msg = MIMEMultipart()
+        msg["From"] = self.sender
+        msg["To"] = self.recipient
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain"))
+
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        img_bytes = buf.tobytes()
+        safe_ts = timestamp.replace(" ", "_").replace(":", "")
+        img_part = MIMEImage(img_bytes, name=f"complete_{safe_ts}.jpg")
+        img_part.add_header("Content-Disposition", "attachment", filename=img_part.get_filename())
+        msg.attach(img_part)
+
+        with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(self.username, self.password)
+            server.sendmail(self.sender, self.recipient, msg.as_string())
