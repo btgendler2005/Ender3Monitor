@@ -33,7 +33,8 @@ def _frames_differ(f1: np.ndarray, f2: np.ndarray, threshold: float = MOTION_THR
 
 
 def _clear_line() -> None:
-    print("\r" + " " * 80 + "\r", end="", flush=True)
+    # Clear current line + the description line below it
+    print("\r\033[K\033[A\033[K", end="", flush=True)
 
 
 def _header() -> None:
@@ -282,11 +283,14 @@ def _print_status(mon: Monitor) -> None:
     ts = mon.last_frame_time.strftime("%H:%M:%S") if mon.last_frame_time else "—"
     conf = f"{mon.last_result.confidence:.1%}" if mon.last_result else "—"
     ftype = mon.last_result.failure_type if mon.last_result else "—"
+    raw_desc = mon.last_result.description if mon.last_result else ""
+    desc = (raw_desc[:72] + "…") if len(raw_desc) > 73 else raw_desc
     _clear_line()
     print(
-        f"  [{ts}] Status: {mon.status:<30} | "
+        f"  [{ts}] Status: {mon.status:<22} | "
         f"Frames: {mon.frame_count:>4} | Failures: {mon.failure_count:>3} | "
-        f"Confidence: {conf} | Type: {ftype}"
+        f"Confidence: {conf} | Type: {ftype}\n"
+        f"           {desc}"
     )
 
 
