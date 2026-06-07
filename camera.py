@@ -108,24 +108,29 @@ class CameraManager:
             print(f"  One camera detected (index {idx}, {w}×{h}). Using it.")
             return idx
 
-        # Save a thumbnail per camera so the user can visually confirm
+        # Capture a thumbnail from each camera and open them all in Preview
+        # so the user can see exactly what each index sees before choosing.
         tmp = Path(tempfile.gettempdir())
         thumbs: dict[int, Path] = {}
         for idx, w, h in cameras:
             frame = _snapshot(idx)
             if frame is not None:
                 path = tmp / f"ender3monitor_cam{idx}.jpg"
-                cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 thumbs[idx] = path
-
-        # Best-effort device names from system_profiler on macOS
-        names: list[str] = _camera_names_macos() if sys.platform == "darwin" else []
 
         print("\nAvailable cameras:")
         for idx, w, h in cameras:
-            name = names[idx] if idx < len(names) else f"Camera {idx}"
-            thumb = f"  preview → open {thumbs[idx]}" if idx in thumbs else ""
-            print(f"  [{idx}] {name}  ({w}×{h}){thumb}")
+            print(f"  [{idx}] Camera {idx}  ({w}×{h})")
+
+        if thumbs:
+            print("\n  Opening preview snapshots so you can see which is which…")
+            for idx, path in sorted(thumbs.items()):
+                print(f"    Camera {idx} → {path}")
+            if sys.platform == "darwin":
+                subprocess.Popen(["open"] + [str(p) for p in sorted(thumbs.values())])
+            else:
+                print("  Open the files above to identify each camera.")
 
         print()
         indices = [idx for idx, _, _ in cameras]
