@@ -217,13 +217,15 @@ class Monitor:
     # Public control methods                                               #
     # ------------------------------------------------------------------ #
 
-    def start(self) -> None:
+    def start(self, camera_index: Optional[int] = None) -> None:
         if self._running:
             print("  Already monitoring.")
             return
 
-        # Camera setup
-        if self.config.camera_index == -1:
+        # Camera setup — caller can override (e.g. web UI passes chosen index)
+        if camera_index is not None:
+            idx = camera_index
+        elif self.config.camera_index == -1:
             idx = CameraManager.select_camera()
         else:
             idx = self.config.camera_index
