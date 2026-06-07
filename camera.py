@@ -1,3 +1,5 @@
+import contextlib
+import os
 import re
 import subprocess
 import sys
@@ -6,6 +8,20 @@ import cv2
 import numpy as np
 from pathlib import Path
 from typing import Optional
+
+
+@contextlib.contextmanager
+def _quiet():
+    """Suppress C-level stderr (OpenCV's 'out of bound' noise during camera scan)."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved = os.dup(2)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+    try:
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
 
 
 def _camera_names_macos() -> list[str]:
@@ -74,11 +90,12 @@ class CameraManager:
     def list_available_cameras(max_check: int = 5) -> list[tuple[int, int, int]]:
         """Return [(index, width, height), ...] for every readable camera."""
         available = []
-        for i in range(max_check):
-            frame = _snapshot(i)
-            if frame is not None:
-                h, w = frame.shape[:2]
-                available.append((i, w, h))
+        with _quiet():
+            for i in range(max_check):
+                frame = _snapshot(i)
+                if frame is not None:
+                    h, w = frame.shape[:2]
+                    available.append((i, w, h))
         return available
 
     @staticmethod
