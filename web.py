@@ -110,6 +110,20 @@ class StartBody(BaseModel):
     camera_index: Optional[int] = None
 
 
+async def _broadcast() -> None:
+    """Push current state to every connected browser immediately."""
+    if not _clients:
+        return
+    msg = json.dumps(_state())
+    dead: Set[WebSocket] = set()
+    for ws in list(_clients):
+        try:
+            await ws.send_text(msg)
+        except Exception:
+            dead.add(ws)
+    _clients.difference_update(dead)
+
+
 @app.post("/api/start")
 async def api_start(body: StartBody = StartBody()):
     if _monitor is None:
@@ -119,6 +133,7 @@ async def api_start(body: StartBody = StartBody()):
         cam = _config.camera_index
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, lambda: _monitor.start(camera_index=cam))
+    await _broadcast()
     return _state()
 
 
@@ -128,6 +143,7 @@ async def api_stop():
         return JSONResponse({"error": "not initialised"}, 503)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _monitor.stop)
+    await _broadcast()
     return _state()
 
 
@@ -612,20 +628,26 @@ async function doStart() {
   if (document.getElementById('cam-select-wrap').style.display !== 'none') {
     body.camera_index = selectedCam();
   }
-  await api('start', body);
+  const data = await api('start', body);
+  if (data) render(data);
 }
-async function doStop()      { await api('stop') }
+async function doStop() {
+  const data = await api('stop');
+  if (data) render(data);
+}
 async function doTimelapse() { await api('timelapse'); toast('Timelapse compiling…') }
 
+// Returns parsed JSON on success, null on error
 async function api(action, body = null) {
   try {
     const res = await fetch(`/api/${action}`, {
-      method:'POST',
-      headers: body ? {'Content-Type':'application/json'} : {},
+      method: 'POST',
+      headers: body ? {'Content-Type': 'application/json'} : {},
       body:    body ? JSON.stringify(body) : undefined,
     });
-    if (!res.ok) toast('Error: ' + res.statusText);
-  } catch(e) { toast('Network error') }
+    if (!res.ok) { toast('Error: ' + res.statusText); return null; }
+    return await res.json();
+  } catch(e) { toast('Network error'); return null; }
 }
 
 // ── Event log ──────────────────────────────────────────────────────────────
