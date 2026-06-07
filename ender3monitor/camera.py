@@ -64,10 +64,12 @@ def _snapshot(index: int, width: int = 1280, height: int = 720) -> Optional[np.n
 
 
 class CameraManager:
-    def __init__(self, camera_index: int = 0, width: int = 1280, height: int = 720):
+    def __init__(self, camera_index: int = 0, width: int = 1280, height: int = 720,
+                 flip: Optional[int] = None):
         self.camera_index = camera_index
         self._width = width
         self._height = height
+        self._flip = flip   # cv2.flip code: -1=180°, 0=vertical, 1=horizontal
 
     # ------------------------------------------------------------------ #
     # Snapshot capture (preferred for monitoring — no persistent thread)  #
@@ -80,7 +82,10 @@ class CameraManager:
         The camera is only active for the ~200 ms it takes to warm up and read
         one frame; the rest of the time no background thread is running.
         """
-        return _snapshot(self.camera_index, self._width, self._height)
+        frame = _snapshot(self.camera_index, self._width, self._height)
+        if frame is not None and self._flip is not None:
+            frame = cv2.flip(frame, self._flip)
+        return frame
 
     # ------------------------------------------------------------------ #
     # Camera discovery and selection                                        #

@@ -1,6 +1,28 @@
 import os
 from dataclasses import dataclass
+from typing import Optional
 from dotenv import load_dotenv
+
+
+def _parse_flip(value: str) -> Optional[int]:
+    """Convert CAMERA_FLIP env string to cv2.flip() code.
+
+    Values:
+      none / off / 0  → no flip
+      180             → rotate 180° (upside-down mount)  → cv2 code -1
+      vertical / v    → flip top-bottom                  → cv2 code  0
+      horizontal / h  → flip left-right                  → cv2 code  1
+    """
+    v = value.strip().lower()
+    if v in ("none", "off", "0", ""):
+        return None
+    if v in ("180", "-1", "rotate180"):
+        return -1
+    if v in ("vertical", "v"):
+        return 0
+    if v in ("horizontal", "h", "1"):
+        return 1
+    return None
 
 
 @dataclass
@@ -22,6 +44,7 @@ class Config:
 
     # Camera / capture
     camera_index: int           # -1 means prompt user to select
+    camera_flip: int            # cv2.flip code: -1=180°, 0=vertical, 1=horizontal, None=off
 
     # Metrics / output
     metrics_port: int
@@ -51,6 +74,7 @@ class Config:
             smtp_recipient=os.getenv("SMTP_RECIPIENT", ""),
             smtp_sender=os.getenv("SMTP_SENDER", os.getenv("SMTP_USERNAME", "")),
             camera_index=int(os.getenv("CAMERA_INDEX", "-1")),
+            camera_flip=_parse_flip(os.getenv("CAMERA_FLIP", "none")),
             metrics_port=int(os.getenv("METRICS_PORT", "8000")),
             timelapse_dir=os.getenv("TIMELAPSE_DIR", "timelapse_frames"),
             confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.70")),

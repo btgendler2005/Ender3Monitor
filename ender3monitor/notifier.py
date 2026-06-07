@@ -8,7 +8,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from analyzer import AnalysisResult
+from ender3monitor.analyzer import AnalysisResult
 
 
 class EmailNotifier:

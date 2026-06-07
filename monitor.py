@@ -239,7 +239,7 @@ class Monitor:
         else:
             idx = self.config.camera_index
 
-        self.camera = CameraManager(idx)
+        self.camera = CameraManager(idx, flip=self.config.camera_flip)
         # Verify the camera is reachable before starting the thread
         if self.camera.snapshot() is None:
             print(f"  Camera error: cannot read from camera {idx}.")
