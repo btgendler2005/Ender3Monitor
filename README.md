@@ -1,18 +1,24 @@
 # Ender3Monitor
 
-A 3D print failure detection system that watches your printer through a USB webcam, uses Claude AI vision to spot problems in real time, fires email alerts when something goes wrong, and records a timelapse of every print.
+A 3D print failure detection system that watches your printer through a USB webcam, uses AI vision to spot problems in real time, fires email alerts when something goes wrong, and records a timelapse of every print.
+
+Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, free, runs locally on your machine).
 
 ---
 
 ## Features
 
-- **Live failure detection** — captures a frame every 30 seconds and sends it to Claude for analysis
+- **Live failure detection** — captures a frame every 30 seconds and analyzes it with AI
 - **Detects six failure types** — spaghetti/stringing, layer shifts, bed detachment, stopped extrusion, nozzle collisions, and warping
-- **Email alerts** — sends an SMTP notification with the failure type, confidence score, and an attached snapshot the moment a problem is found
-- **Prometheus metrics** — exposes a `/metrics` endpoint for frames analyzed, failure counts by type, and confidence score trends
-- **Grafana dashboard** — pre-built JSON dashboard ready to import; shows failure rate, confidence trends, frame history, and failure type breakdown
-- **Timelapse** — saves a frame every 60 seconds and compiles them into an MP4 when monitoring stops
-- **Multi-camera support** — auto-detects all USB cameras and prompts you to pick one if there are multiple
+- **Frame pre-validation** — OpenCV checks brightness, contrast, and edge density before sending to AI; rejects dark, covered, or off-target frames without burning API calls
+- **Print completion detection** — automatically stops monitoring and sends a notification after 4 consecutive still frames (2 minutes of no movement)
+- **Email alerts** — SMTP notification with failure type, confidence score, and attached snapshot
+- **Web UI** — clean dark-theme dashboard at `http://localhost:8080`; start/stop monitoring, live camera feed, confidence gauge, AI observations, and event log
+- **CLI** — terminal interface with live status line if you prefer to run headless
+- **Prometheus metrics** — `/metrics` endpoint for frames analyzed, failure counts by type, and confidence score trends
+- **Grafana dashboard** — pre-built JSON ready to import
+- **Timelapse** — saves a frame every 60 seconds and compiles to MP4 on demand
+- **Multi-camera support** — auto-detects cameras, opens Preview snapshots so you can visually identify which index maps to your printer
 
 ---
 
@@ -20,9 +26,11 @@ A 3D print failure detection system that watches your printer through a USB webc
 
 - Python 3.11+
 - A USB webcam aimed at your printer
-- An [Anthropic API key](https://console.anthropic.com/) **or** [Ollama](https://ollama.com) running locally
-- An SMTP-capable email account (Gmail with an App Password works well)
-- Prometheus + Grafana (optional, for the metrics dashboard)
+- One of:
+  - [Anthropic API key](https://console.anthropic.com/) (Claude cloud backend)
+  - [Ollama](https://ollama.com) running locally (free, no API key)
+- An SMTP-capable email account for alerts (optional — Gmail works well)
+- Prometheus + Grafana (optional — for the metrics dashboard)
 
 ---
 
@@ -38,94 +46,145 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Copy the example env file and fill in your values:
+Copy the example and fill in your values:
 
 ```bash
 cp .env.example .env
 ```
 
-| Variable | Description |
-|---|---|
-| `ANALYZER_BACKEND` | `anthropic` (default) or `ollama` |
-| `ANTHROPIC_API_KEY` | Your Anthropic API key (only required for `anthropic` backend) |
-| `ANTHROPIC_MODEL` | Model to use (default: `claude-sonnet-4-6`) |
-| `OLLAMA_MODEL` | Ollama model to use (default: `llava:7b`) |
-| `OLLAMA_HOST` | Ollama server URL (default: `http://localhost:11434`) |
-| `SMTP_HOST` | SMTP server (e.g. `smtp.gmail.com`) |
-| `SMTP_PORT` | SMTP port (usually `587` for TLS) |
-| `SMTP_USERNAME` | Login username for your email account |
-| `SMTP_PASSWORD` | Email password or App Password |
-| `SMTP_SENDER` | From address for alert emails |
-| `SMTP_RECIPIENT` | Where to send alerts |
-| `CAMERA_INDEX` | Camera index to use (`-1` to pick at startup) |
-| `CONFIDENCE_THRESHOLD` | Alert threshold `0.0–1.0` (default `0.70`) |
-| `METRICS_PORT` | Port for Prometheus metrics (default `8000`) |
-| `TIMELAPSE_DIR` | Folder to store timelapse frames (default `timelapse_frames`) |
+| Variable | Default | Description |
+|---|---|---|
+| `ANALYZER_BACKEND` | `anthropic` | `anthropic` or `ollama` |
+| `ANTHROPIC_API_KEY` | — | Required when using the Anthropic backend |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Claude model to use |
+| `OLLAMA_MODEL` | `llava:7b` | Ollama vision model |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
+| `SMTP_HOST` | `smtp.gmail.com` | SMTP server |
+| `SMTP_PORT` | `587` | SMTP port |
+| `SMTP_USERNAME` | — | Email login |
+| `SMTP_PASSWORD` | — | Email password or App Password |
+| `SMTP_SENDER` | — | From address |
+| `SMTP_RECIPIENT` | — | Where to send alerts |
+| `CAMERA_INDEX` | `-1` | Camera to use; `-1` = prompt at startup |
+| `CONFIDENCE_THRESHOLD` | `0.70` | Alert when confidence ≥ this value |
+| `METRICS_PORT` | `8000` | Prometheus metrics port |
+| `TIMELAPSE_DIR` | `timelapse_frames` | Where to save timelapse frames |
 
-### Ollama setup (free, runs locally)
+---
 
-```bash
-# Install Ollama: https://ollama.com
-ollama pull llava:7b        # ~4.1 GB — recommended for 8 GB RAM machines
+## Choosing an AI backend
+
+### Option A — Anthropic (Claude)
+
+Best accuracy. Requires an API key and costs ~$0.40–1.00/hr depending on resolution.
+
+```
+ANALYZER_BACKEND=anthropic
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Then in `.env`:
+### Option B — Ollama (free, local)
 
+Runs entirely on your machine — no API key, no ongoing cost.
+
+**Install Ollama:**
+```bash
+# macOS
+brew install ollama
+brew services start ollama
+
+# or download from https://ollama.com
+```
+
+**Pull the recommended model:**
+```bash
+ollama pull llava:7b    # ~4.1 GB download
+```
+
+**Set in `.env`:**
 ```
 ANALYZER_BACKEND=ollama
 OLLAMA_MODEL=llava:7b
 ```
 
-**M2 MacBook Air (8 GB) model guide:**
+**Model guide for 8 GB RAM (e.g. M2 MacBook Air):**
 
-| Model | Size | Fits on 8 GB? | Quality |
+| Model | Size | Fits in 8 GB? | Quality |
 |---|---|---|---|
 | `llava:7b` | ~4.1 GB | ✅ Recommended | Good |
 | `moondream` | ~1.4 GB | ✅ Easily | Limited |
 | `llama3.2-vision:11b` | ~6.2 GB | ⚠️ Will swap | Better |
 
-`llava:7b` is the best balance for 8 GB — fits alongside macOS overhead and
-runs on the M2 GPU via Metal. Consider raising `CONFIDENCE_THRESHOLD` to `0.80`
-with local models, as they can be overconfident compared to Claude.
+`llava:7b` is the best balance — fits alongside macOS overhead and uses the M2 GPU via Metal. Consider raising `CONFIDENCE_THRESHOLD` to `0.80` with Ollama, as local models can be overconfident.
+
+---
+
+## Email alerts (optional)
+
+Alerts are sent via SMTP when a failure is detected above the confidence threshold, and again when a print is detected as complete.
 
 ### Gmail setup
 
 Gmail requires an App Password when 2FA is enabled:
+
 1. Go to **Google Account → Security → 2-Step Verification → App passwords**
 2. Generate a password for "Mail"
-3. Use that as `SMTP_PASSWORD`
+3. Use that 16-character password as `SMTP_PASSWORD`
+4. Set `SMTP_HOST=smtp.gmail.com` and `SMTP_PORT=587`
 
 ---
 
-## Usage
+## Running the app
+
+### Web UI (recommended)
+
+```bash
+python web.py
+```
+
+Open **http://localhost:8080** in your browser. The dashboard shows:
+- Live camera snapshot (refreshes every 10 seconds)
+- Confidence gauge with colour coding (green → amber → red)
+- Current failure type and AI observation
+- Frame and failure counters
+- Start / Stop / Compile Timelapse buttons
+- Event log of every analysed frame
+
+### CLI
 
 ```bash
 python monitor.py
 ```
 
-The terminal interface accepts these commands:
-
 | Command | Action |
 |---|---|
 | `start` | Open the camera and begin monitoring |
-| `stop` | Stop monitoring and release the camera |
+| `stop` | Stop monitoring |
 | `timelapse` | Compile saved frames into an MP4 |
-| `status` | Print current status, last result, and frame count |
-| `quit` | Stop monitoring and exit |
+| `status` | Print current status and last result |
+| `quit` | Stop and exit |
 
-While monitoring, a live status line updates after every analysis:
+Live status line while monitoring:
+```
+  [14:23:01] Status: Monitoring…            | Frames:   12 | Failures:   0 | Confidence: 8.3% | Type: none
+             Print progressing normally. First layer adhering well to bed.
+```
 
-```
-  [14:23:01] Status: Monitoring…              | Frames:   12 | Failures:   0 | Confidence: 8.3% | Type: none
-```
+### Camera selection
+
+If `CAMERA_INDEX=-1` (the default), the app will detect all cameras, save a snapshot thumbnail from each to `/tmp/`, and open them in Preview (macOS) so you can see which index maps to which physical camera. Set `CAMERA_INDEX` in `.env` once confirmed to skip the prompt on future runs.
 
 ---
 
-## Prometheus & Grafana
+## Prometheus & Grafana (optional)
 
-### Prometheus
+### 1. Install Prometheus
 
-Add this job to your `prometheus.yml`:
+```bash
+brew install prometheus
+```
+
+Edit `/opt/homebrew/etc/prometheus.yml` and add the scrape job:
 
 ```yaml
 scrape_configs:
@@ -134,57 +193,83 @@ scrape_configs:
       - targets: ['localhost:8000']
 ```
 
-Metrics exposed:
+Start Prometheus:
+```bash
+brew services start prometheus
+# Dashboard at http://localhost:9090
+```
+
+### 2. Install Grafana
+
+```bash
+brew install grafana
+brew services start grafana
+# Dashboard at http://localhost:3000
+# Default login: admin / admin
+```
+
+### 3. Connect Grafana to Prometheus
+
+1. Open **http://localhost:3000**
+2. Go to **Connections → Data Sources → Add data source**
+3. Choose **Prometheus**
+4. Set URL to `http://localhost:9090`
+5. Click **Save & Test**
+
+### 4. Import the dashboard
+
+1. Go to **Dashboards → Import**
+2. Upload `grafana_dashboard.json` from this repo
+3. Select your Prometheus data source when prompted
+4. Click **Import**
+
+### Metrics exposed
 
 | Metric | Type | Description |
 |---|---|---|
 | `printer_frames_analyzed_total` | Counter | Total frames sent for analysis |
 | `printer_failures_detected_total{failure_type}` | Counter | Failures detected, labelled by type |
 | `printer_last_confidence_score` | Gauge | Confidence score from the most recent frame |
-| `printer_confidence_score_histogram` | Histogram | Distribution of confidence scores over time |
+| `printer_confidence_score_histogram` | Histogram | Distribution of confidence scores |
 | `printer_monitoring_active` | Gauge | `1` while monitoring is running, `0` otherwise |
 
-### Grafana
-
-1. In Grafana, go to **Dashboards → Import**
-2. Upload `grafana_dashboard.json` from this repo
-3. Select your Prometheus data source when prompted
-
-The dashboard includes:
-- Confidence score over time with a 70% alert threshold line
-- Failure rate per minute broken down by failure type
-- Frame analysis rate
-- Failure type pie chart
-- Confidence score percentile trends (p50 / p90 / p95)
+You can verify the metrics endpoint is working before setting up Prometheus:
+```bash
+curl http://localhost:8000/metrics
+```
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
 Ender3Monitor/
-├── monitor.py           # Entry point — terminal UI and monitoring loop
-├── camera.py            # USB webcam management and frame capture
-├── analyzer.py          # Claude vision API integration and response parsing
-├── notifier.py          # SMTP email alerts with attached failure snapshot
-├── metrics.py           # Prometheus metrics definitions and server
-├── timelapse.py         # Frame saving and MP4 compilation
-├── config.py            # Configuration loaded from .env
-├── requirements.txt     # Python dependencies
-├── grafana_dashboard.json  # Pre-built Grafana dashboard
-└── .env.example         # Environment variable template
+├── monitor.py              # CLI entry point — terminal UI and monitoring loop
+├── web.py                  # Web UI entry point — FastAPI server at :8080
+├── camera.py               # Camera detection, snapshot capture
+├── analyzer.py             # AI analysis — pre-checks + Anthropic/Ollama backends
+├── notifier.py             # SMTP email alerts
+├── metrics.py              # Prometheus metrics
+├── timelapse.py            # Frame saving and MP4 compilation
+├── config.py               # Configuration loaded from .env
+├── requirements.txt        # Python dependencies
+├── grafana_dashboard.json  # Pre-built Grafana dashboard (9 panels)
+├── .env.example            # Environment variable template
+└── .gitignore              # Excludes .env, timelapse output, caches
 ```
 
 ---
 
-## How It Works
+## How it works
 
-1. `monitor.py` starts a background thread that captures frames from the webcam
-2. Every **30 seconds**, a frame is encoded as JPEG and sent to `claude-sonnet-4-6` with a structured prompt asking it to identify failure types and return a confidence score as JSON
-3. Every **60 seconds**, a frame is saved to disk for the timelapse
-4. If the returned confidence score is at or above `CONFIDENCE_THRESHOLD` (default 70%), an email alert is sent with the frame attached
-5. All results are recorded to Prometheus metrics in real time
-6. When `stop` is called (or the session ends), the timelapse frames can be compiled into an MP4 with the `timelapse` command
+1. A background thread wakes up every 30 seconds
+2. A single frame is captured from the webcam, then the camera is immediately released (prevents OpenCV's background thread from running continuously)
+3. Three fast OpenCV pre-checks run locally (brightness, contrast, edge density) — frames that are too dark, featureless, or not aimed at a printer are rejected without an API call
+4. Valid frames are sent to Claude or llava:7b with a structured prompt; the model returns JSON with `failure_detected`, `failure_type`, `confidence`, and `description`
+5. If confidence ≥ `CONFIDENCE_THRESHOLD` and a real failure is detected, an email alert is sent with the frame attached
+6. If 4 consecutive frames show no significant change (2 minutes of stillness), the print is marked complete, a notification is sent, and monitoring stops automatically
+7. Every 60 seconds a frame is saved for the timelapse
+8. All results are pushed to Prometheus metrics in real time and broadcast to connected web UI clients via WebSocket
 
 ---
 
