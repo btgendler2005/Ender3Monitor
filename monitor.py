@@ -92,22 +92,40 @@ class Monitor:
         self.metrics.monitoring_active.set(1)
         try:
             while self._running:
+                # Sleep until the next event (analysis or timelapse) rather than
+                # waking every second and grabbing a frame we'll discard.
                 now = time.time()
+                next_event = min(
+                    last_capture + CAPTURE_INTERVAL,
+                    last_timelapse + TIMELAPSE_INTERVAL,
+                )
+                sleep_for = max(1.0, next_event - now)
+                time.sleep(sleep_for)
+
+                if not self._running:
+                    break
+
+                now = time.time()
+                needs_analysis = now - last_capture >= CAPTURE_INTERVAL
+                needs_timelapse = now - last_timelapse >= TIMELAPSE_INTERVAL
+
+                if not (needs_analysis or needs_timelapse):
+                    continue
+
                 frame = self.camera.capture_frame() if self.camera else None
 
                 if frame is None:
                     with self._lock:
                         self.status = "Camera error – no frame"
-                    time.sleep(2)
                     continue
 
                 # Timelapse frame every 60 s
-                if now - last_timelapse >= TIMELAPSE_INTERVAL:
+                if needs_timelapse:
                     self.timelapse.save_frame(frame)
                     last_timelapse = now
 
                 # Analysis frame every 30 s
-                if now - last_capture >= CAPTURE_INTERVAL:
+                if needs_analysis:
                     last_capture = now
 
                     # ── Motion / completion detection ──────────────────── #
@@ -172,7 +190,6 @@ class Monitor:
 
                     _print_status(self)
 
-                time.sleep(1)
         finally:
             self.metrics.monitoring_active.set(0)
             # Release the camera here so completion-triggered exits clean up
