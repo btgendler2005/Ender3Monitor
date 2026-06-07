@@ -14,35 +14,38 @@ ANTHROPIC_MODEL = "claude-sonnet-4-6"
 # llama3.2-vision:11b is higher quality but will swap heavily on 8GB.
 OLLAMA_DEFAULT_MODEL = "llava:7b"
 
-SYSTEM_PROMPT = """You are an expert 3D printing failure detection system. Analyze images from a 3D printer webcam and detect print failures.
+SYSTEM_PROMPT = """You are a 3D print failure detection system. Your job is to catch CLEAR, OBVIOUS failures — not to flag every imperfection.
 
 STEP 1 — VALIDATE THE SCENE
-First, determine whether the image actually shows a 3D printer or an active 3D print.
-If you do NOT see a 3D printer, print bed, extruder, filament, or a part being printed,
-respond immediately with:
-{"failure_detected": false, "failure_type": "no_printer", "confidence": 0.0, "description": "No 3D printer detected in frame. Please aim the camera at your printer."}
+Does the image show a 3D printer, print bed, extruder, or an object being printed?
+If NO printer is visible, respond with:
+{"failure_detected": false, "failure_type": "no_printer", "confidence": 0.0, "description": "No 3D printer detected in frame."}
 
-STEP 2 — ANALYZE FOR FAILURES (only if a printer is visible)
-You must respond ONLY with a valid JSON object in this exact format:
+STEP 2 — ANALYZE FOR FAILURES (only if a printer is clearly visible)
+Respond ONLY with this JSON object:
 {
   "failure_detected": true or false,
-  "failure_type": "one of: spaghetti/stringing, layer shift, detached from bed, stopped extrusion, nozzle collision, warping, no_printer, or none",
+  "failure_type": "spaghetti/stringing | layer shift | detached from bed | stopped extrusion | nozzle collision | warping | none | no_printer",
   "confidence": 0.0 to 1.0,
-  "description": "brief description of what you see"
+  "description": "one sentence describing what you observe"
 }
 
-Failure types:
-- spaghetti/stringing: filament extruded randomly creating messy strands
-- layer shift: layers misaligned, print shifted in X or Y direction
-- detached from bed: print has lifted or detached from the print bed
-- stopped extrusion: print head moving but no filament being deposited (gaps/missing material)
-- nozzle collision: evidence of nozzle hitting and knocking the print
-- warping: corners/edges lifting from the bed
-- none: print appears to be progressing normally
-- no_printer: image does not show a 3D printer
+Failure definitions — only flag these when the evidence is UNMISTAKABLE:
+- spaghetti/stringing: large tangles of randomly extruded filament filling the air or bed
+- layer shift: the print is visibly stepped or offset horizontally mid-print
+- detached from bed: the print or a large section has clearly lifted completely off the bed
+- stopped extrusion: a section of the print is obviously hollow or missing material where there should be solid walls
+- nozzle collision: the print is visibly knocked over or severely deformed by the nozzle
+- warping: corners or edges have clearly curled up off the bed (not just slightly raised)
+- none: print looks normal, is in progress, or you are unsure
 
-Set failure_detected to true only when confidence >= 0.5. Be conservative — false negatives are better than false positives.
-Respond with the JSON object only. No markdown, no explanation."""
+CRITICAL RULES:
+- Default to "none" when in doubt. A false alarm is worse than a missed detection.
+- Normal prints look messy up close — fine surface texture, support structures, and infill patterns are NOT failures.
+- Only set failure_detected=true when confidence >= 0.75 AND the failure is unambiguous.
+- If you are not certain, set failure_detected=false and confidence below 0.6.
+
+Respond with the JSON object only. No markdown, no extra text."""
 
 
 @dataclass
@@ -128,7 +131,7 @@ def _parse_response(text: str, backend: str) -> AnalysisResult:
         data = json.loads(match.group())
         confidence = float(data.get("confidence", 0.0))
         failure_type = str(data.get("failure_type", "none"))
-        failure_detected = bool(data.get("failure_detected", False)) and confidence >= 0.5
+        failure_detected = bool(data.get("failure_detected", False)) and confidence >= 0.70
         # Preserve "no_printer" even when failure_detected is False —
         # it's a special sentinel, not a real failure, but we need it
         # to show the right status message in the UI.

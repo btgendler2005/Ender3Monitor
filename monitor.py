@@ -24,6 +24,10 @@ TIMELAPSE_INTERVAL = 60     # seconds between timelapse frames
 NO_MOTION_LIMIT = 4         # 4 × 30 s = 2 minutes
 MOTION_THRESHOLD = 5.0      # mean absolute pixel difference (0–255) to count as "changed"
 
+# Failure confirmation: require this many consecutive frames before alerting.
+# Eliminates single-frame false positives — a real failure persists.
+FAILURE_CONFIRM_FRAMES = 2  # 2 × 30 s = 1 minute of sustained failure
+
 
 def _frames_differ(f1: np.ndarray, f2: np.ndarray, threshold: float = MOTION_THRESHOLD) -> bool:
     """Return True if the two frames differ significantly (motion / print activity)."""
@@ -82,6 +86,10 @@ class Monitor:
         # Print-complete detection
         self._no_motion_count: int = 0
         self._prev_analysis_frame: Optional[np.ndarray] = None
+
+        # Failure confirmation — require consecutive frames before alerting
+        self._pending_failure_type: Optional[str] = None
+        self._pending_failure_count: int = 0
 
     # ------------------------------------------------------------------ #
     # Monitoring loop                                                       #
@@ -185,20 +193,39 @@ class Monitor:
 
                         # Only update status if stop() hasn't already set it to Idle
                         if self._running:
-                            if (
+                            is_failure = (
                                 result.failure_detected
                                 and result.confidence >= self.config.confidence_threshold
-                                and result.failure_type != "no_printer"
-                            ):
-                                self.failure_count += 1
-                                self.status = f"FAILURE DETECTED – {result.failure_type}"
-                                # A live failure resets the idle counter — print is not done
-                                self._no_motion_count = 0
-                                self._send_alert(result, frame)
-                            elif result.failure_type == "no_printer":
-                                self.status = "Monitoring… (no printer in frame)"
+                                and result.failure_type not in ("no_printer", "none")
+                            )
+                            if is_failure:
+                                # Track consecutive frames with the same failure type
+                                if result.failure_type == self._pending_failure_type:
+                                    self._pending_failure_count += 1
+                                else:
+                                    self._pending_failure_type = result.failure_type
+                                    self._pending_failure_count = 1
+
+                                self.status = (
+                                    f"Possible failure – {result.failure_type} "
+                                    f"({self._pending_failure_count}/{FAILURE_CONFIRM_FRAMES})"
+                                    if self._pending_failure_count < FAILURE_CONFIRM_FRAMES
+                                    else f"FAILURE DETECTED – {result.failure_type}"
+                                )
+
+                                if self._pending_failure_count == FAILURE_CONFIRM_FRAMES:
+                                    # Confirmed — alert once per incident
+                                    self.failure_count += 1
+                                    self._no_motion_count = 0
+                                    self._send_alert(result, frame)
                             else:
-                                self.status = "Monitoring…"
+                                # Clean frame — reset pending failure
+                                self._pending_failure_type = None
+                                self._pending_failure_count = 0
+                                if result.failure_type == "no_printer":
+                                    self.status = "Monitoring… (no printer in frame)"
+                                else:
+                                    self.status = "Monitoring…"
 
                     if self._running:
                         _print_status(self)
@@ -255,6 +282,8 @@ class Monitor:
         self.status = "Monitoring…"
         self._no_motion_count = 0
         self._prev_analysis_frame = None
+        self._pending_failure_type = None
+        self._pending_failure_count = 0
 
         self._monitor_thread = threading.Thread(
             target=self._monitoring_loop, daemon=True
