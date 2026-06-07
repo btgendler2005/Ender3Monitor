@@ -20,7 +20,7 @@ A 3D print failure detection system that watches your printer through a USB webc
 
 - Python 3.11+
 - A USB webcam aimed at your printer
-- An [Anthropic API key](https://console.anthropic.com/)
+- An [Anthropic API key](https://console.anthropic.com/) **or** [Ollama](https://ollama.com) running locally
 - An SMTP-capable email account (Gmail with an App Password works well)
 - Prometheus + Grafana (optional, for the metrics dashboard)
 
@@ -46,7 +46,11 @@ cp .env.example .env
 
 | Variable | Description |
 |---|---|
-| `ANTHROPIC_API_KEY` | Your Anthropic API key |
+| `ANALYZER_BACKEND` | `anthropic` (default) or `ollama` |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key (only required for `anthropic` backend) |
+| `ANTHROPIC_MODEL` | Model to use (default: `claude-sonnet-4-6`) |
+| `OLLAMA_MODEL` | Ollama model to use (default: `llava:7b`) |
+| `OLLAMA_HOST` | Ollama server URL (default: `http://localhost:11434`) |
 | `SMTP_HOST` | SMTP server (e.g. `smtp.gmail.com`) |
 | `SMTP_PORT` | SMTP port (usually `587` for TLS) |
 | `SMTP_USERNAME` | Login username for your email account |
@@ -57,6 +61,32 @@ cp .env.example .env
 | `CONFIDENCE_THRESHOLD` | Alert threshold `0.0–1.0` (default `0.70`) |
 | `METRICS_PORT` | Port for Prometheus metrics (default `8000`) |
 | `TIMELAPSE_DIR` | Folder to store timelapse frames (default `timelapse_frames`) |
+
+### Ollama setup (free, runs locally)
+
+```bash
+# Install Ollama: https://ollama.com
+ollama pull llava:7b        # ~4.1 GB — recommended for 8 GB RAM machines
+```
+
+Then in `.env`:
+
+```
+ANALYZER_BACKEND=ollama
+OLLAMA_MODEL=llava:7b
+```
+
+**M2 MacBook Air (8 GB) model guide:**
+
+| Model | Size | Fits on 8 GB? | Quality |
+|---|---|---|---|
+| `llava:7b` | ~4.1 GB | ✅ Recommended | Good |
+| `moondream` | ~1.4 GB | ✅ Easily | Limited |
+| `llama3.2-vision:11b` | ~6.2 GB | ⚠️ Will swap | Better |
+
+`llava:7b` is the best balance for 8 GB — fits alongside macOS overhead and
+runs on the M2 GPU via Metal. Consider raising `CONFIDENCE_THRESHOLD` to `0.80`
+with local models, as they can be overconfident compared to Claude.
 
 ### Gmail setup
 

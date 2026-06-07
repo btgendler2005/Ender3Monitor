@@ -11,7 +11,7 @@ import numpy as np
 
 from config import Config
 from camera import CameraManager
-from analyzer import PrintAnalyzer, AnalysisResult
+from analyzer import create_analyzer, AnalysisResult
 from notifier import EmailNotifier
 from metrics import MonitorMetrics
 from timelapse import TimelapseManager
@@ -36,7 +36,13 @@ class Monitor:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.camera: Optional[CameraManager] = None
-        self.analyzer = PrintAnalyzer(config.anthropic_api_key)
+        self.analyzer = create_analyzer(
+            backend=config.analyzer_backend,
+            anthropic_api_key=config.anthropic_api_key,
+            anthropic_model=config.anthropic_model,
+            ollama_model=config.ollama_model,
+            ollama_host=config.ollama_host,
+        )
         self.notifier = EmailNotifier(
             smtp_host=config.smtp_host,
             smtp_port=config.smtp_port,

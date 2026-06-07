@@ -3,22 +3,16 @@ import json
 import re
 import cv2
 import numpy as np
-import anthropic
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Protocol
 
-# claude-sonnet-4-6 is the current model ID for what was formerly called claude-sonnet-4-20250514
-MODEL_ID = "claude-sonnet-4-6"
+# Anthropic model — claude-sonnet-4-6 is the current ID
+# (formerly advertised as claude-sonnet-4-20250514, which is deprecated)
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
-FAILURE_TYPES = [
-    "spaghetti/stringing",
-    "layer shift",
-    "detached from bed",
-    "stopped extrusion",
-    "nozzle collision",
-    "warping",
-    "none",
-]
+# Default Ollama model — llava:7b is the best fit for 8GB M2 MacBook Air.
+# llama3.2-vision:11b is higher quality but will swap heavily on 8GB.
+OLLAMA_DEFAULT_MODEL = "llava:7b"
 
 SYSTEM_PROMPT = """You are an expert 3D printing failure detection system. Analyze images from a 3D printer webcam and detect print failures.
 
@@ -40,7 +34,7 @@ Failure types:
 - none: print appears to be progressing normally
 
 Set failure_detected to true only when confidence >= 0.5. Be conservative — false negatives are better than false positives.
-"""
+Respond with the JSON object only. No markdown, no explanation."""
 
 
 @dataclass
@@ -49,28 +43,61 @@ class AnalysisResult:
     failure_type: str
     confidence: float
     description: str
+    backend: str = "unknown"
 
     @property
     def summary(self) -> str:
         if not self.failure_detected:
-            return f"OK ({self.confidence:.0%} confidence)"
-        return f"FAILURE: {self.failure_type} ({self.confidence:.0%} confidence)"
+            return f"OK ({self.confidence:.0%} confidence) [{self.backend}]"
+        return f"FAILURE: {self.failure_type} ({self.confidence:.0%} confidence) [{self.backend}]"
 
 
-def _encode_frame(frame: np.ndarray) -> str:
+# ------------------------------------------------------------------ #
+# Shared helpers                                                        #
+# ------------------------------------------------------------------ #
+
+def _encode_frame_b64(frame: np.ndarray) -> str:
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return base64.standard_b64encode(buf.tobytes()).decode("utf-8")
 
 
-class PrintAnalyzer:
-    def __init__(self, api_key: str):
-        self.client = anthropic.Anthropic(api_key=api_key)
+def _parse_response(text: str, backend: str) -> AnalysisResult:
+    """Extract and parse the JSON blob from a model response."""
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return AnalysisResult(False, "none", 0.0, f"No JSON in response: {text[:120]}", backend)
+    try:
+        data = json.loads(match.group())
+        confidence = float(data.get("confidence", 0.0))
+        failure_type = str(data.get("failure_type", "none"))
+        failure_detected = bool(data.get("failure_detected", False)) and confidence >= 0.5
+        return AnalysisResult(
+            failure_detected=failure_detected,
+            failure_type=failure_type if failure_detected else "none",
+            confidence=confidence,
+            description=str(data.get("description", "")),
+            backend=backend,
+        )
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return AnalysisResult(False, "none", 0.0, f"Parse error ({exc}): {text[:120]}", backend)
+
+
+# ------------------------------------------------------------------ #
+# Anthropic backend                                                    #
+# ------------------------------------------------------------------ #
+
+class AnthropicAnalyzer:
+    """Uses claude-sonnet-4-6 via the Anthropic API."""
+
+    def __init__(self, api_key: str, model: str = ANTHROPIC_MODEL) -> None:
+        import anthropic
+        self._client = anthropic.Anthropic(api_key=api_key)
+        self._model = model
 
     def analyze_frame(self, frame: np.ndarray) -> AnalysisResult:
-        image_data = _encode_frame(frame)
-
-        response = self.client.messages.create(
-            model=MODEL_ID,
+        image_data = _encode_frame_b64(frame)
+        response = self._client.messages.create(
+            model=self._model,
             max_tokens=512,
             system=SYSTEM_PROMPT,
             messages=[
@@ -93,28 +120,86 @@ class PrintAnalyzer:
                 }
             ],
         )
+        raw_text = next((b.text for b in response.content if b.type == "text"), "{}")
+        return _parse_response(raw_text, backend=f"anthropic/{self._model}")
 
-        raw_text = next(
-            (b.text for b in response.content if b.type == "text"), "{}"
+
+# ------------------------------------------------------------------ #
+# Ollama backend                                                        #
+# ------------------------------------------------------------------ #
+
+class OllamaAnalyzer:
+    """Uses a local vision model via Ollama.
+
+    Recommended for 8GB M2 MacBook Air: llava:7b (~4.1 GB, runs on Metal).
+    Avoid llama3.2-vision:11b on 8GB — it will swap heavily and be very slow.
+
+    Pull the model first:  ollama pull llava:7b
+    """
+
+    def __init__(self, model: str = OLLAMA_DEFAULT_MODEL, host: str = "http://localhost:11434") -> None:
+        try:
+            import ollama
+            self._ollama = ollama
+        except ImportError as exc:
+            raise ImportError(
+                "Ollama Python package not installed. Run: pip install ollama"
+            ) from exc
+
+        self._model = model
+        self._host = host
+        # Override host if non-default
+        if host != "http://localhost:11434":
+            import os
+            os.environ.setdefault("OLLAMA_HOST", host)
+
+    def analyze_frame(self, frame: np.ndarray) -> AnalysisResult:
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        image_bytes = buf.tobytes()
+
+        # Combine system prompt into the user message — many llava builds
+        # ignore a separate system role, so embedding it is more reliable.
+        prompt = f"{SYSTEM_PROMPT}\n\nAnalyze this 3D printer image for failures. Respond with the JSON object only."
+
+        response = self._ollama.chat(
+            model=self._model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                    "images": [image_bytes],
+                }
+            ],
         )
-        return _parse_response(raw_text)
+        raw_text = response["message"]["content"]
+        return _parse_response(raw_text, backend=f"ollama/{self._model}")
 
 
-def _parse_response(text: str) -> AnalysisResult:
-    # Extract JSON even if the model wraps it in markdown fences
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        return AnalysisResult(False, "none", 0.0, "Failed to parse response")
-    try:
-        data = json.loads(match.group())
-        confidence = float(data.get("confidence", 0.0))
-        failure_type = str(data.get("failure_type", "none"))
-        failure_detected = bool(data.get("failure_detected", False)) and confidence >= 0.5
-        return AnalysisResult(
-            failure_detected=failure_detected,
-            failure_type=failure_type if failure_detected else "none",
-            confidence=confidence,
-            description=str(data.get("description", "")),
-        )
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return AnalysisResult(False, "none", 0.0, f"Parse error: {text[:120]}")
+# ------------------------------------------------------------------ #
+# Factory — call this instead of instantiating directly               #
+# ------------------------------------------------------------------ #
+
+def create_analyzer(
+    backend: str = "anthropic",
+    anthropic_api_key: str = "",
+    anthropic_model: str = ANTHROPIC_MODEL,
+    ollama_model: str = OLLAMA_DEFAULT_MODEL,
+    ollama_host: str = "http://localhost:11434",
+):
+    """Return the right analyzer based on the configured backend.
+
+    backend: "anthropic" | "ollama"
+    """
+    backend = backend.lower().strip()
+    if backend == "ollama":
+        return OllamaAnalyzer(model=ollama_model, host=ollama_host)
+    if backend == "anthropic":
+        if not anthropic_api_key:
+            raise ValueError("ANTHROPIC_API_KEY is required when using the anthropic backend.")
+        return AnthropicAnalyzer(api_key=anthropic_api_key, model=anthropic_model)
+    raise ValueError(f"Unknown ANALYZER_BACKEND '{backend}'. Choose 'anthropic' or 'ollama'.")
+
+
+# Legacy alias so existing code that does `PrintAnalyzer(api_key=...)` still works.
+class PrintAnalyzer(AnthropicAnalyzer):
+    pass
