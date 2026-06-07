@@ -219,7 +219,7 @@ brew services start grafana
 ### 4. Import the dashboard
 
 1. Go to **Dashboards → Import**
-2. Upload `grafana_dashboard.json` from this repo
+2. Upload `grafana/dashboard.json` from this repo
 3. Select your Prometheus data source when prompted
 4. Click **Import**
 
@@ -244,18 +244,23 @@ curl http://localhost:8000/metrics
 
 ```
 Ender3Monitor/
-├── monitor.py              # CLI entry point — terminal UI and monitoring loop
-├── web.py                  # Web UI entry point — FastAPI server at :8080
-├── camera.py               # Camera detection, snapshot capture
-├── analyzer.py             # AI analysis — pre-checks + Anthropic/Ollama backends
-├── notifier.py             # SMTP email alerts
-├── metrics.py              # Prometheus metrics
-├── timelapse.py            # Frame saving and MP4 compilation
-├── config.py               # Configuration loaded from .env
+├── ender3monitor/          # Core package
+│   ├── __init__.py
+│   ├── analyzer.py         # AI analysis — pre-checks + Anthropic/Ollama backends
+│   ├── camera.py           # Camera detection and snapshot capture
+│   ├── config.py           # Configuration loaded from .env
+│   ├── metrics.py          # Prometheus metrics
+│   ├── notifier.py         # SMTP email alerts
+│   └── timelapse.py        # Frame saving and MP4 compilation
+├── grafana/
+│   └── dashboard.json      # Pre-built Grafana dashboard (9 panels)
+├── monitor.py              # CLI entry point — run with: python monitor.py
+├── web.py                  # Web UI entry point — run with: python web.py
 ├── requirements.txt        # Python dependencies
-├── grafana_dashboard.json  # Pre-built Grafana dashboard (9 panels)
 ├── .env.example            # Environment variable template
-└── .gitignore              # Excludes .env, timelapse output, caches
+├── .gitignore              # Excludes .env, timelapse output, caches
+├── LICENSE
+└── README.md
 ```
 
 ---

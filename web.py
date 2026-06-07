@@ -20,8 +20,8 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response, JSONResponse
 from pydantic import BaseModel
 
-from camera import CameraManager
-from config import Config
+from ender3monitor.camera import CameraManager
+from ender3monitor.config import Config
 from monitor import Monitor
 
 # ── global state ──────────────────────────────────────────────────────────────

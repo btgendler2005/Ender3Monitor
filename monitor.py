@@ -10,12 +10,12 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from config import Config
-from camera import CameraManager
-from analyzer import create_analyzer, AnalysisResult
-from notifier import EmailNotifier
-from metrics import MonitorMetrics
-from timelapse import TimelapseManager
+from ender3monitor.config import Config
+from ender3monitor.camera import CameraManager
+from ender3monitor.analyzer import create_analyzer, AnalysisResult
+from ender3monitor.notifier import EmailNotifier
+from ender3monitor.metrics import MonitorMetrics
+from ender3monitor.timelapse import TimelapseManager
 
 CAPTURE_INTERVAL = 30       # seconds between analysis frames
 TIMELAPSE_INTERVAL = 60     # seconds between timelapse frames
