@@ -169,7 +169,7 @@ async def snapshot():
         idx = _config.camera_index
     elif _monitor and _monitor.camera:
         idx = _monitor.camera.camera_index
-    frame = CameraManager(idx).snapshot()
+    frame = CameraManager(idx, flip=_config.camera_flip if _config else None).snapshot()
     if frame is None:
         return Response(status_code=204)
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
