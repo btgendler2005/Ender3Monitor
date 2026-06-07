@@ -64,6 +64,56 @@ class AnalysisResult:
 # Shared helpers                                                        #
 # ------------------------------------------------------------------ #
 
+# Pre-check thresholds — tune these if you get false rejections
+_MIN_BRIGHTNESS = 18.0   # mean pixel value (0-255); below = too dark
+_MIN_CONTRAST   = 10.0   # std-dev of pixel values; below = too uniform
+_MIN_EDGE_FRAC  = 0.01   # fraction of pixels that are edges; below = featureless
+
+
+def _precheck_frame(frame: np.ndarray, backend: str) -> Optional["AnalysisResult"]:
+    """Fast OpenCV sanity checks run *before* sending to the LLM.
+
+    Catches obvious non-usable frames (lens cap, lights off, blank wall)
+    without spending an API call or GPU time.  Returns an AnalysisResult
+    describing the problem if the frame should be skipped, or None if it
+    looks usable.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # 1. Brightness — too dark to see anything
+    brightness = float(gray.mean())
+    if brightness < _MIN_BRIGHTNESS:
+        return AnalysisResult(
+            False, "no_printer", 0.0,
+            f"Frame too dark (brightness {brightness:.0f}/255) — "
+            "check lighting or camera connection.",
+            backend,
+        )
+
+    # 2. Contrast — frame is nearly a solid colour (lens cap, blank wall)
+    contrast = float(gray.std())
+    if contrast < _MIN_CONTRAST:
+        return AnalysisResult(
+            False, "no_printer", 0.0,
+            f"Frame has almost no detail (contrast {contrast:.0f}) — "
+            "camera may be covered or aimed at a blank surface.",
+            backend,
+        )
+
+    # 3. Edge density — so few edges the scene is almost certainly not a printer
+    edges = cv2.Canny(gray, threshold1=40, threshold2=120)
+    edge_frac = float(edges.mean()) / 255.0
+    if edge_frac < _MIN_EDGE_FRAC:
+        return AnalysisResult(
+            False, "no_printer", 0.0,
+            f"Frame has very few edges ({edge_frac:.3%}) — "
+            "camera may not be aimed at the printer.",
+            backend,
+        )
+
+    return None   # frame looks usable — proceed to LLM
+
+
 def _encode_frame_b64(frame: np.ndarray) -> str:
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
     return base64.standard_b64encode(buf.tobytes()).decode("utf-8")
@@ -107,6 +157,9 @@ class AnthropicAnalyzer:
         self._model = model
 
     def analyze_frame(self, frame: np.ndarray) -> AnalysisResult:
+        early = _precheck_frame(frame, backend=f"anthropic/{self._model}")
+        if early:
+            return early
         image_data = _encode_frame_b64(frame)
         response = self._client.messages.create(
             model=self._model,
@@ -166,6 +219,9 @@ class OllamaAnalyzer:
             os.environ.setdefault("OLLAMA_HOST", host)
 
     def analyze_frame(self, frame: np.ndarray) -> AnalysisResult:
+        early = _precheck_frame(frame, backend=f"ollama/{self._model}")
+        if early:
+            return early
         _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         image_bytes = buf.tobytes()
 
