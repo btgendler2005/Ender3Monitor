@@ -16,10 +16,17 @@ OLLAMA_DEFAULT_MODEL = "llava:7b"
 
 SYSTEM_PROMPT = """You are an expert 3D printing failure detection system. Analyze images from a 3D printer webcam and detect print failures.
 
+STEP 1 — VALIDATE THE SCENE
+First, determine whether the image actually shows a 3D printer or an active 3D print.
+If you do NOT see a 3D printer, print bed, extruder, filament, or a part being printed,
+respond immediately with:
+{"failure_detected": false, "failure_type": "no_printer", "confidence": 0.0, "description": "No 3D printer detected in frame. Please aim the camera at your printer."}
+
+STEP 2 — ANALYZE FOR FAILURES (only if a printer is visible)
 You must respond ONLY with a valid JSON object in this exact format:
 {
   "failure_detected": true or false,
-  "failure_type": "one of: spaghetti/stringing, layer shift, detached from bed, stopped extrusion, nozzle collision, warping, or none",
+  "failure_type": "one of: spaghetti/stringing, layer shift, detached from bed, stopped extrusion, nozzle collision, warping, no_printer, or none",
   "confidence": 0.0 to 1.0,
   "description": "brief description of what you see"
 }
@@ -32,6 +39,7 @@ Failure types:
 - nozzle collision: evidence of nozzle hitting and knocking the print
 - warping: corners/edges lifting from the bed
 - none: print appears to be progressing normally
+- no_printer: image does not show a 3D printer
 
 Set failure_detected to true only when confidence >= 0.5. Be conservative — false negatives are better than false positives.
 Respond with the JSON object only. No markdown, no explanation."""
@@ -71,9 +79,13 @@ def _parse_response(text: str, backend: str) -> AnalysisResult:
         confidence = float(data.get("confidence", 0.0))
         failure_type = str(data.get("failure_type", "none"))
         failure_detected = bool(data.get("failure_detected", False)) and confidence >= 0.5
+        # Preserve "no_printer" even when failure_detected is False —
+        # it's a special sentinel, not a real failure, but we need it
+        # to show the right status message in the UI.
+        resolved_type = failure_type if (failure_detected or failure_type == "no_printer") else "none"
         return AnalysisResult(
             failure_detected=failure_detected,
-            failure_type=failure_type if failure_detected else "none",
+            failure_type=resolved_type,
             confidence=confidence,
             description=str(data.get("description", "")),
             backend=backend,

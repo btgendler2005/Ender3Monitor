@@ -68,6 +68,7 @@ class Monitor:
         self.timelapse = TimelapseManager(config.timelapse_dir)
 
         self._running = False
+        self._stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
 
@@ -101,7 +102,9 @@ class Monitor:
                     last_timelapse + TIMELAPSE_INTERVAL,
                 )
                 sleep_for = max(1.0, next_event - now)
-                time.sleep(sleep_for)
+                # Event.wait() returns immediately when stop() sets _stop_event,
+                # so we never block the UI for up to 30 s waiting on a sleep.
+                self._stop_event.wait(timeout=sleep_for)
 
                 if not self._running:
                     break
@@ -180,19 +183,25 @@ class Monitor:
                             self.config.confidence_threshold,
                         )
 
-                        if (
-                            result.failure_detected
-                            and result.confidence >= self.config.confidence_threshold
-                        ):
-                            self.failure_count += 1
-                            self.status = f"FAILURE DETECTED – {result.failure_type}"
-                            # A live failure resets the idle counter — print is not done
-                            self._no_motion_count = 0
-                            self._send_alert(result, frame)
-                        else:
-                            self.status = "Monitoring…"
+                        # Only update status if stop() hasn't already set it to Idle
+                        if self._running:
+                            if (
+                                result.failure_detected
+                                and result.confidence >= self.config.confidence_threshold
+                                and result.failure_type != "no_printer"
+                            ):
+                                self.failure_count += 1
+                                self.status = f"FAILURE DETECTED – {result.failure_type}"
+                                # A live failure resets the idle counter — print is not done
+                                self._no_motion_count = 0
+                                self._send_alert(result, frame)
+                            elif result.failure_type == "no_printer":
+                                self.status = "Monitoring… (no printer in frame)"
+                            else:
+                                self.status = "Monitoring…"
 
-                    _print_status(self)
+                    if self._running:
+                        _print_status(self)
 
         finally:
             self.metrics.monitoring_active.set(0)
@@ -238,6 +247,7 @@ class Monitor:
             return
 
         self.timelapse.reset_session()
+        self._stop_event.clear()
         self._running = True
         self.frame_count = 0
         self.failure_count = 0
@@ -260,9 +270,10 @@ class Monitor:
                 print("  Not currently monitoring.")
             return
         self._running = False
+        self._stop_event.set()   # wake the sleeping loop immediately
         if self._monitor_thread and self._monitor_thread.is_alive():
-            self._monitor_thread.join(timeout=5)
-        # Camera may already be released by the monitoring thread's finally block
+            self._monitor_thread.join(timeout=3)
+        self._stop_event.clear()
         if self.camera:
             self.camera.release()
             self.camera = None
