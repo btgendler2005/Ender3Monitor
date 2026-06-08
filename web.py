@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import traceback
 from contextlib import asynccontextmanager
 from typing import Optional, Set
 
@@ -19,6 +21,9 @@ import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("ender3monitor")
 
 from ender3monitor.camera import CameraManager
 from ender3monitor.config import Config
@@ -142,30 +147,33 @@ async def api_cameras(scan: bool = False):
 
     Pass ?scan=true to force a full hardware scan regardless.
     """
-    configured = _config.camera_index if _config else -1
+    try:
+        configured = _config.camera_index if _config else -1
 
-    if configured >= 0 and not scan:
-        # Fast path — camera already chosen, no need to probe hardware
+        if configured >= 0 and not scan:
+            # Fast path — camera already chosen, no need to probe hardware
+            return {
+                "cameras": [{"index": configured, "width": 1280, "height": 720}],
+                "configured": configured,
+            }
+
+        # Full scan — serialised by the camera lock in camera.py
+        loop = asyncio.get_running_loop()
+        try:
+            cameras = await asyncio.wait_for(
+                loop.run_in_executor(None, CameraManager.list_available_cameras),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            log.warning("Camera scan timed out")
+            return JSONResponse({"error": "Camera scan timed out", "cameras": [], "configured": configured})
         return {
-            "cameras": [{"index": configured, "width": 1280, "height": 720}],
+            "cameras": [{"index": i, "width": w, "height": h} for i, w, h in cameras],
             "configured": configured,
         }
-
-    # Full scan — serialised by the camera lock in camera.py
-    try:
-        loop = asyncio.get_running_loop()
-        cameras = await asyncio.wait_for(
-            loop.run_in_executor(None, CameraManager.list_available_cameras),
-            timeout=10.0,
-        )
-    except asyncio.TimeoutError:
-        return JSONResponse({"error": "Camera scan timed out", "cameras": [], "configured": configured}, 200)
-    except Exception as exc:
-        return JSONResponse({"error": str(exc), "cameras": [], "configured": configured}, 200)
-    return {
-        "cameras": [{"index": i, "width": w, "height": h} for i, w, h in cameras],
-        "configured": configured,
-    }
+    except Exception:
+        log.error("Unhandled error in /api/cameras:\n%s", traceback.format_exc())
+        return JSONResponse({"error": "Internal error — see server log", "cameras": [], "configured": -1})
 
 
 class StartBody(BaseModel):
