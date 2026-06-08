@@ -17,7 +17,7 @@ from typing import Optional, Set
 import cv2
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, Response, JSONResponse
+from fastapi.responses import HTMLResponse, Response, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from ender3monitor.camera import CameraManager
@@ -31,6 +31,39 @@ _monitor: Optional[Monitor] = None
 _clients: Set[WebSocket] = set()
 DEFAULT_PORT = 8080
 
+# Shared MJPEG frame — written by the capture loop, read by stream clients
+_live_frame: Optional[bytes] = None
+_STREAM_FPS = 1          # captures per second (1 fps is plenty for a printer)
+_STREAM_QUALITY = 70     # JPEG quality for the live stream
+
+
+def _capture_frame_sync() -> Optional[bytes]:
+    """Grab one frame from the camera and return it as JPEG bytes (runs in thread)."""
+    idx = 0
+    if _config and _config.camera_index >= 0:
+        idx = _config.camera_index
+    elif _monitor and _monitor.camera:
+        idx = _monitor.camera.camera_index
+    frame = CameraManager(idx, flip=_config.camera_flip if _config else None).snapshot()
+    if frame is None:
+        return None
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _STREAM_QUALITY])
+    return buf.tobytes()
+
+
+async def _stream_capture_loop() -> None:
+    """Background task: refresh the shared live frame at _STREAM_FPS."""
+    global _live_frame
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            data = await loop.run_in_executor(None, _capture_frame_sync)
+            if data:
+                _live_frame = data
+        except Exception:
+            pass
+        await asyncio.sleep(1.0 / _STREAM_FPS)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -38,9 +71,11 @@ async def lifespan(app: FastAPI):
     _config = Config.from_env()
     _monitor = Monitor(_config)
     _monitor.metrics.start_server(_config.metrics_port)
-    task = asyncio.create_task(_push_loop())
+    push_task    = asyncio.create_task(_push_loop())
+    capture_task = asyncio.create_task(_stream_capture_loop())
     yield
-    task.cancel()
+    push_task.cancel()
+    capture_task.cancel()
     if _monitor and _monitor._running:
         _monitor.stop()
 
@@ -163,18 +198,39 @@ async def api_status():
 
 @app.get("/snapshot")
 async def snapshot():
-    """On-demand JPEG snapshot for the browser preview."""
-    idx: int = 0
-    if _config and _config.camera_index >= 0:
-        idx = _config.camera_index
-    elif _monitor and _monitor.camera:
-        idx = _monitor.camera.camera_index
-    frame = CameraManager(idx, flip=_config.camera_flip if _config else None).snapshot()
-    if frame is None:
+    """On-demand JPEG snapshot (single frame)."""
+    data = _live_frame
+    if data is None:
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, _capture_frame_sync)
+    if data is None:
         return Response(status_code=204)
-    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    return Response(buf.tobytes(), media_type="image/jpeg",
+    return Response(data, media_type="image/jpeg",
                     headers={"Cache-Control": "no-store"})
+
+
+async def _mjpeg_generator():
+    """Yield MJPEG frames from the shared live frame buffer."""
+    while True:
+        frame = _live_frame
+        if frame:
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" +
+                frame +
+                b"\r\n"
+            )
+        await asyncio.sleep(1.0 / _STREAM_FPS)
+
+
+@app.get("/stream")
+async def stream():
+    """MJPEG live stream — open in any browser or <img src='/stream'>."""
+    return StreamingResponse(
+        _mjpeg_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 # ── HTML / CSS / JS  (single-file, no build step) ────────────────────────────
@@ -438,10 +494,13 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
   <!-- Camera -->
   <div class="card cam-card">
     <div class="card-label">Camera Feed</div>
-    <img id="cam" src="/snapshot" alt="Camera preview">
+    <img id="cam" src="/stream" alt="Camera preview">
     <div class="cam-meta">
       <span id="cam-label">—</span>
-      <span id="cam-refresh">refreshes every 10 s</span>
+      <span id="stream-link" style="font-size:11px;color:var(--muted)">
+        📱 <a id="stream-url" href="/stream" target="_blank"
+             style="color:var(--muted);text-decoration:none">/stream</a>
+      </span>
     </div>
   </div>
 
@@ -681,11 +740,15 @@ function clearLog() {
   lastFrames = -1;
 }
 
-// ── Camera refresh ─────────────────────────────────────────────────────────
-function refreshCam() {
-  document.getElementById('cam').src = '/snapshot?t=' + Date.now();
-}
-setInterval(refreshCam, 10000);
+// ── Stream link — show full LAN URL so user can open on phone ─────────────
+(function() {
+  const a = document.getElementById('stream-url');
+  if (a) {
+    const url = `${location.protocol}//${location.hostname}:${location.port}/stream`;
+    a.href = url;
+    a.textContent = url;
+  }
+})();
 
 // ── Toast ──────────────────────────────────────────────────────────────────
 function toast(msg, ms=3000) {
