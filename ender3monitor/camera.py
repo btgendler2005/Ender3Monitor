@@ -4,10 +4,16 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import cv2
 import numpy as np
 from pathlib import Path
 from typing import Optional
+
+# Module-level lock — only one thread may open a camera at a time.
+# Prevents the stream-capture loop and the camera-scan endpoint from
+# racing each other and causing OpenCV driver errors.
+_camera_lock = threading.Lock()
 
 
 @contextlib.contextmanager
@@ -49,17 +55,21 @@ def _snapshot(index: int, width: int = 1280, height: int = 720) -> Optional[np.n
     capture thread that otherwise runs at 30 fps continuously in the
     background, even when no frames are being consumed.  On an 8 GB M2 this
     was the primary source of CPU / memory-bandwidth pressure.
+
+    The module-level _camera_lock ensures only one thread accesses any
+    camera at a time, preventing races between the stream loop and scans.
     """
-    cap = cv2.VideoCapture(index)
-    if not cap.isOpened():
-        return None
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    # Discard first frame — camera needs one read to finish initialising.
-    cap.read()
-    ret, frame = cap.read()
-    cap.release()
+    with _camera_lock:
+        cap = cv2.VideoCapture(index)
+        if not cap.isOpened():
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Discard first frame — camera needs one read to finish initialising.
+        cap.read()
+        ret, frame = cap.read()
+        cap.release()
     return frame if ret else None
 
 

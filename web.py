@@ -135,42 +135,18 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
 @app.get("/api/cameras")
 async def api_cameras():
+    """Scan for available cameras. Safe to call at any time — the camera
+    lock in camera.py serialises this with the stream-capture loop."""
     configured = _config.camera_index if _config else -1
-
-    # If a specific camera is already configured, skip the scan entirely —
-    # the stream loop is hitting that camera every second and a concurrent
-    # full scan causes conflicts on most USB webcam drivers.
-    if configured >= 0:
-        idx = configured
-        # Grab resolution from the live frame if available, otherwise snapshot once
-        if _live_frame:
-            import struct, io
-            # Parse width/height from JPEG SOF marker to avoid opening the camera
-            data = _live_frame
-            try:
-                i = 0
-                while i < len(data) - 8:
-                    if data[i] == 0xFF and data[i+1] in (0xC0, 0xC2):
-                        h = (data[i+5] << 8) | data[i+6]
-                        w = (data[i+7] << 8) | data[i+8]
-                        break
-                    i += 1
-                else:
-                    w, h = 1280, 720
-            except Exception:
-                w, h = 1280, 720
-        else:
-            w, h = 1280, 720
-        return {"cameras": [{"index": idx, "width": w, "height": h}], "configured": configured}
-
-    # No camera configured — scan (best-effort; ignore errors)
     try:
         loop = asyncio.get_running_loop()
         cameras = await loop.run_in_executor(None, CameraManager.list_available_cameras)
-    except Exception:
-        cameras = []
-    return {"cameras": [{"index": i, "width": w, "height": h} for i, w, h in cameras],
-            "configured": configured}
+    except Exception as exc:
+        return JSONResponse({"error": str(exc), "cameras": [], "configured": configured}, 500)
+    return {
+        "cameras": [{"index": i, "width": w, "height": h} for i, w, h in cameras],
+        "configured": configured,
+    }
 
 
 class StartBody(BaseModel):
@@ -422,6 +398,9 @@ header{
   font-size:13px;appearance:none;cursor:pointer;
 }
 #cam-select:focus{outline:none;border-color:var(--blue)}
+#cam-select:disabled{opacity:.4;cursor:not-allowed}
+.btn-scan{background:var(--surf3);border-color:var(--border);color:var(--muted);padding:8px 12px}
+.btn-scan:hover{color:var(--text)}
 
 /* ── Controls ── */
 .controls{
@@ -581,8 +560,16 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
 
 <!-- Controls -->
 <div class="controls">
-  <div class="cam-select-row" id="cam-select-wrap" style="display:none">
-    <select id="cam-select"></select>
+  <div class="cam-select-row">
+    <select id="cam-select" title="Select camera">
+      <option value="">Scanning cameras…</option>
+    </select>
+    <button class="btn-scan" onclick="scanCameras()" title="Rescan cameras">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polyline points="23 4 23 10 17 10"/>
+        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+      </svg>
+    </button>
   </div>
   <button class="btn-start" id="btn-start" onclick="doStart()">
     <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21"/></svg>
@@ -690,35 +677,41 @@ function pillClass(s) {
 }
 
 // ── Camera selection ───────────────────────────────────────────────────────
-async function loadCameras() {
+async function scanCameras() {
+  const sel = document.getElementById('cam-select');
+  sel.disabled = true;
+  sel.innerHTML = '<option value="">Scanning…</option>';
   try {
     const res  = await fetch('/api/cameras');
     const data = await res.json();
     camList = data.cameras || [];
     const configured = data.configured;
 
-    if (camList.length > 1 && configured < 0) {
-      const wrap = document.getElementById('cam-select-wrap');
-      const sel  = document.getElementById('cam-select');
-      wrap.style.display = 'flex';
-      sel.innerHTML = camList.map(c =>
-        `<option value="${c.index}">Camera ${c.index} — ${c.width}×${c.height}</option>`
-      ).join('');
+    if (camList.length === 0) {
+      sel.innerHTML = '<option value="">No cameras found</option>';
+    } else {
+      sel.innerHTML = camList.map(c => {
+        const label = `Camera ${c.index} — ${c.width}×${c.height}`;
+        const selected = (c.index === configured || (configured < 0 && camList.indexOf(c) === 0)) ? 'selected' : '';
+        return `<option value="${c.index}" ${selected}>${label}</option>`;
+      }).join('');
     }
-  } catch(e) {}
+  } catch(e) {
+    sel.innerHTML = '<option value="">Scan failed — retry</option>';
+  }
+  sel.disabled = false;
 }
 
 function selectedCam() {
   const sel = document.getElementById('cam-select');
-  return sel ? parseInt(sel.value, 10) : null;
+  const v = sel ? parseInt(sel.value, 10) : NaN;
+  return isNaN(v) ? null : v;
 }
 
 // ── Controls ───────────────────────────────────────────────────────────────
 async function doStart() {
-  const body = {};
-  if (document.getElementById('cam-select-wrap').style.display !== 'none') {
-    body.camera_index = selectedCam();
-  }
+  const cam = selectedCam();
+  const body = cam !== null ? { camera_index: cam } : {};
   const data = await api('start', body);
   if (data) render(data);
 }
@@ -791,7 +784,7 @@ function toast(msg, ms=3000) {
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────
-loadCameras();
+scanCameras();
 connect();
 </script>
 </body>
