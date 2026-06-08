@@ -304,7 +304,13 @@ class Monitor:
         if camera_index is not None:
             idx = camera_index
         elif self.config.camera_index == -1:
-            idx = CameraManager.select_camera()
+            try:
+                idx = CameraManager.select_camera()
+            except RuntimeError as exc:
+                print(f"  {exc}")
+                print("  Tip: another process (e.g. the web UI) may be using the camera,")
+                print("       or set CAMERA_INDEX in .env to skip auto-detection.")
+                return
         else:
             idx = self.config.camera_index
 

@@ -41,6 +41,11 @@ _live_frame: Optional[bytes] = None
 _STREAM_FPS = 1          # captures per second (1 fps is plenty for a printer)
 _STREAM_QUALITY = 70     # JPEG quality for the live stream
 
+# When set, the stream capture loop pauses so a camera scan can have
+# exclusive access to the hardware (probing indices conflicts with the
+# continuous single-camera stream on most USB webcam drivers).
+_stream_paused = False
+
 
 def _capture_frame_sync() -> Optional[bytes]:
     """Grab one frame from the camera and return it as JPEG bytes (runs in thread)."""
@@ -61,6 +66,9 @@ async def _stream_capture_loop() -> None:
     global _live_frame
     loop = asyncio.get_running_loop()
     while True:
+        if _stream_paused:
+            await asyncio.sleep(0.2)
+            continue
         try:
             data = await loop.run_in_executor(None, _capture_frame_sync)
             if data:
@@ -147,6 +155,7 @@ async def api_cameras(scan: bool = False):
 
     Pass ?scan=true to force a full hardware scan regardless.
     """
+    global _stream_paused
     try:
         configured = _config.camera_index if _config else -1
 
@@ -157,21 +166,27 @@ async def api_cameras(scan: bool = False):
                 "configured": configured,
             }
 
-        # Full scan — serialised by the camera lock in camera.py
-        loop = asyncio.get_running_loop()
+        # Pause the stream loop so the scan has exclusive access to the
+        # camera hardware, then give any in-flight capture time to release.
+        _stream_paused = True
+        await asyncio.sleep(0.4)
         try:
+            loop = asyncio.get_running_loop()
             cameras = await asyncio.wait_for(
                 loop.run_in_executor(None, CameraManager.list_available_cameras),
-                timeout=10.0,
+                timeout=15.0,
             )
         except asyncio.TimeoutError:
             log.warning("Camera scan timed out")
             return JSONResponse({"error": "Camera scan timed out", "cameras": [], "configured": configured})
+        finally:
+            _stream_paused = False
         return {
             "cameras": [{"index": i, "width": w, "height": h} for i, w, h in cameras],
             "configured": configured,
         }
     except Exception:
+        _stream_paused = False
         log.error("Unhandled error in /api/cameras:\n%s", traceback.format_exc())
         return JSONResponse({"error": "Internal error — see server log", "cameras": [], "configured": -1})
 

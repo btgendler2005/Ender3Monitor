@@ -1,7 +1,12 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
+
+# Project root is one level up from this package directory, so .env loads
+# correctly no matter which directory the app is launched from.
+_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
 
 def _parse_flip(value: str) -> Optional[int]:
@@ -53,7 +58,8 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        load_dotenv()
+        # Load the project's .env explicitly so it works from any cwd.
+        load_dotenv(_ENV_PATH if _ENV_PATH.exists() else None)
         backend = os.getenv("ANALYZER_BACKEND", "anthropic").lower()
 
         # Only require the API key when using the Anthropic backend
