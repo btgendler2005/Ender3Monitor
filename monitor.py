@@ -39,6 +39,10 @@ def _frames_differ(f1: np.ndarray, f2: np.ndarray, threshold: float = MOTION_THR
     """Return True if the two frames differ significantly (motion / print activity)."""
     gray1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY)
+    # If the camera reinitialises mid-session the resolution can change.
+    # Resize gray2 to match gray1 so absdiff doesn't crash.
+    if gray1.shape != gray2.shape:
+        gray2 = cv2.resize(gray2, (gray1.shape[1], gray1.shape[0]))
     return float(cv2.absdiff(gray1, gray2).mean()) >= threshold
 
 
