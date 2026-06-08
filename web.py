@@ -154,9 +154,14 @@ async def api_cameras(scan: bool = False):
     # Full scan — serialised by the camera lock in camera.py
     try:
         loop = asyncio.get_running_loop()
-        cameras = await loop.run_in_executor(None, CameraManager.list_available_cameras)
+        cameras = await asyncio.wait_for(
+            loop.run_in_executor(None, CameraManager.list_available_cameras),
+            timeout=10.0,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse({"error": "Camera scan timed out", "cameras": [], "configured": configured}, 200)
     except Exception as exc:
-        return JSONResponse({"error": str(exc), "cameras": [], "configured": configured}, 500)
+        return JSONResponse({"error": str(exc), "cameras": [], "configured": configured}, 200)
     return {
         "cameras": [{"index": i, "width": w, "height": h} for i, w, h in cameras],
         "configured": configured,
@@ -704,7 +709,9 @@ async function scanCameras(forceHardwareScan = false) {
     camList = data.cameras || [];
     const configured = data.configured;
 
-    if (camList.length === 0) {
+    if (data.error) {
+      sel.innerHTML = `<option value="">${data.error}</option>`;
+    } else if (camList.length === 0) {
       sel.innerHTML = '<option value="">No cameras found</option>';
     } else {
       sel.innerHTML = camList.map(c => {

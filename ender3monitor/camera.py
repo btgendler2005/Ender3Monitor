@@ -48,7 +48,8 @@ def _camera_names_macos() -> list[str]:
         return []
 
 
-def _snapshot(index: int, width: int = 1280, height: int = 720) -> Optional[np.ndarray]:
+def _snapshot(index: int, width: int = 1280, height: int = 720,
+              timeout: float = 4.0) -> Optional[np.ndarray]:
     """Open a camera, grab one frame, immediately release it.
 
     Opening and releasing on every capture eliminates the OpenCV internal
@@ -58,8 +59,13 @@ def _snapshot(index: int, width: int = 1280, height: int = 720) -> Optional[np.n
 
     The module-level _camera_lock ensures only one thread accesses any
     camera at a time, preventing races between the stream loop and scans.
+    `timeout` caps how long we wait to acquire the lock — if a previous
+    capture is stuck (unresponsive USB camera) we give up and return None
+    rather than hanging the caller forever.
     """
-    with _camera_lock:
+    if not _camera_lock.acquire(timeout=timeout):
+        return None   # another capture is stuck — don't wait forever
+    try:
         cap = cv2.VideoCapture(index)
         if not cap.isOpened():
             return None
@@ -70,6 +76,8 @@ def _snapshot(index: int, width: int = 1280, height: int = 720) -> Optional[np.n
         cap.read()
         ret, frame = cap.read()
         cap.release()
+    finally:
+        _camera_lock.release()
     return frame if ret else None
 
 
