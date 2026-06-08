@@ -29,6 +29,11 @@ MOTION_THRESHOLD = 5.0      # mean absolute pixel difference (0–255) to count 
 FAILURE_CONFIRM_FRAMES = 2          # 2 × 30 s = 1 minute of sustained failure
 SPAGHETTI_CONFIRM_FRAMES = 1        # spaghetti alerts immediately — filament wastes every second
 
+# Startup grace period: skip failure detection while the printer warms up.
+# The bed and nozzle take ~3-5 min to reach temperature; during this time
+# the printer is stationary and the LLM would see a "nothing happening" frame.
+STARTUP_GRACE_FRAMES = 10           # 10 × 30 s = 5 min warm-up window
+
 
 def _frames_differ(f1: np.ndarray, f2: np.ndarray, threshold: float = MOTION_THRESHOLD) -> bool:
     """Return True if the two frames differ significantly (motion / print activity)."""
@@ -84,9 +89,13 @@ class Monitor:
         self.failure_count = 0
         self.last_frame_time: Optional[datetime] = None
 
+        # Startup grace period — skip detection while printer warms up
+        self._grace_frames_remaining: int = STARTUP_GRACE_FRAMES
+
         # Print-complete detection
         self._no_motion_count: int = 0
         self._prev_analysis_frame: Optional[np.ndarray] = None
+        self._print_motion_seen: bool = False   # True once the printer first moves
 
         # Failure confirmation — require consecutive frames before alerting
         self._pending_failure_type: Optional[str] = None
@@ -144,6 +153,21 @@ class Monitor:
                 if needs_analysis:
                     last_capture = now
 
+                    # ── Startup grace period ───────────────────────────── #
+                    if self._grace_frames_remaining > 0:
+                        self._grace_frames_remaining -= 1
+                        secs_left = self._grace_frames_remaining * CAPTURE_INTERVAL
+                        mins_left = secs_left // 60
+                        with self._lock:
+                            self.status = (
+                                f"Warming up… ({mins_left}m {secs_left % 60}s remaining)"
+                                if secs_left > 0 else "Warming up… (almost ready)"
+                            )
+                        self._prev_analysis_frame = frame.copy()
+                        if self._running:
+                            _print_status(self)
+                        continue   # skip motion check and LLM during grace period
+
                     # ── Motion / completion detection ──────────────────── #
                     if self._prev_analysis_frame is not None:
                         if _frames_differ(frame, self._prev_analysis_frame):
@@ -152,24 +176,29 @@ class Monitor:
                                     f"\n  [MOTION] Change detected — "
                                     f"resetting idle counter (was {self._no_motion_count})"
                                 )
+                            self._print_motion_seen = True
                             self._no_motion_count = 0
                         else:
-                            self._no_motion_count += 1
-                            print(
-                                f"\n  [MOTION] No change detected "
-                                f"({self._no_motion_count}/{NO_MOTION_LIMIT} frames)"
-                            )
-                            if self._no_motion_count >= NO_MOTION_LIMIT:
-                                with self._lock:
-                                    self.status = "Print Complete"
-                                    self._running = False
+                            if self._print_motion_seen:
+                                # Only count toward completion after printing has started
+                                self._no_motion_count += 1
                                 print(
-                                    "\n  ✓ Print appears complete — "
-                                    "no change for 4 consecutive frames (2 min)."
+                                    f"\n  [MOTION] No change detected "
+                                    f"({self._no_motion_count}/{NO_MOTION_LIMIT} frames)"
                                 )
-                                self._send_completion(frame)
-                                _print_status(self)
-                                break
+                                if self._no_motion_count >= NO_MOTION_LIMIT:
+                                    with self._lock:
+                                        self.status = "Print Complete"
+                                        self._running = False
+                                    print(
+                                        "\n  ✓ Print appears complete — "
+                                        "no change for 4 consecutive frames (2 min)."
+                                    )
+                                    self._send_completion(frame)
+                                    _print_status(self)
+                                    break
+                            else:
+                                print("\n  [MOTION] No change yet — waiting for print to start")
                     self._prev_analysis_frame = frame.copy()
 
                     # ── LLM analysis ───────────────────────────────────── #
@@ -289,8 +318,10 @@ class Monitor:
         self.failure_count = 0
         self.last_result = None
         self.status = "Monitoring…"
+        self._grace_frames_remaining = STARTUP_GRACE_FRAMES
         self._no_motion_count = 0
         self._prev_analysis_frame = None
+        self._print_motion_seen = False
         self._pending_failure_type = None
         self._pending_failure_count = 0
 
