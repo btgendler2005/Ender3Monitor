@@ -26,8 +26,8 @@ MOTION_THRESHOLD = 5.0      # mean absolute pixel difference (0–255) to count 
 
 # Failure confirmation: require this many consecutive frames before alerting.
 # Eliminates single-frame false positives — a real failure persists.
-FAILURE_CONFIRM_FRAMES = 2          # 2 × 30 s = 1 minute of sustained failure
-SPAGHETTI_CONFIRM_FRAMES = 1        # spaghetti alerts immediately — filament wastes every second
+FAILURE_CONFIRM_FRAMES = 3          # 3 × 30 s = 1.5 min of sustained failure before alerting
+SPAGHETTI_CONFIRM_FRAMES = 2        # spaghetti needs 2 frames — 1 min — reduces blob/stringing false alarms
 
 # Startup grace period: skip failure detection while the printer warms up.
 # The bed and nozzle take ~3-5 min to reach temperature; during this time
