@@ -54,7 +54,7 @@ def _capture_frame_sync() -> Optional[bytes]:
 async def _stream_capture_loop() -> None:
     """Background task: refresh the shared live frame at _STREAM_FPS."""
     global _live_frame
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     while True:
         try:
             data = await loop.run_in_executor(None, _capture_frame_sync)
@@ -135,7 +135,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
 @app.get("/api/cameras")
 async def api_cameras():
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     cameras = await loop.run_in_executor(None, CameraManager.list_available_cameras)
     return {"cameras": [{"index": i, "width": w, "height": h} for i, w, h in cameras],
             "configured": _config.camera_index if _config else -1}
@@ -166,7 +166,7 @@ async def api_start(body: StartBody = StartBody()):
     cam = body.camera_index
     if cam is None and _config and _config.camera_index >= 0:
         cam = _config.camera_index
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: _monitor.start(camera_index=cam))
     await _broadcast()
     return _state()
@@ -176,7 +176,7 @@ async def api_start(body: StartBody = StartBody()):
 async def api_stop():
     if _monitor is None:
         return JSONResponse({"error": "not initialised"}, 503)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _monitor.stop)
     await _broadcast()
     return _state()
@@ -186,7 +186,7 @@ async def api_stop():
 async def api_timelapse():
     if _monitor is None:
         return JSONResponse({"error": "not initialised"}, 503)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _monitor.compile_timelapse)
     return {"message": "timelapse compiled"}
 
@@ -201,7 +201,7 @@ async def snapshot():
     """On-demand JPEG snapshot (single frame)."""
     data = _live_frame
     if data is None:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, _capture_frame_sync)
     if data is None:
         return Response(status_code=204)
