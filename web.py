@@ -134,10 +134,24 @@ async def ws_endpoint(ws: WebSocket) -> None:
 # ── REST API ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/cameras")
-async def api_cameras():
-    """Scan for available cameras. Safe to call at any time — the camera
-    lock in camera.py serialises this with the stream-capture loop."""
+async def api_cameras(scan: bool = False):
+    """Return available cameras.
+
+    If CAMERA_INDEX is set (>= 0), return it immediately without opening
+    any camera — fast path, no contention with the stream loop.
+
+    Pass ?scan=true to force a full hardware scan regardless.
+    """
     configured = _config.camera_index if _config else -1
+
+    if configured >= 0 and not scan:
+        # Fast path — camera already chosen, no need to probe hardware
+        return {
+            "cameras": [{"index": configured, "width": 1280, "height": 720}],
+            "configured": configured,
+        }
+
+    # Full scan — serialised by the camera lock in camera.py
     try:
         loop = asyncio.get_running_loop()
         cameras = await loop.run_in_executor(None, CameraManager.list_available_cameras)
@@ -564,7 +578,7 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
     <select id="cam-select" title="Select camera">
       <option value="">Scanning cameras…</option>
     </select>
-    <button class="btn-scan" onclick="scanCameras()" title="Rescan cameras">
+    <button class="btn-scan" onclick="scanCameras(true)" title="Rescan all cameras">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <polyline points="23 4 23 10 17 10"/>
         <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
@@ -677,12 +691,15 @@ function pillClass(s) {
 }
 
 // ── Camera selection ───────────────────────────────────────────────────────
-async function scanCameras() {
+async function scanCameras(forceHardwareScan = false) {
   const sel = document.getElementById('cam-select');
   sel.disabled = true;
-  sel.innerHTML = '<option value="">Scanning…</option>';
+  sel.innerHTML = forceHardwareScan
+    ? '<option value="">Scanning hardware…</option>'
+    : '<option value="">Loading…</option>';
   try {
-    const res  = await fetch('/api/cameras');
+    const url = forceHardwareScan ? '/api/cameras?scan=true' : '/api/cameras';
+    const res  = await fetch(url);
     const data = await res.json();
     camList = data.cameras || [];
     const configured = data.configured;
