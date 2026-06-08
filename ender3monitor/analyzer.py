@@ -37,11 +37,27 @@ SPAGHETTI — NO, do NOT flag it:
 - Infill patterns (grid, honeycomb, lines — regular and inside walls)
 - Any texture that looks structured or intentional, even if it looks messy up close
 
-STEP 3 — OTHER CATASTROPHIC FAILURES ONLY
+STEP 3 — CHECK FOR CLOG / STOPPED EXTRUSION (second highest priority)
+A clog or filament runout means the nozzle keeps moving but NO new material comes out.
+The tell-tale sign is a clear, empty gap between the nozzle/print head and the top of
+the partially-printed object — the head is travelling well above or away from the print
+with nothing connecting them and the print is no longer growing.
+
+CLOG / STOPPED EXTRUSION — YES, flag it:
+- A large visible GAP of empty space between the nozzle tip and the top surface of the print
+- The print head is clearly hovering or moving in mid-air, separated from the print, with no filament between them
+- The print looks abruptly cut off / unfinished at a flat top while the nozzle is elsewhere
+- A whole section that should have solid walls is hollow or completely missing material
+
+CLOG / STOPPED EXTRUSION — NO, do NOT flag it:
+- The nozzle is touching or right at the top of the print (normal — that's where it deposits)
+- A normal travel move where the head briefly lifts a small amount between nearby points
+- Gaps that are just part of the model geometry (holes, overhangs, bridging)
+
+STEP 4 — OTHER CATASTROPHIC FAILURES ONLY
 Only flag if the failure has already destroyed or will imminently destroy the print:
 - layer shift: the ENTIRE print body is offset — looks like a staircase or snapped sideways (NOT a surface line)
 - detached from bed: the whole print or a large chunk has physically lifted off and is no longer adhered
-- stopped extrusion: a large section of the print has completely missing walls or is hollow where solid was expected
 - warping: edges have lifted SO severely the print is peeling off or curling dramatically — not slight corner lift
 
 DO NOT FLAG:
@@ -49,6 +65,7 @@ DO NOT FLAG:
 - Slight corner lifting or elephant foot
 - Minor stringing or wisps between parts
 - Normal-looking layer lines or texture
+- The nozzle simply resting at the top of the print (that is normal operation)
 - Anything you are not highly certain about
 
 Respond ONLY with this JSON:
