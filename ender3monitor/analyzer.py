@@ -195,6 +195,7 @@ class AnthropicAnalyzer:
         import anthropic
         self._client = anthropic.Anthropic(api_key=api_key)
         self._model = model
+        self._cache_logged = False
 
     def analyze_frame(self, frame: np.ndarray) -> AnalysisResult:
         early = _precheck_frame(frame, backend=f"anthropic/{self._model}")
@@ -204,7 +205,17 @@ class AnthropicAnalyzer:
         response = self._client.messages.create(
             model=self._model,
             max_tokens=512,
-            system=SYSTEM_PROMPT,
+            # Prompt caching: the system prompt is identical on every call,
+            # so we mark it cache-eligible. Anthropic charges full price to
+            # write it to cache once (1.25×), then ~0.1× on every cache hit
+            # for the 5-minute TTL — a large saving at one call per 30 s.
+            system=[
+                {
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             messages=[
                 {
                     "role": "user",
@@ -225,6 +236,18 @@ class AnthropicAnalyzer:
                 }
             ],
         )
+        # One-time confirmation that prompt caching is active. After the
+        # first cache write, subsequent calls should show cache_read > 0.
+        if not self._cache_logged:
+            u = getattr(response, "usage", None)
+            if u is not None:
+                write = getattr(u, "cache_creation_input_tokens", 0) or 0
+                read = getattr(u, "cache_read_input_tokens", 0) or 0
+                if write or read:
+                    print(f"  [CACHE] prompt caching active "
+                          f"(write={write}, read={read} tokens)")
+                    self._cache_logged = True
+
         raw_text = next((b.text for b in response.content if b.type == "text"), "{}")
         return _parse_response(raw_text, backend=f"anthropic/{self._model}")
 
