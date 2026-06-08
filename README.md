@@ -22,6 +22,18 @@ Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, f
 
 ---
 
+## Screenshots
+
+![Ender3Monitor dashboard](docs/dashboard.png)
+
+*Web dashboard — live camera feed, confidence gauge, AI observation, and event log*
+
+![Live camera feed](docs/screenshot-monitoring.jpg)
+
+*Live camera snapshot showing an active print in progress*
+
+---
+
 ## Requirements
 
 - Python 3.11+
