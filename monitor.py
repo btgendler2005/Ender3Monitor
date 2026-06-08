@@ -26,7 +26,8 @@ MOTION_THRESHOLD = 5.0      # mean absolute pixel difference (0–255) to count 
 
 # Failure confirmation: require this many consecutive frames before alerting.
 # Eliminates single-frame false positives — a real failure persists.
-FAILURE_CONFIRM_FRAMES = 2  # 2 × 30 s = 1 minute of sustained failure
+FAILURE_CONFIRM_FRAMES = 2          # 2 × 30 s = 1 minute of sustained failure
+SPAGHETTI_CONFIRM_FRAMES = 1        # spaghetti alerts immediately — filament wastes every second
 
 
 def _frames_differ(f1: np.ndarray, f2: np.ndarray, threshold: float = MOTION_THRESHOLD) -> bool:
@@ -199,6 +200,14 @@ class Monitor:
                                 and result.failure_type not in ("no_printer", "none")
                             )
                             if is_failure:
+                                # Spaghetti is time-critical — alert on the first frame.
+                                # All other failures require consecutive confirmation.
+                                is_spaghetti = "spaghetti" in result.failure_type.lower()
+                                confirm_needed = (
+                                    SPAGHETTI_CONFIRM_FRAMES if is_spaghetti
+                                    else FAILURE_CONFIRM_FRAMES
+                                )
+
                                 # Track consecutive frames with the same failure type
                                 if result.failure_type == self._pending_failure_type:
                                     self._pending_failure_count += 1
@@ -208,12 +217,12 @@ class Monitor:
 
                                 self.status = (
                                     f"Possible failure – {result.failure_type} "
-                                    f"({self._pending_failure_count}/{FAILURE_CONFIRM_FRAMES})"
-                                    if self._pending_failure_count < FAILURE_CONFIRM_FRAMES
+                                    f"({self._pending_failure_count}/{confirm_needed})"
+                                    if self._pending_failure_count < confirm_needed
                                     else f"FAILURE DETECTED – {result.failure_type}"
                                 )
 
-                                if self._pending_failure_count == FAILURE_CONFIRM_FRAMES:
+                                if self._pending_failure_count == confirm_needed:
                                     # Confirmed — alert once per incident
                                     self.failure_count += 1
                                     self._no_motion_count = 0
