@@ -135,10 +135,42 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
 @app.get("/api/cameras")
 async def api_cameras():
-    loop = asyncio.get_running_loop()
-    cameras = await loop.run_in_executor(None, CameraManager.list_available_cameras)
+    configured = _config.camera_index if _config else -1
+
+    # If a specific camera is already configured, skip the scan entirely —
+    # the stream loop is hitting that camera every second and a concurrent
+    # full scan causes conflicts on most USB webcam drivers.
+    if configured >= 0:
+        idx = configured
+        # Grab resolution from the live frame if available, otherwise snapshot once
+        if _live_frame:
+            import struct, io
+            # Parse width/height from JPEG SOF marker to avoid opening the camera
+            data = _live_frame
+            try:
+                i = 0
+                while i < len(data) - 8:
+                    if data[i] == 0xFF and data[i+1] in (0xC0, 0xC2):
+                        h = (data[i+5] << 8) | data[i+6]
+                        w = (data[i+7] << 8) | data[i+8]
+                        break
+                    i += 1
+                else:
+                    w, h = 1280, 720
+            except Exception:
+                w, h = 1280, 720
+        else:
+            w, h = 1280, 720
+        return {"cameras": [{"index": idx, "width": w, "height": h}], "configured": configured}
+
+    # No camera configured — scan (best-effort; ignore errors)
+    try:
+        loop = asyncio.get_running_loop()
+        cameras = await loop.run_in_executor(None, CameraManager.list_available_cameras)
+    except Exception:
+        cameras = []
     return {"cameras": [{"index": i, "width": w, "height": h} for i, w, h in cameras],
-            "configured": _config.camera_index if _config else -1}
+            "configured": configured}
 
 
 class StartBody(BaseModel):
