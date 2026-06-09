@@ -187,6 +187,8 @@ async def lifespan(app: FastAPI):
     push_task.cancel()
     if _monitor and _monitor._running:
         _monitor.stop()
+    if _monitor:
+        _monitor.close()       # disconnect printer / stop temp poller
     if _stream:
         _stream.stop()
 
@@ -227,6 +229,8 @@ def _state() -> dict:
         "description": r.description if r else "",
         "backend": r.backend if r else "",
         "camera_index": _monitor.camera.camera_index if _monitor.camera else None,
+        "printer": _monitor.printer.status.as_dict(),
+        "push_channels": _monitor.push.channels(),
     }
 
 
@@ -807,6 +811,22 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
       </div>
     </div>
 
+    <!-- Printer (USB) — hidden until a printer is connected -->
+    <div id="printer-block" style="display:none">
+      <div class="card-label" style="margin-top:18px">Printer</div>
+      <div class="counts">
+        <div class="count-box">
+          <div class="lbl">Nozzle</div>
+          <div class="num" id="temp-nozzle" style="font-size:20px">—</div>
+        </div>
+        <div class="count-box">
+          <div class="lbl">Bed</div>
+          <div class="num" id="temp-bed" style="font-size:20px">—</div>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:8px" id="printer-progress"></div>
+    </div>
+
     <div style="font-size:11px;color:var(--muted);border-top:1px solid var(--border);
                 padding-top:14px" id="backend-row"></div>
   </div>
@@ -913,6 +933,23 @@ function render(d) {
   // Backend
   if (d.backend) {
     document.getElementById('backend-row').textContent = 'Backend: ' + d.backend;
+  }
+
+  // Printer (USB) temps + progress
+  const p = d.printer || {};
+  const pb = document.getElementById('printer-block');
+  if (p.connected) {
+    pb.style.display = 'block';
+    const fmt = (t, tgt) => (t == null ? '—'
+      : Math.round(t) + '°' + (tgt ? ' / ' + Math.round(tgt) + '°' : ''));
+    document.getElementById('temp-nozzle').textContent = fmt(p.nozzle_temp, p.nozzle_target);
+    document.getElementById('temp-bed').textContent    = fmt(p.bed_temp, p.bed_target);
+    const prog = document.getElementById('printer-progress');
+    prog.textContent = (p.progress != null)
+      ? 'Progress: ' + (p.progress * 100).toFixed(1) + '%'
+      : (p.port ? 'Connected: ' + p.port : 'Connected');
+  } else {
+    pb.style.display = 'none';
   }
 
   // Camera label

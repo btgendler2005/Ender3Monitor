@@ -56,6 +56,18 @@ class Config:
     timelapse_dir: str
     confidence_threshold: float
 
+    # Printer USB control (optional)
+    printer_port: str           # serial device path; "" = disabled, "auto" = autodetect
+    printer_baud: int
+    auto_pause_on_failure: bool
+    auto_pause_action: str       # "pause" | "cooldown" | "estop"
+
+    # Push notifications (optional)
+    ntfy_topic: str              # ntfy.sh topic (or full URL); "" = disabled
+    discord_webhook: str         # Discord webhook URL; "" = disabled
+    telegram_bot_token: str
+    telegram_chat_id: str
+
     @classmethod
     def from_env(cls) -> "Config":
         # Load the project's .env explicitly so it works from any cwd.
@@ -84,4 +96,13 @@ class Config:
             metrics_port=int(os.getenv("METRICS_PORT", "8000")),
             timelapse_dir=os.getenv("TIMELAPSE_DIR", "timelapse_frames"),
             confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.70")),
+            printer_port=os.getenv("PRINTER_PORT", "").strip(),
+            printer_baud=int(os.getenv("PRINTER_BAUD", "115200")),
+            auto_pause_on_failure=os.getenv("AUTO_PAUSE_ON_FAILURE", "false").strip().lower()
+                in ("1", "true", "yes", "on"),
+            auto_pause_action=os.getenv("AUTO_PAUSE_ACTION", "pause").strip().lower(),
+            ntfy_topic=os.getenv("NTFY_TOPIC", "").strip(),
+            discord_webhook=os.getenv("DISCORD_WEBHOOK", "").strip(),
+            telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         )

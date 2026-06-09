@@ -22,6 +22,10 @@ from ender3monitor.analyzer import create_analyzer, AnalysisResult
 from ender3monitor.notifier import EmailNotifier
 from ender3monitor.metrics import MonitorMetrics
 from ender3monitor.timelapse import TimelapseManager
+from ender3monitor.printer import PrinterController
+from ender3monitor.push import PushNotifier
+
+PRINTER_POLL_INTERVAL = 5    # seconds between temperature polls over USB
 
 CAPTURE_INTERVAL = 30       # seconds between analysis frames
 TIMELAPSE_INTERVAL = 30     # seconds between timelapse frames
@@ -87,10 +91,24 @@ class Monitor:
         self.metrics = MonitorMetrics()
         self.timelapse = TimelapseManager(config.timelapse_dir)
 
+        # Optional printer USB control + push notifications
+        self.printer = PrinterController(config.printer_port, config.printer_baud)
+        self.push = PushNotifier(
+            ntfy_topic=config.ntfy_topic,
+            discord_webhook=config.discord_webhook,
+            telegram_bot_token=config.telegram_bot_token,
+            telegram_chat_id=config.telegram_chat_id,
+        )
+
         self._running = False
         self._stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+
+        # Background printer temperature/progress poller
+        self._printer_poll_stop = threading.Event()
+        self._printer_poll_thread: Optional[threading.Thread] = None
+        self._init_printer()
 
         # UI state
         self.status = "Idle"
@@ -114,6 +132,41 @@ class Monitor:
         # Optional external frame source (web UI shares its capture thread).
         # When set, the loop samples this instead of opening the camera.
         self._frame_provider: Optional[FrameProvider] = None
+
+    # ------------------------------------------------------------------ #
+    # Printer USB connection + polling                                     #
+    # ------------------------------------------------------------------ #
+
+    def _init_printer(self) -> None:
+        """Connect to the printer (if configured) and start the temp poller."""
+        if not self.config.printer_port:
+            return   # USB control disabled
+        if self.printer.connect():
+            print(f"  Printer connected on {self.printer.status.port}.")
+            self._printer_poll_thread = threading.Thread(
+                target=self._printer_poll_loop, daemon=True
+            )
+            self._printer_poll_thread.start()
+        else:
+            print(f"  Printer not connected: {self.printer.status.last_error}")
+
+    def _printer_poll_loop(self) -> None:
+        """Poll temperatures (and SD progress) for the live UI."""
+        ticks = 0
+        while not self._printer_poll_stop.is_set():
+            if self.printer.connected:
+                self.printer.query_temps()
+                if ticks % 3 == 0:          # progress less often
+                    self.printer.query_progress()
+            ticks += 1
+            self._printer_poll_stop.wait(timeout=PRINTER_POLL_INTERVAL)
+
+    def close(self) -> None:
+        """Release printer resources (call on app shutdown)."""
+        self._printer_poll_stop.set()
+        if self._printer_poll_thread and self._printer_poll_thread.is_alive():
+            self._printer_poll_thread.join(timeout=2)
+        self.printer.disconnect()
 
     # ------------------------------------------------------------------ #
     # Monitoring loop                                                       #
@@ -229,6 +282,7 @@ class Monitor:
                             self.status = f"Analysis error: {exc}"
                         continue
 
+                    confirmed_failure = False
                     with self._lock:
                         self.frame_count += 1
                         self.last_result = result
@@ -270,10 +324,11 @@ class Monitor:
                                 )
 
                                 if self._pending_failure_count == confirm_needed:
-                                    # Confirmed — alert once per incident
+                                    # Confirmed — alert once per incident. Do the
+                                    # actual I/O (email/push/serial) outside the lock.
                                     self.failure_count += 1
                                     self._no_motion_count = 0
-                                    self._send_alert(result, frame)
+                                    confirmed_failure = True
                             else:
                                 # Clean frame — reset pending failure
                                 self._pending_failure_type = None
@@ -283,6 +338,11 @@ class Monitor:
                                 else:
                                     self.status = "Monitoring…"
 
+                    # Side effects for a confirmed failure — outside the lock so
+                    # slow email/serial I/O doesn't block UI state reads.
+                    if confirmed_failure:
+                        self._handle_confirmed_failure(result, frame)
+
                     if self._running:
                         _print_status(self)
 
@@ -290,6 +350,34 @@ class Monitor:
             self.metrics.monitoring_active.set(0)
             # snapshot() releases the camera after every frame, so nothing
             # persistent to clean up here.
+
+    def _handle_confirmed_failure(self, result: AnalysisResult, frame: np.ndarray) -> None:
+        """All side effects for a confirmed failure: email, push, auto-pause."""
+        # 1. Email (existing behaviour)
+        self._send_alert(result, frame)
+
+        # 2. Push notification
+        if self.push.enabled:
+            msg = result.description or f"{result.failure_type} detected"
+            self.push.send(
+                title=f"⚠️ Print failure: {result.failure_type}",
+                message=f"{msg}\nConfidence {result.confidence:.0%}",
+                priority="high",
+            )
+
+        # 3. Auto-pause / cooldown / e-stop over USB
+        if self.config.auto_pause_on_failure:
+            if self.printer.connected:
+                action_result = self.printer.apply_failure_action(self.config.auto_pause_action)
+                print(f"\n  [PRINTER] Auto-{self.config.auto_pause_action}: {action_result}")
+                if self.push.enabled:
+                    self.push.send(
+                        title="🛑 Printer action taken",
+                        message=f"Auto-{self.config.auto_pause_action}: {action_result}",
+                        priority="high",
+                    )
+            else:
+                print("\n  [PRINTER] Auto-pause enabled but printer not connected.")
 
     def _send_alert(self, result: AnalysisResult, frame: np.ndarray) -> None:
         try:
@@ -304,6 +392,12 @@ class Monitor:
             print(f"\n  [EMAIL] Completion notice sent to {self.config.smtp_recipient}")
         except Exception as exc:
             print(f"\n  [EMAIL ERROR] {exc}")
+        if self.push.enabled:
+            self.push.send(
+                title="✅ Print complete",
+                message=f"Monitoring finished after {self.frame_count} analyzed frames.",
+                priority="default",
+            )
 
     # ------------------------------------------------------------------ #
     # Public control methods                                               #
