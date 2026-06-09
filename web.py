@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
+import time
 import traceback
 from contextlib import asynccontextmanager
 from typing import Optional, Set
@@ -36,61 +38,156 @@ _monitor: Optional[Monitor] = None
 _clients: Set[WebSocket] = set()
 DEFAULT_PORT = 8080
 
-# Shared MJPEG frame — written by the capture loop, read by stream clients
-_live_frame: Optional[bytes] = None
-_STREAM_FPS = 1          # captures per second (1 fps is plenty for a printer)
-_STREAM_QUALITY = 70     # JPEG quality for the live stream
-
-# When set, the stream capture loop pauses so a camera scan can have
-# exclusive access to the hardware (probing indices conflicts with the
-# continuous single-camera stream on most USB webcam drivers).
-_stream_paused = False
+# ── Live-view tuning ────────────────────────────────────────────────────────
+_STREAM_FPS = 12          # live-view frames per second served to the browser
+_STREAM_QUALITY = 70      # JPEG quality for the live stream
+_STREAM_WIDTH = 1280
+_STREAM_HEIGHT = 720
 
 
-def _capture_frame_sync() -> Optional[bytes]:
-    """Grab one frame from the camera and return it as JPEG bytes (runs in thread)."""
-    idx = 0
+class StreamCapture:
+    """Single persistent camera owner.
+
+    One background thread keeps the camera open and continuously reads frames
+    into a shared buffer. The MJPEG stream serves this buffer at _STREAM_FPS for
+    a smooth live view, while the analysis loop and timelapse sample the latest
+    raw frame on their own (much slower) schedule. Because there is exactly one
+    handle on the camera, there is no contention — the prior design opened the
+    camera separately for the stream and for each analysis frame, which raced on
+    macOS USB drivers.
+    """
+
+    def __init__(self, index: int, flip: Optional[int],
+                 width: int = _STREAM_WIDTH, height: int = _STREAM_HEIGHT,
+                 fps: int = _STREAM_FPS, quality: int = _STREAM_QUALITY) -> None:
+        self.index = index
+        self.flip = flip
+        self.width = width
+        self.height = height
+        self._encode_interval = 1.0 / max(1, fps)
+        self.quality = quality
+
+        self._latest_raw = None       # numpy BGR, already flipped
+        self._latest_jpeg: Optional[bytes] = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._paused = False          # when True, release the camera (for scans)
+        self._thread: Optional[threading.Thread] = None
+
+    # ── lifecycle ──
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def _open(self):
+        cap = cv2.VideoCapture(self.index)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
+    def _loop(self) -> None:
+        cap = None
+        last_encode = 0.0
+        while self._running:
+            # Paused (or reindexing): drop the camera handle so a scan can use it.
+            if self._paused:
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                time.sleep(0.1)
+                continue
+            if cap is None:
+                cap = self._open()
+                if cap is None:
+                    time.sleep(1.0)
+                    continue
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                cap.release()
+                cap = None
+                time.sleep(0.3)
+                continue
+            if self.flip is not None:
+                frame = cv2.flip(frame, self.flip)
+            with self._lock:
+                self._latest_raw = frame
+            now = time.time()
+            if now - last_encode >= self._encode_interval:
+                ok2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+                if ok2:
+                    with self._lock:
+                        self._latest_jpeg = buf.tobytes()
+                last_encode = now
+        if cap is not None:
+            cap.release()
+
+    # ── controls ──
+    def set_paused(self, paused: bool) -> None:
+        self._paused = paused
+
+    def set_index(self, index: int) -> None:
+        """Switch to a different camera. Briefly pauses so the old handle is
+        released before the new one opens."""
+        if index == self.index:
+            return
+        self.index = index
+        with self._lock:
+            self._latest_raw = None
+            self._latest_jpeg = None
+        self._paused = True
+        time.sleep(0.3)
+        self._paused = False
+
+    # ── readers ──
+    def latest_jpeg(self) -> Optional[bytes]:
+        with self._lock:
+            return self._latest_jpeg
+
+    def latest_frame(self):
+        """Return a copy of the latest raw frame (for analysis/timelapse)."""
+        with self._lock:
+            return None if self._latest_raw is None else self._latest_raw.copy()
+
+
+# The single shared capture instance (created in lifespan once config is loaded)
+_stream: Optional[StreamCapture] = None
+
+
+def _resolve_stream_index() -> int:
+    """Pick the camera index for the live stream at startup."""
     if _config and _config.camera_index >= 0:
-        idx = _config.camera_index
-    elif _monitor and _monitor.camera:
-        idx = _monitor.camera.camera_index
-    frame = CameraManager(idx, flip=_config.camera_flip if _config else None).snapshot()
-    if frame is None:
-        return None
-    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _STREAM_QUALITY])
-    return buf.tobytes()
-
-
-async def _stream_capture_loop() -> None:
-    """Background task: refresh the shared live frame at _STREAM_FPS."""
-    global _live_frame
-    loop = asyncio.get_running_loop()
-    while True:
-        if _stream_paused:
-            await asyncio.sleep(0.2)
-            continue
-        try:
-            data = await loop.run_in_executor(None, _capture_frame_sync)
-            if data:
-                _live_frame = data
-        except Exception:
-            pass
-        await asyncio.sleep(1.0 / _STREAM_FPS)
+        return _config.camera_index
+    return 0   # default; user can switch in the UI
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _config, _monitor
+    global _config, _monitor, _stream
     _config = Config.from_env()
     _monitor = Monitor(_config)
     _monitor.metrics.start_server(_config.metrics_port)
-    push_task    = asyncio.create_task(_push_loop())
-    capture_task = asyncio.create_task(_stream_capture_loop())
+    _stream = StreamCapture(_resolve_stream_index(),
+                            flip=_config.camera_flip)
+    _stream.start()
+    push_task = asyncio.create_task(_push_loop())
     yield
     push_task.cancel()
-    capture_task.cancel()
     if _monitor and _monitor._running:
         _monitor.stop()
+    if _stream:
+        _stream.stop()
 
 
 app = FastAPI(title="Ender3Monitor", lifespan=lifespan)
@@ -155,7 +252,6 @@ async def api_cameras(scan: bool = False):
 
     Pass ?scan=true to force a full hardware scan regardless.
     """
-    global _stream_paused
     try:
         configured = _config.camera_index if _config else -1
 
@@ -166,9 +262,10 @@ async def api_cameras(scan: bool = False):
                 "configured": configured,
             }
 
-        # Pause the stream loop so the scan has exclusive access to the
-        # camera hardware, then give any in-flight capture time to release.
-        _stream_paused = True
+        # Pause the persistent capture so the scan has exclusive access to the
+        # camera hardware, then give it a moment to release its handle.
+        if _stream:
+            _stream.set_paused(True)
         await asyncio.sleep(0.4)
         try:
             loop = asyncio.get_running_loop()
@@ -180,13 +277,15 @@ async def api_cameras(scan: bool = False):
             log.warning("Camera scan timed out")
             return JSONResponse({"error": "Camera scan timed out", "cameras": [], "configured": configured})
         finally:
-            _stream_paused = False
+            if _stream:
+                _stream.set_paused(False)
         return {
             "cameras": [{"index": i, "width": w, "height": h} for i, w, h in cameras],
             "configured": configured,
         }
     except Exception:
-        _stream_paused = False
+        if _stream:
+            _stream.set_paused(False)
         log.error("Unhandled error in /api/cameras:\n%s", traceback.format_exc())
         return JSONResponse({"error": "Internal error — see server log", "cameras": [], "configured": -1})
 
@@ -216,8 +315,21 @@ async def api_start(body: StartBody = StartBody()):
     cam = body.camera_index
     if cam is None and _config and _config.camera_index >= 0:
         cam = _config.camera_index
+
+    # Point the persistent capture at the chosen camera (if specified), then
+    # hand the monitor that same capture as its frame source — no second handle.
+    if _stream is not None and cam is not None and cam != _stream.index:
+        _stream.set_index(cam)
+        await asyncio.sleep(0.5)   # let the new camera produce a first frame
+
+    provider = _stream.latest_frame if _stream is not None else None
+    cam_for_monitor = cam if cam is not None else (_stream.index if _stream else None)
+
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, lambda: _monitor.start(camera_index=cam))
+    await loop.run_in_executor(
+        None,
+        lambda: _monitor.start(camera_index=cam_for_monitor, frame_provider=provider),
+    )
     await _broadcast()
     return _state()
 
@@ -246,13 +358,26 @@ async def api_status():
     return _state()
 
 
+class PreviewBody(BaseModel):
+    camera_index: int
+
+
+@app.post("/api/preview")
+async def api_preview(body: PreviewBody):
+    """Switch the live-view camera without starting monitoring — lets the user
+    confirm the right camera in the UI before hitting Start."""
+    if _stream is None:
+        return JSONResponse({"error": "stream not ready"}, 503)
+    if _monitor and _monitor._running:
+        return JSONResponse({"error": "stop monitoring before switching camera"}, 409)
+    _stream.set_index(body.camera_index)
+    return {"camera_index": body.camera_index}
+
+
 @app.get("/snapshot")
 async def snapshot():
-    """On-demand JPEG snapshot (single frame)."""
-    data = _live_frame
-    if data is None:
-        loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(None, _capture_frame_sync)
+    """On-demand JPEG snapshot (single frame from the live buffer)."""
+    data = _stream.latest_jpeg() if _stream else None
     if data is None:
         return Response(status_code=204)
     return Response(data, media_type="image/jpeg",
@@ -260,9 +385,10 @@ async def snapshot():
 
 
 async def _mjpeg_generator():
-    """Yield MJPEG frames from the shared live frame buffer."""
+    """Yield MJPEG frames from the shared live buffer at _STREAM_FPS."""
+    interval = 1.0 / _STREAM_FPS
     while True:
-        frame = _live_frame
+        frame = _stream.latest_jpeg() if _stream else None
         if frame:
             yield (
                 b"--frame\r\n"
@@ -270,7 +396,7 @@ async def _mjpeg_generator():
                 frame +
                 b"\r\n"
             )
-        await asyncio.sleep(1.0 / _STREAM_FPS)
+        await asyncio.sleep(interval)
 
 
 @app.get("/stream")
@@ -603,7 +729,7 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
 <!-- Controls -->
 <div class="controls">
   <div class="cam-select-row">
-    <select id="cam-select" title="Select camera">
+    <select id="cam-select" title="Select camera" onchange="previewCamera()">
       <option value="">Scanning cameras…</option>
     </select>
     <button class="btn-scan" onclick="scanCameras(true)" title="Rescan all cameras">
@@ -753,6 +879,24 @@ function selectedCam() {
   const sel = document.getElementById('cam-select');
   const v = sel ? parseInt(sel.value, 10) : NaN;
   return isNaN(v) ? null : v;
+}
+
+// Switch the live preview to the chosen camera (only when not monitoring)
+async function previewCamera() {
+  const cam = selectedCam();
+  if (cam === null) return;
+  try {
+    const res = await fetch('/api/preview', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ camera_index: cam }),
+    });
+    if (res.ok) {
+      toast(`Live view → Camera ${cam}`);
+    } else if (res.status === 409) {
+      toast('Stop monitoring before switching camera');
+    }
+  } catch(e) {}
 }
 
 // ── Controls ───────────────────────────────────────────────────────────────

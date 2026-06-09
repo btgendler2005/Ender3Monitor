@@ -5,10 +5,16 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
+
+# A frame provider returns the latest camera frame (already oriented/flipped)
+# or None if no frame is available yet. Used by the web UI to share its single
+# persistent capture thread with the analysis loop instead of opening the
+# camera a second time.
+FrameProvider = Callable[[], Optional[np.ndarray]]
 
 from ender3monitor.config import Config
 from ender3monitor.camera import CameraManager
@@ -105,6 +111,10 @@ class Monitor:
         self._pending_failure_type: Optional[str] = None
         self._pending_failure_count: int = 0
 
+        # Optional external frame source (web UI shares its capture thread).
+        # When set, the loop samples this instead of opening the camera.
+        self._frame_provider: Optional[FrameProvider] = None
+
     # ------------------------------------------------------------------ #
     # Monitoring loop                                                       #
     # ------------------------------------------------------------------ #
@@ -138,10 +148,14 @@ class Monitor:
                 if not (needs_analysis or needs_timelapse):
                     continue
 
-                # Open, grab one frame, release immediately — this prevents
-                # OpenCV's internal capture thread from running continuously
-                # at 30 fps between monitoring intervals.
-                frame = self.camera.snapshot() if self.camera else None
+                # Sample a frame. With an external provider (web UI), pull the
+                # latest frame from its shared capture thread — no second camera
+                # handle. Otherwise open/grab/release via snapshot(), which keeps
+                # OpenCV's capture thread from running continuously between frames.
+                if self._frame_provider is not None:
+                    frame = self._frame_provider()
+                else:
+                    frame = self.camera.snapshot() if self.camera else None
 
                 if frame is None:
                     with self._lock:
@@ -295,7 +309,8 @@ class Monitor:
     # Public control methods                                               #
     # ------------------------------------------------------------------ #
 
-    def start(self, camera_index: Optional[int] = None) -> None:
+    def start(self, camera_index: Optional[int] = None,
+              frame_provider: Optional[FrameProvider] = None) -> None:
         if self._running:
             print("  Already monitoring.")
             return
@@ -314,12 +329,18 @@ class Monitor:
         else:
             idx = self.config.camera_index
 
+        # CameraManager is kept for metadata (camera_index display). When a
+        # frame_provider is supplied the loop uses that instead of opening the
+        # camera, so we must NOT probe it here — that would grab a second handle
+        # and fight the provider's persistent capture thread.
         self.camera = CameraManager(idx, flip=self.config.camera_flip)
-        # Verify the camera is reachable before starting the thread
-        if self.camera.snapshot() is None:
-            print(f"  Camera error: cannot read from camera {idx}.")
-            self.camera = None
-            return
+        self._frame_provider = frame_provider
+        if frame_provider is None:
+            # Standalone capture — verify the camera is reachable before starting.
+            if self.camera.snapshot() is None:
+                print(f"  Camera error: cannot read from camera {idx}.")
+                self.camera = None
+                return
 
         self.timelapse.reset_session()
         self._stop_event.clear()
@@ -356,6 +377,7 @@ class Monitor:
         if self.camera:
             self.camera.release()
             self.camera = None
+        self._frame_provider = None   # release reference to the web UI's capture
         if self.status != "Print Complete":
             self.status = "Idle"
         print("  Monitoring stopped.")
