@@ -24,7 +24,7 @@ from ender3monitor.metrics import MonitorMetrics
 from ender3monitor.timelapse import TimelapseManager
 
 CAPTURE_INTERVAL = 30       # seconds between analysis frames
-TIMELAPSE_INTERVAL = 60     # seconds between timelapse frames
+TIMELAPSE_INTERVAL = 30     # seconds between timelapse frames
 
 # Print-complete detection: stop after this many consecutive still frames
 NO_MOTION_LIMIT = 4         # 4 × 30 s = 2 minutes

@@ -17,7 +17,7 @@ Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, f
 - **CLI** — terminal interface with live status line if you prefer to run headless
 - **Prometheus metrics** — `/metrics` endpoint for frames analyzed, failure counts by type, and confidence score trends
 - **Grafana dashboard** — pre-built JSON ready to import
-- **Timelapse** — saves a frame every 60 seconds and compiles to MP4 on demand
+- **Timelapse** — saves a frame every 30 seconds and compiles to a downloadable MP4 on demand
 - **Multi-camera support** — auto-detects cameras, opens Preview snapshots so you can visually identify which index maps to your printer
 
 ---
@@ -285,7 +285,7 @@ Ender3Monitor/
 4. Valid frames are sent to Claude or llava:7b with a structured prompt; the model returns JSON with `failure_detected`, `failure_type`, `confidence`, and `description`
 5. If confidence ≥ `CONFIDENCE_THRESHOLD` and a real failure is detected, an email alert is sent with the frame attached
 6. If 4 consecutive frames show no significant change (2 minutes of stillness), the print is marked complete, a notification is sent, and monitoring stops automatically
-7. Every 60 seconds a frame is saved for the timelapse
+7. Every 30 seconds a frame is saved for the timelapse
 8. All results are pushed to Prometheus metrics in real time and broadcast to connected web UI clients via WebSocket
 
 ---
