@@ -16,12 +16,13 @@ import threading
 import time
 import traceback
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional, Set
 
 import cv2
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, Response, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, JSONResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -349,8 +350,38 @@ async def api_timelapse():
     if _monitor is None:
         return JSONResponse({"error": "not initialised"}, 503)
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _monitor.compile_timelapse)
-    return {"message": "timelapse compiled"}
+    path = await loop.run_in_executor(None, _monitor.compile_timelapse)
+    if not path:
+        return JSONResponse(
+            {"error": "No frames to compile yet — start monitoring first.", "file": None}
+        )
+    return {"message": "timelapse compiled", "file": Path(path).name}
+
+
+def _timelapse_dir() -> Path:
+    return Path(_config.timelapse_dir).resolve() if _config else Path("timelapse_frames").resolve()
+
+
+@app.get("/download/timelapse")
+async def download_timelapse(name: Optional[str] = None):
+    """Download a compiled timelapse MP4. With ?name=…, serves that file;
+    otherwise serves the most recently compiled one. Path-traversal safe —
+    only .mp4 files directly inside the timelapse dir are served."""
+    base = _timelapse_dir()
+    if name:
+        # Reduce to a bare filename so "../" etc. can't escape the directory
+        candidate = (base / Path(name).name).resolve()
+    else:
+        mp4s = sorted(base.glob("timelapse_*.mp4"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        if not mp4s:
+            return JSONResponse({"error": "No timelapse available."}, 404)
+        candidate = mp4s[0].resolve()
+
+    if candidate.parent != base or candidate.suffix != ".mp4" or not candidate.is_file():
+        return JSONResponse({"error": "Timelapse not found."}, 404)
+
+    return FileResponse(str(candidate), media_type="video/mp4", filename=candidate.name)
 
 
 @app.get("/api/status")
@@ -811,11 +842,11 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
     <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
     Stop
   </button>
-  <button onclick="doTimelapse()">
+  <button onclick="doTimelapse()" id="btn-timelapse">
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16" fill="currentColor"/>
+      <path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/>
     </svg>
-    Compile Timelapse
+    Download Timelapse
   </button>
 </div>
 
@@ -974,7 +1005,20 @@ async function doStop() {
   const data = await api('stop');
   if (data) render(data);
 }
-async function doTimelapse() { await api('timelapse'); toast('Timelapse compiling…') }
+async function doTimelapse() {
+  const btn = document.getElementById('btn-timelapse');
+  btn.disabled = true;
+  toast('Compiling timelapse…');
+  const data = await api('timelapse');
+  btn.disabled = false;
+  if (data && data.file) {
+    toast('Downloading ' + data.file);
+    // Content-Disposition: attachment triggers a download without navigating away
+    window.location = '/download/timelapse?name=' + encodeURIComponent(data.file);
+  } else {
+    toast((data && data.error) ? data.error : 'No timelapse to download yet');
+  }
+}
 
 // Returns parsed JSON on success, null on error
 async function api(action, body = null) {

@@ -382,11 +382,12 @@ class Monitor:
             self.status = "Idle"
         print("  Monitoring stopped.")
 
-    def compile_timelapse(self) -> None:
+    def compile_timelapse(self) -> Optional[str]:
         print("  Compiling timelapse…")
         result = self.timelapse.compile()
         if result:
             print(f"  Saved: {result}")
+        return result
 
 
 # ------------------------------------------------------------------ #
