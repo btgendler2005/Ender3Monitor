@@ -619,25 +619,37 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
 }
 .ev{
   display:grid;
-  grid-template-columns:68px 90px 1fr 46px;
-  gap:12px;align-items:center;
+  grid-template-columns:64px 116px 1fr 44px;
+  gap:12px;align-items:start;       /* top-align so multi-line rows never overlap */
   padding:10px 18px;
   border-bottom:1px solid var(--border);
   font-size:12px;
 }
 .ev:last-child{border-bottom:none}
-.ev-time{color:var(--muted);font-family:monospace;font-size:11.5px}
+.ev-time{color:var(--muted);font-family:monospace;font-size:11.5px;padding-top:2px}
 .badge{
-  padding:2px 9px;border-radius:5px;
+  padding:3px 9px;border-radius:5px;
   font-size:10.5px;font-weight:700;
   text-transform:uppercase;letter-spacing:.05em;
-  width:fit-content;
+  width:fit-content;max-width:100%;
+  min-width:0;                      /* allow shrink inside the grid track */
+  overflow-wrap:anywhere;           /* wrap long/compound failure types */
+  line-height:1.35;
 }
 .badge-ok  {background:rgba(34,197,94,.12);color:var(--green)}
 .badge-fail{background:rgba(248,113,113,.12);color:var(--red)}
 .badge-done{background:rgba(79,142,247,.12);color:var(--blue)}
-.ev-desc{color:var(--text);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-.ev-conf{color:var(--muted);font-family:monospace;text-align:right}
+.ev-desc{
+  color:var(--text);
+  min-width:0;                      /* let it wrap instead of overflowing */
+  overflow-wrap:anywhere;
+  line-height:1.5;
+  display:-webkit-box;
+  -webkit-line-clamp:3;             /* wrap up to 3 lines, then ellipsis */
+  -webkit-box-orient:vertical;
+  overflow:hidden;
+}
+.ev-conf{color:var(--muted);font-family:monospace;text-align:right;padding-top:2px}
 
 /* ── Toast ── */
 #toast{
@@ -935,7 +947,7 @@ function addLog(d) {
   const isDone = (d.status||'').toLowerCase().includes('complete');
   const cls  = isFail ? 'badge-fail' : isDone ? 'badge-done' : 'badge-ok';
   const lbl  = isFail ? (d.failure_type||'failure') : isDone ? 'complete' : 'ok';
-  const desc = (d.description||'').slice(0, 90);
+  const desc = (d.description||'').slice(0, 220);
   const conf = d.confidence ? (d.confidence*100).toFixed(0)+'%' : '';
 
   const row = document.createElement('div');
