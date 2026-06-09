@@ -424,6 +424,7 @@ _HTML = r"""<!DOCTYPE html>
 <title>Ender3Monitor</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{overflow-x:hidden;max-width:100%}
 
 :root{
   --bg:#070b14;
@@ -450,6 +451,7 @@ body{
   min-height:100vh;
   display:flex;
   flex-direction:column;
+  overflow-x:hidden;            /* never scroll sideways on small screens */
 }
 
 /* ── Header ── */
@@ -518,7 +520,10 @@ header{
   border-radius:8px;object-fit:cover;
   background:#000;display:block;
 }
-.cam-meta{font-size:11.5px;color:var(--muted);display:flex;justify-content:space-between}
+.cam-meta{font-size:11.5px;color:var(--muted);display:flex;justify-content:space-between;
+          flex-wrap:wrap;gap:4px 10px;min-width:0}
+.cam-meta span{min-width:0;overflow-wrap:anywhere}
+#stream-url{word-break:break-all}
 
 /* ── Stats ── */
 .stats-card{display:flex;flex-direction:column;gap:20px}
@@ -660,6 +665,53 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
   box-shadow:var(--shadow);
 }
 #toast.show{transform:translateX(-50%) translateY(0)}
+
+/* ── Mobile / narrow screens ── */
+@media (max-width:760px){
+  header{padding:12px 16px}
+  .logo{font-size:15px}
+  .pill{padding:5px 10px;font-size:10px}
+
+  /* Stack the two-column layout into one; camera no longer spans rows */
+  .page{
+    grid-template-columns:1fr;
+    grid-template-rows:none;
+    gap:14px;
+    padding:14px 14px;
+  }
+  .cam-card{grid-row:auto}
+  .card{padding:16px}
+
+  /* Controls: full-width camera picker, big tappable buttons */
+  .controls{padding:0 14px 4px;gap:8px}
+  .cam-select-row{flex:1 0 100%;min-width:0}
+  #cam-select{min-width:0}
+  .controls > button{flex:1 1 40%;justify-content:center;padding:12px 14px;font-size:14px}
+  .btn-scan{flex:0 0 auto}
+
+  .log-section{padding:0 14px 22px}
+
+  /* Event log: time + badge + confidence on top row, description below */
+  .ev{
+    /* minmax(0,1fr) — not plain 1fr — lets the middle track shrink below its
+       content's min-width so a long compound badge wraps instead of blowing
+       out the row width (the classic CSS grid overflow trap). */
+    grid-template-columns:auto minmax(0,1fr) auto;
+    grid-template-areas:
+      "time badge conf"
+      "desc desc desc";
+    row-gap:6px;column-gap:10px;
+    align-items:center;
+    padding:12px 14px;
+  }
+  .ev-time{grid-area:time}
+  /* base .badge already has width:fit-content + max-width:100%; combined with
+     the minmax(0,1fr) track that clamps & wraps long compound types while
+     keeping short badges compact */
+  .badge{grid-area:badge;justify-self:start}
+  .ev-conf{grid-area:conf;padding-top:0}
+  .ev-desc{grid-area:desc;-webkit-line-clamp:4}
+}
 </style>
 </head>
 <body>
