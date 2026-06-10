@@ -67,6 +67,7 @@ class Config:
     discord_webhook: str         # Discord webhook URL; "" = disabled
     telegram_bot_token: str
     telegram_chat_id: str
+    telegram_allowed_chats: str  # comma-separated chat IDs allowed to send commands
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -105,4 +106,5 @@ class Config:
             discord_webhook=os.getenv("DISCORD_WEBHOOK", "").strip(),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+            telegram_allowed_chats=os.getenv("TELEGRAM_ALLOWED_CHATS", "").strip(),
         )

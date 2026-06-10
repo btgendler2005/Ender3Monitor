@@ -30,6 +30,7 @@ log = logging.getLogger("ender3monitor")
 
 from ender3monitor.camera import CameraManager
 from ender3monitor.config import Config
+from ender3monitor.telegram_bot import TelegramBot
 from monitor import Monitor
 
 # ── global state ──────────────────────────────────────────────────────────────
@@ -37,6 +38,7 @@ from monitor import Monitor
 _config: Optional[Config] = None
 _monitor: Optional[Monitor] = None
 _clients: Set[WebSocket] = set()
+_telegram: Optional[TelegramBot] = None
 DEFAULT_PORT = 8080
 
 # ── Live-view tuning ────────────────────────────────────────────────────────
@@ -173,18 +175,136 @@ def _resolve_stream_index() -> int:
     return 0   # default; user can switch in the UI
 
 
+# ── Telegram command handlers ─────────────────────────────────────────────────
+
+def _printer_status_lines() -> list:
+    pr = _monitor.printer.status if _monitor else None
+    if not (pr and pr.connected):
+        return ["Printer: not connected"]
+    def t(v, tgt):
+        return "—" if v is None else f"{round(v)}°" + (f"/{round(tgt)}°" if tgt else "")
+    lines = [f"Nozzle: {t(pr.nozzle_temp, pr.nozzle_target)}   Bed: {t(pr.bed_temp, pr.bed_target)}"]
+    if pr.printing and pr.progress is not None:
+        d = pr.as_dict()
+        extra = []
+        if d.get("elapsed_str"):   extra.append(d['elapsed_str'] + " elapsed")
+        if d.get("remaining_str"): extra.append("~" + d['remaining_str'] + " left")
+        lines.append(f"Progress: {pr.progress*100:.1f}%   " + "   ".join(extra))
+    elif pr.printing:
+        lines.append("Printing…")
+    return lines
+
+
+def _tg_status(args):
+    s = _state()
+    out = ["*Ender3Monitor*", f"Status: {s.get('status')}",
+           f"Frames: {s.get('frame_count', 0)}   Failures: {s.get('failure_count', 0)}"]
+    ft = s.get("failure_type")
+    if ft and ft not in ("none", "no_printer"):
+        out.append(f"Last: {ft} ({(s.get('confidence') or 0)*100:.0f}%)")
+    out += _printer_status_lines()
+    return "\n".join(out)
+
+
+def _tg_snapshot(args):
+    jpeg = _stream.latest_jpeg() if _stream else None
+    return ("photo", jpeg, "📷 Live snapshot")
+
+
+def _require_printer():
+    return _monitor and _monitor.printer.connected
+
+
+def _tg_pause(args):
+    if not _require_printer(): return "Printer not connected."
+    _monitor.printer.pause(); return "⏸ Print paused."
+
+
+def _tg_resume(args):
+    if not _require_printer(): return "Printer not connected."
+    _monitor.printer.resume(); return "▶️ Print resumed."
+
+
+def _tg_cooldown(args):
+    if not _require_printer(): return "Printer not connected."
+    _monitor.printer.cooldown(); return "❄️ Paused — heaters off."
+
+
+def _tg_go(args):
+    if _monitor is None: return "Not ready."
+    if _monitor._running: return "Already monitoring."
+    provider = _stream.latest_frame if _stream else None
+    cam = _stream.index if _stream else None
+    _monitor.start(camera_index=cam, frame_provider=provider)
+    return "▶️ Monitoring started."
+
+
+def _tg_stop(args):
+    if _monitor is None: return "Not ready."
+    _monitor.stop(); return "⏹ Monitoring stopped."
+
+
+def _build_telegram_handlers():
+    handlers = {
+        "status":   (_tg_status,   "current status + temps + progress"),
+        "snapshot": (_tg_snapshot, "live camera photo"),
+        "photo":    (_tg_snapshot, "alias of /snapshot"),
+        "pause":    (_tg_pause,    "pause the print"),
+        "resume":   (_tg_resume,   "resume the print"),
+        "cooldown": (_tg_cooldown, "pause + heaters off"),
+        "go":       (_tg_go,       "start monitoring"),
+        "stop":     (_tg_stop,     "stop monitoring"),
+    }
+
+    def _help(args):
+        lines = ["*Ender3Monitor commands*"]
+        for cmd, (_, desc) in handlers.items():
+            if desc.startswith("alias"):
+                continue
+            lines.append(f"/{cmd} — {desc}")
+        lines.append("/help — this list")
+        return "\n".join(lines)
+
+    handlers["help"] = (_help, "alias")             # listed manually below
+    handlers["start"] = (_help, "alias of /help")   # /start is Telegram's default
+    return handlers
+
+
+def _parse_allowed_chats(raw: str) -> set:
+    out = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if part:
+            try:
+                out.add(int(part))
+            except ValueError:
+                pass
+    return out
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _config, _monitor, _stream
+    global _config, _monitor, _stream, _telegram
     _config = Config.from_env()
     _monitor = Monitor(_config)
     _monitor.metrics.start_server(_config.metrics_port)
     _stream = StreamCapture(_resolve_stream_index(),
                             flip=_config.camera_flip)
     _stream.start()
+
+    # Interactive Telegram bot (optional)
+    if _config.telegram_bot_token:
+        allowed = _parse_allowed_chats(_config.telegram_allowed_chats)
+        _telegram = TelegramBot(_config.telegram_bot_token, allowed, _build_telegram_handlers())
+        _telegram.start()
+        log.info("Telegram bot started (authorized chats: %s)",
+                 allowed if allowed else "none yet — DM the bot to get your chat ID")
+
     push_task = asyncio.create_task(_push_loop())
     yield
     push_task.cancel()
+    if _telegram:
+        _telegram.stop()
     if _monitor and _monitor._running:
         _monitor.stop()
     if _monitor:
