@@ -82,9 +82,16 @@ class PrinterStatus:
 
 
 def autodetect_port() -> Optional[str]:
-    """Best-effort guess at the printer's serial device across platforms."""
+    """Best-effort guess at the printer's serial device across platforms.
+
+    On macOS the cu.* node is preferred over tty.* — tty.* can block on open
+    waiting for a carrier-detect signal the printer never asserts. Re-globbing
+    each time also means a replug that renames the device (e.g. usbserial-1210
+    → usbserial-1310) is handled transparently, including on reconnect.
+    """
     patterns = [
-        "/dev/tty.usbserial*", "/dev/tty.usbmodem*", "/dev/tty.wchusbserial*",  # macOS
+        "/dev/cu.usbserial*", "/dev/cu.usbmodem*", "/dev/cu.wchusbserial*",      # macOS (preferred)
+        "/dev/tty.usbserial*", "/dev/tty.usbmodem*", "/dev/tty.wchusbserial*",   # macOS fallback
         "/dev/ttyUSB*", "/dev/ttyACM*",                                          # Linux
     ]
     for pat in patterns:
