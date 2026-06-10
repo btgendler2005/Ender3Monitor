@@ -994,9 +994,16 @@ function render(d) {
     document.getElementById('temp-nozzle').textContent = fmt(p.nozzle_temp, p.nozzle_target);
     document.getElementById('temp-bed').textContent    = fmt(p.bed_temp, p.bed_target);
     const prog = document.getElementById('printer-progress');
-    prog.textContent = (p.progress != null)
-      ? 'Progress: ' + (p.progress * 100).toFixed(1) + '%'
-      : (p.port ? 'Connected: ' + p.port : 'Connected');
+    if (p.printing && p.progress != null) {
+      const parts = [(p.progress * 100).toFixed(1) + '%'];
+      if (p.elapsed_str)   parts.push(p.elapsed_str + ' elapsed');
+      if (p.remaining_str) parts.push('~' + p.remaining_str + ' left');
+      prog.textContent = parts.join('  ·  ');
+    } else if (p.printing) {
+      prog.textContent = 'Printing…';
+    } else {
+      prog.textContent = p.port ? 'Idle · ' + p.port : 'Idle';
+    }
   } else {
     pb.style.display = 'none';
   }

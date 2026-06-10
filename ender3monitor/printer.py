@@ -34,6 +34,19 @@ except Exception:
 _TEMP_RE = re.compile(r"T:\s*(-?\d+\.?\d*)\s*/\s*(-?\d+\.?\d*).*?B:\s*(-?\d+\.?\d*)\s*/\s*(-?\d+\.?\d*)")
 # M27 reply looks like:   SD printing byte 1234/56789   (or "Not SD printing")
 _SD_RE = re.compile(r"SD printing byte\s+(\d+)\s*/\s*(\d+)")
+# M31 reply looks like:   echo:Print time: 1h 23m 45s   (any of h/m/s may be absent)
+_PRINTTIME_RE = re.compile(r"Print time:\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?", re.IGNORECASE)
+
+
+def _fmt_duration(seconds: Optional[int]) -> Optional[str]:
+    if seconds is None:
+        return None
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, _ = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
 
 
 @dataclass
@@ -44,7 +57,11 @@ class PrinterStatus:
     nozzle_target: Optional[float] = None
     bed_temp: Optional[float] = None
     bed_target: Optional[float] = None
+    printing: bool = False                  # an SD/USB print is currently active
     progress: Optional[float] = None        # 0..1, SD prints only
+    elapsed_seconds: Optional[int] = None   # print job timer (M31)
+    remaining_seconds: Optional[int] = None # estimated, from elapsed + progress
+
     last_error: Optional[str] = None
 
     def as_dict(self) -> dict:
@@ -55,7 +72,12 @@ class PrinterStatus:
             "nozzle_target": self.nozzle_target,
             "bed_temp": self.bed_temp,
             "bed_target": self.bed_target,
+            "printing": self.printing,
             "progress": self.progress,
+            "elapsed_seconds": self.elapsed_seconds,
+            "remaining_seconds": self.remaining_seconds,
+            "elapsed_str": _fmt_duration(self.elapsed_seconds),
+            "remaining_str": _fmt_duration(self.remaining_seconds),
         }
 
 
@@ -180,14 +202,39 @@ class PrinterController:
             self.status.bed_target = float(m.group(4))
 
     def query_progress(self) -> None:
-        """Update SD-print progress via M27 (only meaningful for SD prints)."""
+        """Update SD-print state + percent via M27 (meaningful for SD/USB prints)."""
         resp = self.send("M27")
         m = _SD_RE.search(resp)
         if m:
             done, total = int(m.group(1)), int(m.group(2))
+            self.status.printing = True
             self.status.progress = (done / total) if total > 0 else None
         elif "Not SD printing" in resp:
-            self.status.progress = None
+            self.status.printing = False
+
+    def query_print_time(self) -> None:
+        """Update elapsed time via M31 and estimate remaining from progress."""
+        resp = self.send("M31")
+        m = _PRINTTIME_RE.search(resp)
+        if m and any(m.groups()):
+            h = int(m.group(1) or 0)
+            mn = int(m.group(2) or 0)
+            s = int(m.group(3) or 0)
+            self.status.elapsed_seconds = h * 3600 + mn * 60 + s
+        # Estimate remaining: linear projection once we're a little way in.
+        el, pct = self.status.elapsed_seconds, self.status.progress
+        if self.status.printing and el is not None and pct is not None and pct > 0.02:
+            self.status.remaining_seconds = int(el * (1.0 / pct - 1.0))
+        elif not self.status.printing:
+            self.status.remaining_seconds = None
+
+    def refresh_status(self) -> None:
+        """One combined poll: temps, print state/percent, and time."""
+        self.query_temps()
+        if not self.connected:
+            return
+        self.query_progress()
+        self.query_print_time()
 
     # ------------------------------------------------------------------ #
     # Interventions                                                        #

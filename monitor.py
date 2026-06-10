@@ -45,6 +45,10 @@ SPAGHETTI_CONFIRM_FRAMES = 2        # spaghetti needs 2 frames — 1 min — red
 # the printer is stationary and the LLM would see a "nothing happening" frame.
 STARTUP_GRACE_FRAMES = 10           # 10 × 30 s = 5 min warm-up window
 
+# Near the end of a print the head parks away from the model, leaving a gap
+# that looks like stopped-extrusion. Suppress failure flagging past this %.
+COMPLETION_SUPPRESS_PCT = 0.97
+
 
 def _frames_differ(f1: np.ndarray, f2: np.ndarray, threshold: float = MOTION_THRESHOLD) -> bool:
     """Return True if the two frames differ significantly (motion / print activity)."""
@@ -126,6 +130,10 @@ class Monitor:
         self._prev_analysis_frame: Optional[np.ndarray] = None
         self._print_motion_seen: bool = False   # True once the printer first moves
 
+        # Printer-authoritative completion (preferred over camera stillness)
+        self._seen_printer_printing: bool = False  # saw an active SD/USB print
+        self._printer_was_printing: bool = False   # previous poll's printing state
+
         # Failure confirmation — require consecutive frames before alerting
         self._pending_failure_type: Optional[str] = None
         self._pending_failure_count: int = 0
@@ -169,21 +177,18 @@ class Monitor:
         was_connected = self.printer.connected
         while not self._printer_poll_stop.is_set():
             if self.printer.connected:
-                self.printer.query_temps()
-                if self.printer.connected and ticks % 3 == 0:
-                    self.printer.query_progress()
+                self.printer.refresh_status()   # temps + print state + time
             elif ticks % reconnect_ticks == 0:
-                self.printer.connect()   # quiet retry; logged on transition below
+                self.printer.connect()          # quiet retry; logged on transition below
 
             # Log + clean up on connect/disconnect transitions
             now_connected = self.printer.connected
             if was_connected and not now_connected:
                 print("\n  [PRINTER] Connection lost — retrying in the background…")
-                self.printer.status.nozzle_temp = None
-                self.printer.status.nozzle_target = None
-                self.printer.status.bed_temp = None
-                self.printer.status.bed_target = None
-                self.printer.status.progress = None
+                s = self.printer.status
+                s.nozzle_temp = s.nozzle_target = None
+                s.bed_temp = s.bed_target = None
+                s.progress = s.elapsed_seconds = s.remaining_seconds = None
             elif not was_connected and now_connected:
                 print(f"\n  [PRINTER] Reconnected on {self.printer.status.port}.")
             was_connected = now_connected
@@ -269,38 +274,69 @@ class Monitor:
                             _print_status(self)
                         continue   # skip motion check and LLM during grace period
 
-                    # ── Motion / completion detection ──────────────────── #
-                    if self._prev_analysis_frame is not None:
-                        if _frames_differ(frame, self._prev_analysis_frame):
-                            if self._no_motion_count > 0:
-                                print(
-                                    f"\n  [MOTION] Change detected — "
-                                    f"resetting idle counter (was {self._no_motion_count})"
-                                )
-                            self._print_motion_seen = True
-                            self._no_motion_count = 0
-                        else:
-                            if self._print_motion_seen:
-                                # Only count toward completion after printing has started
-                                self._no_motion_count += 1
-                                print(
-                                    f"\n  [MOTION] No change detected "
-                                    f"({self._no_motion_count}/{NO_MOTION_LIMIT} frames)"
-                                )
-                                if self._no_motion_count >= NO_MOTION_LIMIT:
-                                    with self._lock:
-                                        self.status = "Print Complete"
-                                        self._running = False
+                    # ── Printer-authoritative status (preferred) ───────── #
+                    printer_connected = self.printer.connected
+                    pr = self.printer.status if printer_connected else None
+                    printer_printing = bool(pr and pr.printing)
+                    if printer_printing:
+                        self._seen_printer_printing = True
+                    use_printer_completion = self._seen_printer_printing
+
+                    # Only evaluate printer completion when actually CONNECTED —
+                    # a USB drop mid-print must not be read as "finished".
+                    if use_printer_completion and printer_connected:
+                        # active → not-printing means the job finished (or was stopped).
+                        if self._printer_was_printing and not printer_printing:
+                            with self._lock:
+                                self.status = "Print Complete"
+                                self._running = False
+                            print("\n  ✓ Print complete (reported by printer).")
+                            self._send_completion(frame)
+                            _print_status(self)
+                            break
+                        self._printer_was_printing = printer_printing
+
+                    # Near the end the head parks away from the model → looks like a
+                    # gap/stopped-extrusion. Suppress failure flagging past the cutoff.
+                    near_completion = bool(
+                        pr and pr.progress is not None and pr.progress >= COMPLETION_SUPPRESS_PCT
+                    )
+
+                    # ── Camera motion completion (fallback only) ──────────── #
+                    # Used only when the printer can't tell us (no USB / not reporting
+                    # SD status). Once we trust the printer, skip this entirely so a
+                    # parked head at the end isn't mistaken for completion or failure.
+                    if not use_printer_completion:
+                        if self._prev_analysis_frame is not None:
+                            if _frames_differ(frame, self._prev_analysis_frame):
+                                if self._no_motion_count > 0:
                                     print(
-                                        "\n  ✓ Print appears complete — "
-                                        "no change for 4 consecutive frames (2 min)."
+                                        f"\n  [MOTION] Change detected — "
+                                        f"resetting idle counter (was {self._no_motion_count})"
                                     )
-                                    self._send_completion(frame)
-                                    _print_status(self)
-                                    break
+                                self._print_motion_seen = True
+                                self._no_motion_count = 0
                             else:
-                                print("\n  [MOTION] No change yet — waiting for print to start")
-                    self._prev_analysis_frame = frame.copy()
+                                if self._print_motion_seen:
+                                    self._no_motion_count += 1
+                                    print(
+                                        f"\n  [MOTION] No change detected "
+                                        f"({self._no_motion_count}/{NO_MOTION_LIMIT} frames)"
+                                    )
+                                    if self._no_motion_count >= NO_MOTION_LIMIT:
+                                        with self._lock:
+                                            self.status = "Print Complete"
+                                            self._running = False
+                                        print(
+                                            "\n  ✓ Print appears complete — "
+                                            "no change for 4 consecutive frames (2 min)."
+                                        )
+                                        self._send_completion(frame)
+                                        _print_status(self)
+                                        break
+                                else:
+                                    print("\n  [MOTION] No change yet — waiting for print to start")
+                        self._prev_analysis_frame = frame.copy()
 
                     # ── LLM analysis ───────────────────────────────────── #
                     with self._lock:
@@ -329,6 +365,8 @@ class Monitor:
                                 result.failure_detected
                                 and result.confidence >= self.config.confidence_threshold
                                 and result.failure_type not in ("no_printer", "none")
+                                # Don't flag a "gap" failure when the print is basically done
+                                and not near_completion
                             )
                             if is_failure:
                                 # Spaghetti is time-critical — alert on the first frame.
@@ -360,10 +398,13 @@ class Monitor:
                                     self._no_motion_count = 0
                                     confirmed_failure = True
                             else:
-                                # Clean frame — reset pending failure
+                                # Clean frame (or suppressed near completion) —
+                                # reset pending failure
                                 self._pending_failure_type = None
                                 self._pending_failure_count = 0
-                                if result.failure_type == "no_printer":
+                                if near_completion:
+                                    self.status = "Finishing… (near complete)"
+                                elif result.failure_type == "no_printer":
                                     self.status = "Monitoring… (no printer in frame)"
                                 else:
                                     self.status = "Monitoring…"
@@ -477,6 +518,8 @@ class Monitor:
         self._no_motion_count = 0
         self._prev_analysis_frame = None
         self._print_motion_seen = False
+        self._seen_printer_printing = False
+        self._printer_was_printing = False
         self._pending_failure_type = None
         self._pending_failure_count = 0
 

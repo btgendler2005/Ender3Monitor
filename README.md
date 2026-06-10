@@ -11,7 +11,9 @@ Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, f
 - **Live failure detection** — captures a frame every 30 seconds and analyzes it with AI
 - **Detects six failure types** — spaghetti/stringing, layer shifts, bed detachment, stopped extrusion, nozzle collisions, and warping
 - **Frame pre-validation** — OpenCV checks brightness, contrast, and edge density before sending to AI; rejects dark, covered, or off-target frames without burning API calls
-- **Print completion detection** — automatically stops monitoring and sends a notification after 4 consecutive still frames (2 minutes of no movement)
+- **Print completion detection** — uses the printer's own status over USB when available (stops exactly when the print finishes); falls back to camera stillness (4 consecutive still frames) when no printer is connected
+- **Printer control over USB** — live nozzle/bed temps, print progress and time remaining, auto-pause/cooldown on a confirmed failure, and manual pause/resume/cooldown/e-stop from the dashboard
+- **Push notifications** — instant phone alerts via ntfy, Discord, or Telegram
 - **Email alerts** — SMTP notification with failure type, confidence score, and attached snapshot
 - **Web UI** — clean dark-theme dashboard at `http://localhost:8080`; start/stop monitoring, live camera feed, confidence gauge, AI observations, and event log
 - **CLI** — terminal interface with live status line if you prefer to run headless
@@ -284,7 +286,7 @@ Ender3Monitor/
 3. Three fast OpenCV pre-checks run locally (brightness, contrast, edge density) — frames that are too dark, featureless, or not aimed at a printer are rejected without an API call
 4. Valid frames are sent to Claude or llava:7b with a structured prompt; the model returns JSON with `failure_detected`, `failure_type`, `confidence`, and `description`
 5. If confidence ≥ `CONFIDENCE_THRESHOLD` and a real failure is detected, an email alert is sent with the frame attached
-6. If 4 consecutive frames show no significant change (2 minutes of stillness), the print is marked complete, a notification is sent, and monitoring stops automatically
+6. Completion is detected from the printer's USB status when connected (monitoring stops the moment the print finishes); otherwise it falls back to camera stillness (4 consecutive still frames). Near the end, failure flagging is suppressed so the parked print head isn't mistaken for a gap/stopped-extrusion failure
 7. Every 30 seconds a frame is saved for the timelapse
 8. All results are pushed to Prometheus metrics in real time and broadcast to connected web UI clients via WebSocket
 
