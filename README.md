@@ -8,7 +8,7 @@ Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, f
 
 ## Features
 
-- **Live failure detection** — captures a frame every 30 seconds and analyzes it with AI
+- **Live failure detection** — analyzes a frame on a configurable interval (default 60s; the main cost dial)
 - **Detects six failure types** — spaghetti/stringing, layer shifts, bed detachment, stopped extrusion, nozzle collisions, and warping
 - **Frame pre-validation** — OpenCV checks brightness, contrast, and edge density before sending to AI; rejects dark, covered, or off-target frames without burning API calls
 - **Print completion detection** — uses the printer's own status over USB when available (stops exactly when the print finishes); falls back to camera stillness (4 consecutive still frames) when no printer is connected
@@ -81,6 +81,7 @@ cp .env.example .env
 | `SMTP_RECIPIENT` | — | Where to send alerts |
 | `CAMERA_INDEX` | `-1` | Camera to use; `-1` = prompt at startup |
 | `CONFIDENCE_THRESHOLD` | `0.70` | Alert when confidence ≥ this value |
+| `CAPTURE_INTERVAL_SECONDS` | `60` | Seconds between AI analyses — main cost dial (30≈$1/hr, 60≈$0.48/hr, 90≈$0.32/hr) |
 | `METRICS_PORT` | `8000` | Prometheus metrics port |
 | `TIMELAPSE_DIR` | `timelapse_frames` | Where to save timelapse frames |
 
@@ -281,7 +282,7 @@ Ender3Monitor/
 
 ## How it works
 
-1. A background thread wakes up every 30 seconds
+1. A background thread wakes up every `CAPTURE_INTERVAL_SECONDS` (default 60s)
 2. A single frame is captured from the webcam, then the camera is immediately released (prevents OpenCV's background thread from running continuously)
 3. Three fast OpenCV pre-checks run locally (brightness, contrast, edge density) — frames that are too dark, featureless, or not aimed at a printer are rejected without an API call
 4. Valid frames are sent to Claude or llava:7b with a structured prompt; the model returns JSON with `failure_detected`, `failure_type`, `confidence`, and `description`

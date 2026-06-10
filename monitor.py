@@ -28,7 +28,10 @@ from ender3monitor.push import PushNotifier
 PRINTER_POLL_INTERVAL = 5        # seconds between temperature polls over USB
 PRINTER_RECONNECT_INTERVAL = 10  # seconds between reconnect attempts when dropped
 
-CAPTURE_INTERVAL = 30       # seconds between analysis frames
+# Default seconds between analysis frames. Overridable per-run via the
+# CAPTURE_INTERVAL_SECONDS env var (see Config) to trade cost vs responsiveness:
+# 30 ≈ $1/hr (Claude), 60 ≈ $0.48/hr, 90 ≈ $0.32/hr.
+DEFAULT_CAPTURE_INTERVAL = 60
 TIMELAPSE_INTERVAL = 30     # seconds between timelapse frames
 
 # Print-complete detection: stop after this many consecutive still frames
@@ -43,7 +46,7 @@ SPAGHETTI_CONFIRM_FRAMES = 2        # spaghetti needs 2 frames — 1 min — red
 # Startup grace period: skip failure detection while the printer warms up.
 # The bed and nozzle take ~3-5 min to reach temperature; during this time
 # the printer is stationary and the LLM would see a "nothing happening" frame.
-STARTUP_GRACE_FRAMES = 10           # 10 × 30 s = 5 min warm-up window
+STARTUP_GRACE_SECONDS = 300         # ~5 min warm-up window (converted to frames)
 
 # Near the end of a print the head parks away from the model, leaving a gap
 # that looks like stopped-extrusion. Suppress failure flagging past this %.
@@ -123,7 +126,7 @@ class Monitor:
         self.last_frame_time: Optional[datetime] = None
 
         # Startup grace period — skip detection while printer warms up
-        self._grace_frames_remaining: int = STARTUP_GRACE_FRAMES
+        self._grace_frames_remaining: int = 0   # set in start() from the interval
 
         # Print-complete detection
         self._no_motion_count: int = 0
@@ -210,6 +213,7 @@ class Monitor:
     def _monitoring_loop(self) -> None:
         last_capture = 0.0
         last_timelapse = 0.0
+        interval = self.config.capture_interval
 
         self.metrics.monitoring_active.set(1)
         try:
@@ -218,19 +222,19 @@ class Monitor:
                 # waking every second and grabbing a frame we'll discard.
                 now = time.time()
                 next_event = min(
-                    last_capture + CAPTURE_INTERVAL,
+                    last_capture + interval,
                     last_timelapse + TIMELAPSE_INTERVAL,
                 )
                 sleep_for = max(1.0, next_event - now)
                 # Event.wait() returns immediately when stop() sets _stop_event,
-                # so we never block the UI for up to 30 s waiting on a sleep.
+                # so we never block the UI for the full interval waiting on a sleep.
                 self._stop_event.wait(timeout=sleep_for)
 
                 if not self._running:
                     break
 
                 now = time.time()
-                needs_analysis = now - last_capture >= CAPTURE_INTERVAL
+                needs_analysis = now - last_capture >= interval
                 needs_timelapse = now - last_timelapse >= TIMELAPSE_INTERVAL
 
                 if not (needs_analysis or needs_timelapse):
@@ -262,7 +266,7 @@ class Monitor:
                     # ── Startup grace period ───────────────────────────── #
                     if self._grace_frames_remaining > 0:
                         self._grace_frames_remaining -= 1
-                        secs_left = self._grace_frames_remaining * CAPTURE_INTERVAL
+                        secs_left = self._grace_frames_remaining * interval
                         mins_left = secs_left // 60
                         with self._lock:
                             self.status = (
@@ -514,7 +518,9 @@ class Monitor:
         self.failure_count = 0
         self.last_result = None
         self.status = "Monitoring…"
-        self._grace_frames_remaining = STARTUP_GRACE_FRAMES
+        self._grace_frames_remaining = max(
+            1, round(STARTUP_GRACE_SECONDS / self.config.capture_interval)
+        )
         self._no_motion_count = 0
         self._prev_analysis_frame = None
         self._print_motion_seen = False
@@ -527,7 +533,7 @@ class Monitor:
             target=self._monitoring_loop, daemon=True
         )
         self._monitor_thread.start()
-        print(f"  Monitoring started (camera {idx}). Analysis every {CAPTURE_INTERVAL}s.")
+        print(f"  Monitoring started (camera {idx}). Analysis every {self.config.capture_interval}s.")
 
     def stop(self) -> None:
         if not self._running:

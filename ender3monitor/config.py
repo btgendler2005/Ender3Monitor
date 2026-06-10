@@ -55,6 +55,7 @@ class Config:
     metrics_port: int
     timelapse_dir: str
     confidence_threshold: float
+    capture_interval: int        # seconds between AI analysis frames
 
     # Printer USB control (optional)
     printer_port: str           # serial device path; "" = disabled, "auto" = autodetect
@@ -97,6 +98,7 @@ class Config:
             metrics_port=int(os.getenv("METRICS_PORT", "8000")),
             timelapse_dir=os.getenv("TIMELAPSE_DIR", "timelapse_frames"),
             confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.70")),
+            capture_interval=max(10, int(os.getenv("CAPTURE_INTERVAL_SECONDS", "60"))),
             printer_port=os.getenv("PRINTER_PORT", "").strip(),
             printer_baud=int(os.getenv("PRINTER_BAUD", "115200")),
             auto_pause_on_failure=os.getenv("AUTO_PAUSE_ON_FAILURE", "false").strip().lower()
