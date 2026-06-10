@@ -84,6 +84,9 @@ cp .env.example .env
 | `CAPTURE_INTERVAL_SECONDS` | `60` | Seconds between AI analyses — main cost dial (30≈$1/hr, 60≈$0.48/hr, 90≈$0.32/hr) |
 | `METRICS_PORT` | `8000` | Prometheus metrics port |
 | `TIMELAPSE_DIR` | `timelapse_frames` | Where to save timelapse frames |
+| `TIMELAPSE_MAX_SESSIONS` | `20` | Keep at most this many recent print folders (older pruned) |
+| `TIMELAPSE_RETENTION_DAYS` | `30` | Also delete timelapse folders/MP4s older than this |
+| `TIMELAPSE_DELETE_FRAMES_AFTER_COMPILE` | `false` | Drop a session's JPEGs once compiled to MP4 |
 
 ---
 

@@ -97,7 +97,12 @@ class Monitor:
             recipient=config.smtp_recipient,
         )
         self.metrics = MonitorMetrics()
-        self.timelapse = TimelapseManager(config.timelapse_dir)
+        self.timelapse = TimelapseManager(
+            config.timelapse_dir,
+            max_sessions=config.timelapse_max_sessions,
+            retention_days=config.timelapse_retention_days,
+            delete_frames_after_compile=config.timelapse_delete_frames_after_compile,
+        )
 
         # Optional printer USB control + push notifications
         self.printer = PrinterController(config.printer_port, config.printer_baud)

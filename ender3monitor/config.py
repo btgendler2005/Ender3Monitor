@@ -57,6 +57,11 @@ class Config:
     confidence_threshold: float
     capture_interval: int        # seconds between AI analysis frames
 
+    # Timelapse retention (disk cleanup)
+    timelapse_max_sessions: int
+    timelapse_retention_days: int
+    timelapse_delete_frames_after_compile: bool
+
     # Printer USB control (optional)
     printer_port: str           # serial device path; "" = disabled, "auto" = autodetect
     printer_baud: int
@@ -97,6 +102,11 @@ class Config:
             camera_flip=_parse_flip(os.getenv("CAMERA_FLIP", "none")),
             metrics_port=int(os.getenv("METRICS_PORT", "8000")),
             timelapse_dir=os.getenv("TIMELAPSE_DIR", "timelapse_frames"),
+            timelapse_max_sessions=int(os.getenv("TIMELAPSE_MAX_SESSIONS", "20")),
+            timelapse_retention_days=int(os.getenv("TIMELAPSE_RETENTION_DAYS", "30")),
+            timelapse_delete_frames_after_compile=os.getenv(
+                "TIMELAPSE_DELETE_FRAMES_AFTER_COMPILE", "false"
+            ).strip().lower() in ("1", "true", "yes", "on"),
             confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.70")),
             capture_interval=max(10, int(os.getenv("CAPTURE_INTERVAL_SECONDS", "60"))),
             printer_port=os.getenv("PRINTER_PORT", "").strip(),

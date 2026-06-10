@@ -1,15 +1,36 @@
-import os
+import shutil
+import time
 import cv2
 import numpy as np
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 
 class TimelapseManager:
-    def __init__(self, output_dir: str = "timelapse_frames") -> None:
+    """Saves timelapse frames and compiles them to MP4, with disk retention.
+
+    Without cleanup the frame folders grow unbounded (≈ one JPEG per capture,
+    every print, forever). Retention bounds that:
+      • keep at most `max_sessions` most-recent session folders
+      • delete session folders and MP4s older than `retention_days`
+      • optionally delete a session's frames after it is compiled to MP4
+    Pruning runs at the start of each new session.
+    """
+
+    def __init__(self, output_dir: str = "timelapse_frames",
+                 max_sessions: int = 20, retention_days: int = 30,
+                 delete_frames_after_compile: bool = False) -> None:
         self.output_dir = Path(output_dir)
-        self._session_dir: Path | None = None
+        self.max_sessions = max(1, max_sessions)
+        self.retention_days = max(0, retention_days)
+        self.delete_frames_after_compile = delete_frames_after_compile
+        self._session_dir: Optional[Path] = None
         self._frame_count = 0
+
+    # ------------------------------------------------------------------ #
+    # Capture                                                              #
+    # ------------------------------------------------------------------ #
 
     def _ensure_session_dir(self) -> Path:
         if self._session_dir is None:
@@ -26,10 +47,62 @@ class TimelapseManager:
         self._frame_count += 1
 
     def reset_session(self) -> None:
+        self.prune()                 # bound disk use before starting a new print
         self._session_dir = None
         self._frame_count = 0
 
-    def compile(self, fps: int = 24, output_file: str | None = None) -> str | None:
+    # ------------------------------------------------------------------ #
+    # Retention                                                            #
+    # ------------------------------------------------------------------ #
+
+    def _session_dirs(self) -> list:
+        if not self.output_dir.exists():
+            return []
+        return sorted([p for p in self.output_dir.iterdir() if p.is_dir()],
+                      key=lambda p: p.stat().st_mtime)
+
+    def prune(self) -> int:
+        """Delete old session folders / MP4s per the retention policy.
+
+        Returns the number of items removed. Never raises.
+        """
+        removed = 0
+        try:
+            cutoff = time.time() - self.retention_days * 86400 if self.retention_days else None
+
+            # 1. Age-based: drop session folders older than the cutoff.
+            if cutoff is not None:
+                for p in self._session_dirs():
+                    if p.stat().st_mtime < cutoff:
+                        shutil.rmtree(p, ignore_errors=True)
+                        removed += 1
+
+            # 2. Count-based: keep only the newest `max_sessions` folders.
+            sessions = self._session_dirs()
+            excess = len(sessions) - self.max_sessions
+            for p in sessions[:max(0, excess)]:
+                shutil.rmtree(p, ignore_errors=True)
+                removed += 1
+
+            # 3. Age-based: drop old compiled MP4s too.
+            if cutoff is not None:
+                for f in self.output_dir.glob("*.mp4"):
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink(missing_ok=True)
+                        removed += 1
+        except Exception as exc:
+            print(f"  [TIMELAPSE] Prune error (ignored): {exc}")
+
+        if removed:
+            print(f"  [TIMELAPSE] Pruned {removed} old item(s) "
+                  f"(keep ≤{self.max_sessions} sessions, ≤{self.retention_days} days).")
+        return removed
+
+    # ------------------------------------------------------------------ #
+    # Compile                                                              #
+    # ------------------------------------------------------------------ #
+
+    def compile(self, fps: int = 24, output_file: Optional[str] = None) -> Optional[str]:
         if self._session_dir is None:
             print("No timelapse session to compile.")
             return None
@@ -59,4 +132,10 @@ class TimelapseManager:
 
         writer.release()
         print(f"Timelapse compiled: {output_file} ({len(frames)} frames @ {fps} fps)")
+
+        # Reclaim the (now redundant) frames if configured to.
+        if self.delete_frames_after_compile and self._session_dir:
+            shutil.rmtree(self._session_dir, ignore_errors=True)
+            print("  [TIMELAPSE] Source frames deleted after compile (MP4 kept).")
+
         return output_file
