@@ -14,75 +14,36 @@ ANTHROPIC_MODEL = "claude-sonnet-4-6"
 # llama3.2-vision:11b is higher quality but will swap heavily on 8GB.
 OLLAMA_DEFAULT_MODEL = "llava:7b"
 
-SYSTEM_PROMPT = """You are a 3D print failure detection system. You ONLY alert on severe, print-ruining failures that require immediate action. Minor issues, surface imperfections, and anything that would still produce an acceptable final part are NOT failures.
+SYSTEM_PROMPT = """You are a 3D-print failure detector reviewing webcam frames of a printer. Catch only SEVERE, unmistakable failures. A healthy print — even a messy- or odd-looking one — must be reported as "none". False alarms are disruptive; missing a subtle issue is acceptable.
 
-STEP 1 — VALIDATE THE SCENE
-Does the image show a 3D printer, print bed, extruder, or an object being printed?
-If NO printer is visible, respond with:
-{"failure_detected": false, "failure_type": "no_printer", "confidence": 0.0, "description": "No 3D printer detected in frame."}
-
-STEP 2 — CHECK FOR SPAGHETTI (highest priority, most common catastrophic failure)
-Spaghetti = the print has completely failed and the nozzle is extruding freely into empty space,
-producing a large chaotic tangle or nest of loose filament strands. This fills the air or piles
-up randomly over a large area of the build volume.
-
-SPAGHETTI — YES, flag it:
-- A large messy bird's nest or pile of loose strands covering a significant portion of the build area
-- Filament hanging in mid-air in a chaotic tangle across the full frame
-- The intended print object is completely gone and replaced by random strands
-
-SPAGHETTI — NO, do NOT flag it:
-- A few fine strings or hairs between features (normal with PETG/PLA)
-- Support structures (intentional thin pillars or lattice — attached and orderly)
-- Infill patterns (grid, honeycomb, lines — regular and inside walls)
-- Any texture that looks structured or intentional, even if it looks messy up close
-
-STEP 3 — CHECK FOR CLOG / STOPPED EXTRUSION (second highest priority)
-A clog or filament runout means the nozzle keeps moving but NO new material comes out.
-The tell-tale sign is a clear, empty gap between the nozzle/print head and the top of
-the partially-printed object — the head is travelling well above or away from the print
-with nothing connecting them and the print is no longer growing.
-
-CLOG / STOPPED EXTRUSION — YES, flag it:
-- A large visible GAP of empty space between the nozzle tip and the top surface of the print
-- The print head is clearly hovering or moving in mid-air, separated from the print, with no filament between them
-- The print looks abruptly cut off / unfinished at a flat top while the nozzle is elsewhere
-- A whole section that should have solid walls is hollow or completely missing material
-
-CLOG / STOPPED EXTRUSION — NO, do NOT flag it:
-- The nozzle is touching or right at the top of the print (normal — that's where it deposits)
-- A normal travel move where the head briefly lifts a small amount between nearby points
-- Gaps that are just part of the model geometry (holes, overhangs, bridging)
-
-STEP 4 — OTHER CATASTROPHIC FAILURES ONLY
-Only flag if the failure has already destroyed or will imminently destroy the print:
-- layer shift: the ENTIRE print body is offset — looks like a staircase or snapped sideways (NOT a surface line)
-- detached from bed: the whole print or a large chunk has physically lifted off and is no longer adhered
-- warping: edges have lifted SO severely the print is peeling off or curling dramatically — not slight corner lift
-
-DO NOT FLAG:
-- Small blobs, zits, or surface imperfections
-- Slight corner lifting or elephant foot
-- Minor stringing or wisps between parts
-- Normal-looking layer lines or texture
-- The nozzle simply resting at the top of the print (that is normal operation)
-- Anything you are not highly certain about
-
-Respond ONLY with this JSON:
+First describe what you actually see, then decide. Respond with ONLY this JSON object (no markdown, no extra text):
 {
-  "failure_detected": true or false,
-  "failure_type": "spaghetti/stringing | layer shift | detached from bed | stopped extrusion | warping | none | no_printer",
-  "confidence": 0.0 to 1.0,
-  "description": "one sentence: exactly what you see that led to this classification"
+  "observations": "one short sentence describing what is actually on the bed and the state of the print",
+  "failure_type": "none",
+  "confidence": 0.0,
+  "description": "short reason for your verdict"
 }
 
-CRITICAL RULES:
-- When in doubt, respond with failure_detected=false and failure_type="none". Always.
-- A normal print in progress — even a complex or messy-looking one — should be classified as "none".
-- Only set failure_detected=true when the failure is so obvious and severe that a human watching would immediately stop the print.
-- Set confidence=1.0 only when absolutely certain. Be conservative with your confidence score.
+"failure_type" MUST be EXACTLY ONE of these single tokens — never a list, never multiple, never the word "or":
+  none               print looks fine / in progress / you are not sure  (THIS IS THE DEFAULT)
+  spaghetti          a large chaotic tangle or nest of loose filament strands in the air or piled across the bed
+  detached           the whole print (or a large chunk) has clearly broken free of the bed — dragged around, flipped, or stuck to the nozzle
+  layer_shift        the print body is visibly stepped/offset sideways partway up its height
+  stopped_extrusion  a large region that should be solid is clearly empty / no material is coming out while it should be
+  warping            corners have curled UP off the bed badly enough to risk a nozzle crash
+  no_printer         no printer / bed / print is visible in the frame
 
-Respond with the JSON object only. No markdown, no extra text."""
+HARD RULES to avoid false alarms:
+- Default to "none". Choose a failure ONLY when it is obvious and severe.
+- A print sitting on the bed is NOT "detached", even at a steep/upside-down camera angle, even if it looks small, short, or oddly shaped. "detached" requires the part to be visibly OFF the bed or being dragged around.
+- Supports, infill grids, brims, skirts, and normal layer lines are NOT failures.
+- A few thin strings/wisps are NOT spaghetti — spaghetti is a big chaotic mess of loose filament.
+- The nozzle hovering above or beside the print (a travel move) is NOT stopped_extrusion.
+- Minor first-layer roughness or slight corner lift is NOT warping.
+- If unsure, answer "none".
+
+"confidence" is how certain you are of the chosen failure_type. For "none", use 0.0–0.3.
+Only choose a non-"none" failure_type when your confidence is >= 0.85."""
 
 
 @dataclass
@@ -154,9 +115,46 @@ def _precheck_frame(frame: np.ndarray, backend: str) -> Optional["AnalysisResult
     return None   # frame looks usable — proceed to LLM
 
 
-def _encode_frame_b64(frame: np.ndarray) -> str:
-    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+# Minimum confidence for a non-"none" verdict to count as a real failure.
+_FAILURE_FLOOR = 0.85
+
+# Map the model's clean single-token failure_type to the display names the rest
+# of the app expects. Anything not in this map (compound junk, the echoed option
+# list, hallucinated values) is treated as "none" — no false alarm.
+_TYPE_MAP = {
+    "none": "none",
+    "spaghetti": "spaghetti/stringing",
+    "detached": "detached from bed",
+    "layer_shift": "layer shift",
+    "stopped_extrusion": "stopped extrusion",
+    "warping": "warping",
+    "no_printer": "no_printer",
+}
+
+
+def _encode_frame_b64(frame: np.ndarray, quality: int = 90) -> str:
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return base64.standard_b64encode(buf.tobytes()).decode("utf-8")
+
+
+def _normalize_type(raw: str) -> str:
+    """Reduce the model's failure_type to a single known token, else 'none'.
+
+    Defends against the model returning a pipe-separated list or the entire
+    option list verbatim — we take the first recognized token, but only if the
+    string is a clean single token; a list-like answer collapses to 'none'.
+    """
+    t = (raw or "").strip().lower()
+    if t in _TYPE_MAP:
+        return _TYPE_MAP[t]
+    # If it looks like a list/multiple values, the model didn't pick one → none.
+    if "|" in t or "," in t or " or " in t or t.count(" ") > 2:
+        return "none"
+    # Last resort: substring match to a single known failure word.
+    for token, display in _TYPE_MAP.items():
+        if token != "none" and token in t:
+            return display
+    return "none"
 
 
 def _parse_response(text: str, backend: str) -> AnalysisResult:
@@ -167,17 +165,19 @@ def _parse_response(text: str, backend: str) -> AnalysisResult:
     try:
         data = json.loads(match.group())
         confidence = float(data.get("confidence", 0.0))
-        failure_type = str(data.get("failure_type", "none"))
-        failure_detected = bool(data.get("failure_detected", False)) and confidence >= 0.82
-        # Preserve "no_printer" even when failure_detected is False —
-        # it's a special sentinel, not a real failure, but we need it
-        # to show the right status message in the UI.
-        resolved_type = failure_type if (failure_detected or failure_type == "no_printer") else "none"
+        ftype = _normalize_type(str(data.get("failure_type", "none")))
+
+        # A real failure = a recognized failure type with high confidence.
+        failure_detected = ftype not in ("none", "no_printer") and confidence >= _FAILURE_FLOOR
+        resolved_type = ftype if (failure_detected or ftype == "no_printer") else "none"
+
+        # Prefer the model's reason; fall back to its observations.
+        desc = str(data.get("description") or data.get("observations") or "")
         return AnalysisResult(
             failure_detected=failure_detected,
             failure_type=resolved_type,
             confidence=confidence,
-            description=str(data.get("description", "")),
+            description=desc,
             backend=backend,
         )
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -196,12 +196,45 @@ class AnthropicAnalyzer:
         self._client = anthropic.Anthropic(api_key=api_key)
         self._model = model
         self._cache_logged = False
+        self._prev_frame: Optional[np.ndarray] = None   # for temporal comparison
+
+    def _image_block(self, frame: np.ndarray) -> dict:
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": _encode_frame_b64(frame, quality=90),
+            },
+        }
 
     def analyze_frame(self, frame: np.ndarray) -> AnalysisResult:
         early = _precheck_frame(frame, backend=f"anthropic/{self._model}")
         if early:
+            self._prev_frame = frame.copy()
             return early
-        image_data = _encode_frame_b64(frame)
+
+        # Temporal context: show the previous analysis frame (~30 s ago) before
+        # the current one. A real failure persists or worsens between frames; a
+        # print that looks normal in both is normal. This sharply cuts single-
+        # frame misreads (e.g. an attached print called "detached" from one odd
+        # angle).
+        content = []
+        if self._prev_frame is not None:
+            content.append({"type": "text",
+                            "text": "FRAME 1 — about 30 seconds ago (for comparison only):"})
+            content.append(self._image_block(self._prev_frame))
+            content.append({"type": "text",
+                            "text": "FRAME 2 — NOW. Judge this current frame. A genuine "
+                                    "failure usually persists or gets worse from FRAME 1 to "
+                                    "FRAME 2; if the print looks normal in both, answer none."})
+            content.append(self._image_block(frame))
+        else:
+            content.append({"type": "text", "text": "Current printer frame:"})
+            content.append(self._image_block(frame))
+        content.append({"type": "text",
+                        "text": "Respond with the JSON object only."})
+
         response = self._client.messages.create(
             model=self._model,
             max_tokens=512,
@@ -216,26 +249,9 @@ class AnthropicAnalyzer:
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_data,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": "Analyze this 3D printer image for failures. Respond with the JSON object only.",
-                        },
-                    ],
-                }
-            ],
+            messages=[{"role": "user", "content": content}],
         )
+        self._prev_frame = frame.copy()
         # One-time confirmation that prompt caching is active. After the
         # first cache write, subsequent calls should show cache_read > 0.
         if not self._cache_logged:
