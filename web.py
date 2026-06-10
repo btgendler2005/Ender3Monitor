@@ -362,6 +362,36 @@ async def api_timelapse():
     return {"message": "timelapse compiled", "file": Path(path).name}
 
 
+class PrinterActionBody(BaseModel):
+    action: str   # pause | resume | cooldown | estop
+
+
+@app.post("/api/printer")
+async def api_printer(body: PrinterActionBody):
+    """Manual printer control over USB."""
+    if _monitor is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    pr = _monitor.printer
+    if not pr.connected:
+        return JSONResponse({"error": "Printer not connected"}, 409)
+
+    action = (body.action or "").lower()
+    handlers = {
+        "pause":    (pr.pause,           "Print paused"),
+        "resume":   (pr.resume,          "Print resumed"),
+        "cooldown": (pr.cooldown,        "Paused — heaters off"),
+        "estop":    (pr.emergency_stop,  "Emergency stop sent — power-cycle the printer"),
+    }
+    if action not in handlers:
+        return JSONResponse({"error": f"unknown action '{action}'"}, 400)
+
+    fn, msg = handlers[action]
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, fn)
+    await _broadcast()
+    return {"message": msg}
+
+
 def _timelapse_dir() -> Path:
     return Path(_config.timelapse_dir).resolve() if _config else Path("timelapse_frames").resolve()
 
@@ -587,6 +617,19 @@ header{
 }
 .count-box .lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
 .count-box .num{font-size:26px;font-weight:800;line-height:1}
+
+/* ── Printer controls ── */
+.printer-controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+.pbtn{
+  padding:9px 10px;border-radius:8px;
+  border:1px solid var(--border);background:var(--surf3);color:var(--text);
+  font-size:12.5px;font-weight:600;cursor:pointer;transition:all .15s;
+  justify-content:center;
+}
+.pbtn:hover{border-color:rgba(255,255,255,.16);background:#1d2336}
+.pbtn:active{transform:scale(.97)}
+.pbtn-stop{background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.3);color:var(--red)}
+.pbtn-stop:hover{background:rgba(248,113,113,.2)}
 
 /* ── Description ── */
 .desc-card{}
@@ -825,6 +868,12 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
         </div>
       </div>
       <div style="font-size:11px;color:var(--muted);margin-top:8px" id="printer-progress"></div>
+      <div class="printer-controls">
+        <button class="pbtn" onclick="doPrinter('pause')">Pause</button>
+        <button class="pbtn" onclick="doPrinter('resume')">Resume</button>
+        <button class="pbtn" onclick="doPrinter('cooldown')">Cooldown</button>
+        <button class="pbtn pbtn-stop" onclick="doPrinter('estop')">E‑Stop</button>
+      </div>
     </div>
 
     <div style="font-size:11px;color:var(--muted);border-top:1px solid var(--border);
@@ -1054,6 +1103,25 @@ async function doTimelapse() {
     window.location = '/download/timelapse?name=' + encodeURIComponent(data.file);
   } else {
     toast((data && data.error) ? data.error : 'No timelapse to download yet');
+  }
+}
+
+// Manual printer control over USB
+async function doPrinter(action) {
+  if (action === 'estop' &&
+      !confirm('Emergency stop halts the printer immediately and requires a power-cycle to recover. Continue?')) {
+    return;
+  }
+  try {
+    const res = await fetch('/api/printer', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ action }),
+    });
+    const data = await res.json();
+    toast(res.ok ? (data.message || 'Done') : (data.error || 'Printer command failed'));
+  } catch(e) {
+    toast('Printer command failed');
   }
 }
 
