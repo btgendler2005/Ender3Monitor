@@ -25,7 +25,8 @@ from ender3monitor.timelapse import TimelapseManager
 from ender3monitor.printer import PrinterController
 from ender3monitor.push import PushNotifier
 
-PRINTER_POLL_INTERVAL = 5    # seconds between temperature polls over USB
+PRINTER_POLL_INTERVAL = 5        # seconds between temperature polls over USB
+PRINTER_RECONNECT_INTERVAL = 10  # seconds between reconnect attempts when dropped
 
 CAPTURE_INTERVAL = 30       # seconds between analysis frames
 TIMELAPSE_INTERVAL = 30     # seconds between timelapse frames
@@ -138,26 +139,55 @@ class Monitor:
     # ------------------------------------------------------------------ #
 
     def _init_printer(self) -> None:
-        """Connect to the printer (if configured) and start the temp poller."""
+        """Connect to the printer (if configured) and start the poller.
+
+        The poller is started even if the first connect fails, so the printer
+        can be plugged in later (or recover from a bumped cable) without a
+        restart.
+        """
         if not self.config.printer_port:
             return   # USB control disabled
         if self.printer.connect():
             print(f"  Printer connected on {self.printer.status.port}.")
-            self._printer_poll_thread = threading.Thread(
-                target=self._printer_poll_loop, daemon=True
-            )
-            self._printer_poll_thread.start()
         else:
             print(f"  Printer not connected: {self.printer.status.last_error}")
+            print("  Will keep retrying in the background…")
+        self._printer_poll_thread = threading.Thread(
+            target=self._printer_poll_loop, daemon=True
+        )
+        self._printer_poll_thread.start()
 
     def _printer_poll_loop(self) -> None:
-        """Poll temperatures (and SD progress) for the live UI."""
+        """Poll temps/progress while connected; auto-reconnect when not.
+
+        A failed serial write inside query_temps() flips the controller to
+        disconnected, so a yanked cable is noticed within one poll cycle and
+        we begin retrying connect() roughly every RECONNECT seconds.
+        """
+        reconnect_ticks = max(1, round(PRINTER_RECONNECT_INTERVAL / PRINTER_POLL_INTERVAL))
         ticks = 0
+        was_connected = self.printer.connected
         while not self._printer_poll_stop.is_set():
             if self.printer.connected:
                 self.printer.query_temps()
-                if ticks % 3 == 0:          # progress less often
+                if self.printer.connected and ticks % 3 == 0:
                     self.printer.query_progress()
+            elif ticks % reconnect_ticks == 0:
+                self.printer.connect()   # quiet retry; logged on transition below
+
+            # Log + clean up on connect/disconnect transitions
+            now_connected = self.printer.connected
+            if was_connected and not now_connected:
+                print("\n  [PRINTER] Connection lost — retrying in the background…")
+                self.printer.status.nozzle_temp = None
+                self.printer.status.nozzle_target = None
+                self.printer.status.bed_temp = None
+                self.printer.status.bed_target = None
+                self.printer.status.progress = None
+            elif not was_connected and now_connected:
+                print(f"\n  [PRINTER] Reconnected on {self.printer.status.port}.")
+            was_connected = now_connected
+
             ticks += 1
             self._printer_poll_stop.wait(timeout=PRINTER_POLL_INTERVAL)
 
