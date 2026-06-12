@@ -99,6 +99,7 @@ class Monitor:
             anthropic_model=config.anthropic_model,
             ollama_model=config.ollama_model,
             ollama_host=config.ollama_host,
+            capture_interval=config.capture_interval,
         )
         self.notifier = EmailNotifier(
             smtp_host=config.smtp_host,

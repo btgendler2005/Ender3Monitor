@@ -148,6 +148,16 @@ def _encode_frame_b64(frame: np.ndarray, quality: int = 90) -> str:
     return base64.standard_b64encode(buf.tobytes()).decode("utf-8")
 
 
+def _downscale(frame: np.ndarray, max_width: int = 640) -> np.ndarray:
+    """Shrink a frame for token-cheap context use (image tokens scale ~quadratically
+    with dimensions — 1280→640 px cuts the image's token cost ~4×)."""
+    h, w = frame.shape[:2]
+    if w <= max_width:
+        return frame
+    scale = max_width / w
+    return cv2.resize(frame, (max_width, max(1, int(h * scale))))
+
+
 def _normalize_type(raw: str) -> str:
     """Reduce the model's failure_type to a single known token, else 'none'.
 
@@ -202,12 +212,19 @@ def _parse_response(text: str, backend: str) -> AnalysisResult:
 class AnthropicAnalyzer:
     """Uses claude-sonnet-4-6 via the Anthropic API."""
 
-    def __init__(self, api_key: str, model: str = ANTHROPIC_MODEL) -> None:
+    def __init__(self, api_key: str, model: str = ANTHROPIC_MODEL,
+                 capture_interval: Optional[int] = None) -> None:
         import anthropic
         self._client = anthropic.Anthropic(api_key=api_key)
         self._model = model
         self._cache_logged = False
         self._prev_frame: Optional[np.ndarray] = None   # for temporal comparison
+        # Prompt caching only pays when the NEXT call lands inside the 5-min
+        # cache TTL. At long cadences every call pays the 1.25× cache-write
+        # premium and never hits — worse than no caching. Enable by default
+        # only when calls are frequent enough (first-layer mode re-enables it
+        # per call, since that cadence is ~60 s).
+        self._cache_by_default = capture_interval is None or capture_interval < 240
 
     def _image_block(self, frame: np.ndarray) -> dict:
         return {
@@ -234,7 +251,9 @@ class AnthropicAnalyzer:
         if self._prev_frame is not None:
             content.append({"type": "text",
                             "text": "FRAME 1 — the previous capture, earlier (for comparison only):"})
-            content.append(self._image_block(self._prev_frame))
+            # Context-only frame: downscaled to ~640 px (≈4× fewer image tokens,
+            # ~35% off the whole call) — comparison works fine at low res.
+            content.append(self._image_block(_downscale(self._prev_frame)))
             content.append({"type": "text",
                             "text": "FRAME 2 — NOW. Judge this current frame. A genuine "
                                     "failure usually persists or gets worse from FRAME 1 to "
@@ -248,20 +267,18 @@ class AnthropicAnalyzer:
         content.append({"type": "text",
                         "text": "Respond with the JSON object only."})
 
+        # Cache the system prompt only when calls are frequent enough to hit
+        # the 5-min TTL (always true during first-layer mode at ~60 s cadence).
+        use_cache = first_layer or self._cache_by_default
+        system_param = (
+            [{"type": "text", "text": SYSTEM_PROMPT,
+              "cache_control": {"type": "ephemeral"}}]
+            if use_cache else SYSTEM_PROMPT
+        )
         response = self._client.messages.create(
             model=self._model,
             max_tokens=512,
-            # Prompt caching: the system prompt is identical on every call,
-            # so we mark it cache-eligible. Anthropic charges full price to
-            # write it to cache once (1.25×), then ~0.1× on every cache hit
-            # for the 5-minute TTL — a large saving at one call per 30 s.
-            system=[
-                {
-                    "type": "text",
-                    "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
+            system=system_param,
             messages=[{"role": "user", "content": content}],
         )
         self._prev_frame = frame.copy()
@@ -385,10 +402,13 @@ def create_analyzer(
     anthropic_model: str = ANTHROPIC_MODEL,
     ollama_model: str = OLLAMA_DEFAULT_MODEL,
     ollama_host: str = "http://localhost:11434",
+    capture_interval: Optional[int] = None,
 ):
     """Return the right analyzer based on the configured backend.
 
     backend: "anthropic" | "ollama"
+    capture_interval: the analysis cadence in seconds — used to decide whether
+    Anthropic prompt caching pays off (only when calls land inside the TTL).
     """
     backend = backend.lower().strip()
     if backend == "ollama":
@@ -396,7 +416,8 @@ def create_analyzer(
     if backend == "anthropic":
         if not anthropic_api_key:
             raise ValueError("ANTHROPIC_API_KEY is required when using the anthropic backend.")
-        return AnthropicAnalyzer(api_key=anthropic_api_key, model=anthropic_model)
+        return AnthropicAnalyzer(api_key=anthropic_api_key, model=anthropic_model,
+                                 capture_interval=capture_interval)
     raise ValueError(f"Unknown ANALYZER_BACKEND '{backend}'. Choose 'anthropic' or 'ollama'.")
 
 
