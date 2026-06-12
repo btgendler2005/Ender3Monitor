@@ -79,6 +79,11 @@ class Config:
     auto_pause_on_failure: bool
     auto_pause_action: str       # "pause" | "cooldown" | "estop"
 
+    # Web dashboard login (optional but recommended — gates ALL web routes,
+    # including printer controls/e-stop). Empty = no auth (open on the LAN).
+    web_username: str
+    web_password: str
+
     # Push notifications (optional)
     ntfy_topic: str              # ntfy.sh topic (or full URL); "" = disabled
     discord_webhook: str         # Discord webhook URL; "" = disabled
@@ -131,6 +136,8 @@ class Config:
             auto_pause_on_failure=os.getenv("AUTO_PAUSE_ON_FAILURE", "false").strip().lower()
                 in ("1", "true", "yes", "on"),
             auto_pause_action=os.getenv("AUTO_PAUSE_ACTION", "pause").strip().lower(),
+            web_username=os.getenv("WEB_USERNAME", "").strip(),
+            web_password=os.getenv("WEB_PASSWORD", "").strip(),
             ntfy_topic=os.getenv("NTFY_TOPIC", "").strip(),
             discord_webhook=os.getenv("DISCORD_WEBHOOK", "").strip(),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),

@@ -10,8 +10,10 @@ The CLI (python monitor.py) continues to work independently.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import secrets
 import threading
 import time
 import traceback
@@ -367,6 +369,40 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Ender3Monitor", lifespan=lifespan)
 
 
+# ── HTTP Basic Auth (optional, via WEB_USERNAME / WEB_PASSWORD) ───────────────
+# Gates every HTTP route and the websocket. Without it, anyone on the LAN can
+# watch the camera and drive the printer (pause / e-stop / heaters).
+
+def _auth_enabled() -> bool:
+    return bool(_config and _config.web_username and _config.web_password)
+
+
+def _check_basic_auth(header: str) -> bool:
+    """Validate an 'Authorization: Basic …' header against the configured creds."""
+    if not header.startswith("Basic "):
+        return False
+    try:
+        user, _, pwd = base64.b64decode(header[6:]).decode("utf-8").partition(":")
+    except Exception:
+        return False
+    # compare_digest on both fields — no early-exit timing oracle
+    return (secrets.compare_digest(user, _config.web_username)
+            and secrets.compare_digest(pwd, _config.web_password))
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    if not _auth_enabled():
+        return await call_next(request)
+    if _check_basic_auth(request.headers.get("authorization", "")):
+        return await call_next(request)
+    return Response(
+        status_code=401,
+        content="Authentication required",
+        headers={"WWW-Authenticate": 'Basic realm="Ender3Monitor"'},
+    )
+
+
 # ── Prometheus HTTP request metrics ───────────────────────────────────────────
 
 # /stream is a long-lived MJPEG response — its "duration" is the whole stream
@@ -436,6 +472,11 @@ def _state() -> dict:
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
+    # http-middleware doesn't cover the websocket scope — enforce auth here.
+    # Browsers re-send the page's cached Basic credentials on the WS upgrade.
+    if _auth_enabled() and not _check_basic_auth(ws.headers.get("authorization", "")):
+        await ws.close(code=4401)
+        return
     await ws.accept()
     _clients.add(ws)
     ops.ws_clients.set(len(_clients))

@@ -28,7 +28,14 @@ class EmailNotifier:
         self.sender = sender
         self.recipient = recipient
 
+    @property
+    def enabled(self) -> bool:
+        """True only when SMTP is fully configured — callers skip silently otherwise."""
+        return bool(self.username and self.password and self.recipient)
+
     def send_alert(self, result: AnalysisResult, frame: np.ndarray) -> None:
+        if not self.enabled:
+            return
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         subject = f"[Ender3Monitor] 3D Print Failure Detected – {result.failure_type}"
 
@@ -55,7 +62,8 @@ Please check your printer immediately.
         img_part.add_header("Content-Disposition", "attachment", filename=img_part.get_filename())
         msg.attach(img_part)
 
-        with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+        # timeout: a hung SMTP connection must never stall the monitoring thread
+        with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=15) as server:
             server.ehlo()
             server.starttls()
             server.login(self.username, self.password)
@@ -63,6 +71,8 @@ Please check your printer immediately.
 
     def send_completion(self, frame: np.ndarray, frames_analyzed: int) -> None:
         """Send a print-complete notification with the final frame attached."""
+        if not self.enabled:
+            return
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         subject = "[Ender3Monitor] 3D Print Appears Complete"
 
@@ -89,7 +99,8 @@ A snapshot from the final frame is attached.
         img_part.add_header("Content-Disposition", "attachment", filename=img_part.get_filename())
         msg.attach(img_part)
 
-        with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+        # timeout: a hung SMTP connection must never stall the monitoring thread
+        with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=15) as server:
             server.ehlo()
             server.starttls()
             server.login(self.username, self.password)

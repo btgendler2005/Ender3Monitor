@@ -637,6 +637,8 @@ class Monitor:
                 print("\n  [PRINTER] Auto-pause enabled but printer not connected.")
 
     def _send_alert(self, result: AnalysisResult, frame: np.ndarray) -> None:
+        if not self.notifier.enabled:
+            return
         try:
             self.notifier.send_alert(result, frame)
             print(f"\n  [EMAIL] Alert sent to {self.config.smtp_recipient}")
@@ -645,7 +647,7 @@ class Monitor:
 
     def _send_completion(self, frame: Optional[np.ndarray]) -> None:
         # Email (existing behaviour) — needs a frame for the attachment
-        if frame is not None:
+        if frame is not None and self.notifier.enabled:
             try:
                 self.notifier.send_completion(frame, self.frame_count)
                 print(f"\n  [EMAIL] Completion notice sent to {self.config.smtp_recipient}")
