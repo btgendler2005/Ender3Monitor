@@ -245,14 +245,16 @@ brew services start grafana
 4. Set URL to `http://localhost:9090`
 5. Click **Save & Test**
 
-### 4. Import the dashboard
+### 4. Import the dashboards
 
 1. Go to **Dashboards → Import**
-2. Upload `grafana/dashboard.json` from this repo
+2. Upload from this repo (repeat for each):
+   - `grafana/dashboard.json` — **print monitoring** (frames, failures, confidence)
+   - `grafana/web_dashboard.json` — **web app / SRE** (HTTP latency, system, internals)
 3. Select your Prometheus data source when prompted
 4. Click **Import**
 
-### Metrics exposed
+### Print-monitoring metrics
 
 | Metric | Type | Description |
 |---|---|---|
@@ -261,6 +263,25 @@ brew services start grafana
 | `printer_last_confidence_score` | Gauge | Confidence score from the most recent frame |
 | `printer_confidence_score_histogram` | Histogram | Distribution of confidence scores |
 | `printer_monitoring_active` | Gauge | `1` while monitoring is running, `0` otherwise |
+
+### Operational / SRE metrics
+
+Served from the same `:8000/metrics` endpoint, visualised by `web_dashboard.json`:
+
+| Metric | Type | Description |
+|---|---|---|
+| `e3m_http_requests_total{method,path,status}` | Counter | HTTP requests (by route template) |
+| `e3m_http_request_duration_seconds` | Histogram | Request latency (p50/p95/p99) |
+| `e3m_http_requests_in_progress` | Gauge | In-flight requests |
+| `e3m_analysis_duration_seconds{backend}` | Histogram | AI analysis call latency |
+| `e3m_analysis_errors_total{backend}` | Counter | AI analysis errors |
+| `e3m_camera_frames_total{result}` | Counter | Stream frames captured (ok/fail) |
+| `e3m_printer_connected` | Gauge | `1` if the printer is connected over USB |
+| `e3m_printer_reconnects_total` / `e3m_printer_serial_errors_total` | Counter | USB reconnects / serial errors |
+| `e3m_ws_clients` | Gauge | Connected dashboard websocket clients |
+| `e3m_telegram_commands_total{command}` | Counter | Telegram commands handled |
+| `e3m_push_notifications_total{channel,result}` | Counter | Push notifications sent |
+| `e3m_system_*` / `e3m_process_*` | Gauge | Host & process CPU / memory / disk (via psutil) |
 
 You can verify the metrics endpoint is working before setting up Prometheus:
 ```bash
@@ -305,7 +326,8 @@ Ender3Monitor/
 │   ├── notifier.py         # SMTP email alerts
 │   └── timelapse.py        # Frame saving and MP4 compilation
 ├── grafana/
-│   └── dashboard.json      # Pre-built Grafana dashboard (9 panels)
+│   ├── dashboard.json      # Print-monitoring Grafana dashboard
+│   └── web_dashboard.json  # Operational / SRE Grafana dashboard
 ├── monitor.py              # CLI entry point — run with: python monitor.py
 ├── web.py                  # Web UI entry point — run with: python web.py
 ├── requirements.txt        # Python dependencies
