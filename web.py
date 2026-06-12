@@ -244,11 +244,25 @@ def _tg_stop(args):
     _monitor.stop(); return "⏹ Monitoring stopped."
 
 
+def _tg_ask(args):
+    """Free-form question about the live frame, answered by the vision model."""
+    if _monitor is None or _stream is None:
+        return "Not ready."
+    question = " ".join(args).strip()
+    if not question:
+        return "Ask me something about the print, e.g. `/ask is the first layer sticking?`"
+    frame = _stream.latest_frame()
+    if frame is None:
+        return "No camera frame available right now."
+    return _monitor.analyzer.ask(frame, question)
+
+
 def _build_telegram_handlers():
     handlers = {
         "status":   (_tg_status,   "current status + temps + progress"),
         "snapshot": (_tg_snapshot, "live camera photo"),
         "photo":    (_tg_snapshot, "alias of /snapshot"),
+        "ask":      (_tg_ask,      "ask about the print, e.g. /ask how's the first layer?"),
         "pause":    (_tg_pause,    "pause the print"),
         "resume":   (_tg_resume,   "resume the print"),
         "cooldown": (_tg_cooldown, "pause + heaters off"),

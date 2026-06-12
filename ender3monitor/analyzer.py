@@ -288,9 +288,10 @@ class AnthropicAnalyzer:
                 model=self._model,
                 max_tokens=400,
                 system=("You are a helpful 3D-printing assistant looking at a live webcam "
-                        "frame of a print in progress. Answer the user's question concisely "
-                        "(1–3 sentences), grounded in what you actually see. If you can't tell "
-                        "from the image, say so."),
+                        "frame of a print in progress. Answer the user's question in 1–3 short "
+                        "sentences of PLAIN TEXT — no markdown, no headers, no bullet lists. "
+                        "Ground your answer in what you actually see; if you can't tell from the "
+                        "image, say so."),
                 messages=[{"role": "user", "content": [
                     self._image_block(frame),
                     {"type": "text", "text": q},

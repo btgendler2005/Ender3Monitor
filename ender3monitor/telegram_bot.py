@@ -135,14 +135,17 @@ class TelegramBot:
         return payload.get("result", []) if payload.get("ok") else []
 
     def send_message(self, chat_id: int, text: str) -> None:
-        try:
-            url = _API.format(token=self.token, method="sendMessage")
-            data = urllib.parse.urlencode({
-                "chat_id": chat_id, "text": text, "parse_mode": "Markdown",
-            }).encode()
-            urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10).read()
-        except Exception:
-            pass
+        url = _API.format(token=self.token, method="sendMessage")
+        # Try Markdown first; if Telegram rejects the entities (free-form /ask
+        # answers can contain stray markdown), resend as plain text.
+        for params in ({"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+                       {"chat_id": chat_id, "text": text}):
+            try:
+                data = urllib.parse.urlencode(params).encode()
+                urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10).read()
+                return
+            except Exception:
+                continue
 
     def send_photo(self, chat_id: int, jpeg: bytes, caption: str = "") -> None:
         try:
