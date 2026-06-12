@@ -38,6 +38,11 @@ _SD_RE = re.compile(r"SD printing byte\s+(\d+)\s*/\s*(\d+)")
 _PRINTTIME_RE = re.compile(r"Print time:\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?", re.IGNORECASE)
 # M114 reply looks like:  X:0.00 Y:0.00 Z:0.20 E:0.00 Count X:0 Y:0 Z:80
 _POS_RE = re.compile(r"\bZ:\s*(-?\d+\.?\d*)")
+# M78 (print statistics) has a line like:  Total time: 8d 12h 34m 56s
+_M78_TOTAL_RE = re.compile(
+    r"Total time:\s*(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?",
+    re.IGNORECASE,
+)
 
 
 def _fmt_duration(seconds: Optional[int]) -> Optional[str]:
@@ -64,6 +69,7 @@ class PrinterStatus:
     elapsed_seconds: Optional[int] = None   # print job timer (M31)
     remaining_seconds: Optional[int] = None # estimated, from elapsed + progress
     z_height: Optional[float] = None        # current nozzle Z (M114), for first-layer / layer-timelapse
+    lifetime_print_seconds: Optional[int] = None  # firmware EEPROM total (M78)
 
     last_error: Optional[str] = None
 
@@ -80,8 +86,10 @@ class PrinterStatus:
             "elapsed_seconds": self.elapsed_seconds,
             "remaining_seconds": self.remaining_seconds,
             "z_height": self.z_height,
+            "lifetime_print_seconds": self.lifetime_print_seconds,
             "elapsed_str": _fmt_duration(self.elapsed_seconds),
             "remaining_str": _fmt_duration(self.remaining_seconds),
+            "lifetime_str": _fmt_duration(self.lifetime_print_seconds),
         }
 
 
@@ -116,6 +124,7 @@ class PrinterController:
         self._serial = None
         self._lock = threading.Lock()
         self.status = PrinterStatus()
+        self._refresh_count = 0   # paces the slow M78 statistics query
 
     # ------------------------------------------------------------------ #
     # Connection                                                           #
@@ -246,14 +255,35 @@ class PrinterController:
         if m:
             self.status.z_height = float(m.group(1))
 
+    def query_statistics(self) -> None:
+        """Read the firmware's lifetime total print time via M78 (EEPROM stats).
+
+        Not all builds support M78; if unsupported the value just stays None.
+        """
+        resp = self.send("M78")
+        m = _M78_TOTAL_RE.search(resp)
+        if m and any(m.groups()):
+            d = int(m.group(1) or 0)
+            h = int(m.group(2) or 0)
+            mn = int(m.group(3) or 0)
+            s = int(m.group(4) or 0)
+            self.status.lifetime_print_seconds = d * 86400 + h * 3600 + mn * 60 + s
+
     def refresh_status(self) -> None:
-        """One combined poll: temps, print state/percent, time, and Z height."""
+        """One combined poll: temps, print state/percent, time, and Z height.
+
+        Lifetime statistics (M78) change slowly, so we query them only ~once a
+        minute (and on the first refresh after connecting).
+        """
         self.query_temps()
         if not self.connected:
             return
         self.query_progress()
         self.query_print_time()
         self.query_position()
+        if self._refresh_count % 12 == 0:   # ~every 60 s at a 5 s poll
+            self.query_statistics()
+        self._refresh_count += 1
 
     # ------------------------------------------------------------------ #
     # Interventions                                                        #

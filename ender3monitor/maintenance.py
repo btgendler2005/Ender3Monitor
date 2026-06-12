@@ -60,8 +60,7 @@ class MaintenanceTracker:
         until_next = self.reminder_hours - (self.total_hours % self.reminder_hours)
         return (
             f"*Maintenance*\n"
-            f"Total print time: {self.total_hours:.1f} h\n"
-            f"Prints completed: {d['prints_completed']}\n"
+            f"Tracked since install: {self.total_hours:.1f} h ({d['prints_completed']} prints)\n"
             f"Next upkeep reminder in ~{until_next:.0f} h"
         )
 

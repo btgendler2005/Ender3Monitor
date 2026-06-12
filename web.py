@@ -203,7 +203,9 @@ def _tg_status(args):
     if ft and ft not in ("none", "no_printer"):
         out.append(f"Last: {ft} ({(s.get('confidence') or 0)*100:.0f}%)")
     out += _printer_status_lines()
-    out.append(f"Lifetime: {_monitor.maintenance.total_hours:.1f} h printed")
+    life = s.get("printer", {}).get("lifetime_str")
+    out.append(f"Lifetime: {life} (printer)" if life
+               else f"Lifetime: {_monitor.maintenance.total_hours:.1f} h (tracked)")
     return "\n".join(out)
 
 
@@ -248,7 +250,11 @@ def _tg_stop(args):
 def _tg_maintenance(args):
     if _monitor is None:
         return "Not ready."
-    return _monitor.maintenance.summary()
+    lines = [_monitor.maintenance.summary()]
+    life = _monitor.printer.status.as_dict().get("lifetime_str") if _monitor.printer.connected else None
+    if life:
+        lines.append(f"Printer lifetime (EEPROM): {life}")
+    return "\n".join(lines)
 
 
 def _tg_autostart(args):
