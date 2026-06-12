@@ -250,6 +250,7 @@ brew services start grafana
 1. Go to **Dashboards → Import**
 2. Upload from this repo (repeat for each):
    - `grafana/dashboard.json` — **print monitoring** (frames, failures, confidence)
+   - `grafana/printer_dashboard.json` — **printer telemetry** (temps, progress, Z, lifetime)
    - `grafana/web_dashboard.json` — **web app / SRE** (HTTP latency, system, internals)
 3. Select your Prometheus data source when prompted
 4. Click **Import**
@@ -263,6 +264,20 @@ brew services start grafana
 | `printer_last_confidence_score` | Gauge | Confidence score from the most recent frame |
 | `printer_confidence_score_histogram` | Histogram | Distribution of confidence scores |
 | `printer_monitoring_active` | Gauge | `1` while monitoring is running, `0` otherwise |
+
+### Printer telemetry metrics
+
+Updated every poll while the printer is connected over USB (NaN when unknown), visualised by `printer_dashboard.json`:
+
+| Metric | Type | Description |
+|---|---|---|
+| `e3m_printer_nozzle_temp_celsius` / `e3m_printer_nozzle_target_celsius` | Gauge | Nozzle actual / target temp |
+| `e3m_printer_bed_temp_celsius` / `e3m_printer_bed_target_celsius` | Gauge | Bed actual / target temp |
+| `e3m_printer_z_height_mm` | Gauge | Current nozzle Z height |
+| `e3m_printer_progress_ratio` | Gauge | Print progress (0..1) |
+| `e3m_printer_printing` | Gauge | `1` while a print is active |
+| `e3m_printer_elapsed_seconds` / `e3m_printer_remaining_seconds` | Gauge | Elapsed / estimated remaining print time |
+| `e3m_printer_lifetime_seconds` | Gauge | Lifetime print time from firmware EEPROM (M78) |
 
 ### Operational / SRE metrics
 
@@ -326,8 +341,9 @@ Ender3Monitor/
 │   ├── notifier.py         # SMTP email alerts
 │   └── timelapse.py        # Frame saving and MP4 compilation
 ├── grafana/
-│   ├── dashboard.json      # Print-monitoring Grafana dashboard
-│   └── web_dashboard.json  # Operational / SRE Grafana dashboard
+│   ├── dashboard.json          # Print-monitoring Grafana dashboard
+│   ├── printer_dashboard.json  # Printer telemetry Grafana dashboard
+│   └── web_dashboard.json      # Operational / SRE Grafana dashboard
 ├── monitor.py              # CLI entry point — run with: python monitor.py
 ├── web.py                  # Web UI entry point — run with: python web.py
 ├── requirements.txt        # Python dependencies

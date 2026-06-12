@@ -240,9 +240,11 @@ class Monitor:
             elif ticks % reconnect_ticks == 0:
                 self.printer.connect()          # quiet retry; logged on transition below
 
+            # Mirror live telemetry into Prometheus gauges each poll.
+            ops.update_printer(self.printer.status)
+
             # Log + clean up on connect/disconnect transitions
             now_connected = self.printer.connected
-            ops.printer_connected.set(1 if now_connected else 0)
             if was_connected and not now_connected:
                 print("\n  [PRINTER] Connection lost — retrying in the background…")
                 s = self.printer.status

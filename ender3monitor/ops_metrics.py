@@ -48,6 +48,39 @@ printer_connected = Gauge("e3m_printer_connected", "1 if the printer is connecte
 printer_reconnects_total = Counter("e3m_printer_reconnects_total", "Printer USB reconnects")
 printer_serial_errors_total = Counter("e3m_printer_serial_errors_total", "Serial command failures")
 
+# ── Printer telemetry (physical state, updated each poll) ─────────────────────
+printer_nozzle_temp = Gauge("e3m_printer_nozzle_temp_celsius", "Nozzle temperature (°C)")
+printer_nozzle_target = Gauge("e3m_printer_nozzle_target_celsius", "Nozzle target temperature (°C)")
+printer_bed_temp = Gauge("e3m_printer_bed_temp_celsius", "Bed temperature (°C)")
+printer_bed_target = Gauge("e3m_printer_bed_target_celsius", "Bed target temperature (°C)")
+printer_z_height = Gauge("e3m_printer_z_height_mm", "Current nozzle Z height (mm)")
+printer_progress = Gauge("e3m_printer_progress_ratio", "Print progress (0..1)")
+printer_printing = Gauge("e3m_printer_printing", "1 while a print is active")
+printer_elapsed_seconds = Gauge("e3m_printer_elapsed_seconds", "Elapsed print time (s)")
+printer_remaining_seconds = Gauge("e3m_printer_remaining_seconds", "Estimated remaining print time (s)")
+printer_lifetime_seconds = Gauge("e3m_printer_lifetime_seconds", "Lifetime print time from EEPROM (s)")
+
+_NAN = float("nan")
+
+
+def update_printer(status) -> None:
+    """Mirror the live PrinterStatus into Prometheus gauges. NaN = unknown so
+    graphs show gaps instead of stale values when disconnected."""
+    def g(gauge, val):
+        gauge.set(val if val is not None else _NAN)
+
+    printer_connected.set(1 if status.connected else 0)
+    printer_printing.set(1 if status.printing else 0)
+    g(printer_nozzle_temp, status.nozzle_temp)
+    g(printer_nozzle_target, status.nozzle_target)
+    g(printer_bed_temp, status.bed_temp)
+    g(printer_bed_target, status.bed_target)
+    g(printer_z_height, status.z_height)
+    g(printer_progress, status.progress)
+    g(printer_elapsed_seconds, status.elapsed_seconds)
+    g(printer_remaining_seconds, status.remaining_seconds)
+    g(printer_lifetime_seconds, status.lifetime_print_seconds)
+
 # ── WebSocket / notifications ─────────────────────────────────────────────────
 ws_clients = Gauge("e3m_ws_clients", "Connected dashboard websocket clients")
 telegram_commands_total = Counter("e3m_telegram_commands_total", "Telegram commands handled", ["command"])
