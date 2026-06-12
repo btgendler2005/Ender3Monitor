@@ -36,6 +36,8 @@ _TEMP_RE = re.compile(r"T:\s*(-?\d+\.?\d*)\s*/\s*(-?\d+\.?\d*).*?B:\s*(-?\d+\.?\
 _SD_RE = re.compile(r"SD printing byte\s+(\d+)\s*/\s*(\d+)")
 # M31 reply looks like:   echo:Print time: 1h 23m 45s   (any of h/m/s may be absent)
 _PRINTTIME_RE = re.compile(r"Print time:\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?", re.IGNORECASE)
+# M114 reply looks like:  X:0.00 Y:0.00 Z:0.20 E:0.00 Count X:0 Y:0 Z:80
+_POS_RE = re.compile(r"\bZ:\s*(-?\d+\.?\d*)")
 
 
 def _fmt_duration(seconds: Optional[int]) -> Optional[str]:
@@ -61,6 +63,7 @@ class PrinterStatus:
     progress: Optional[float] = None        # 0..1, SD prints only
     elapsed_seconds: Optional[int] = None   # print job timer (M31)
     remaining_seconds: Optional[int] = None # estimated, from elapsed + progress
+    z_height: Optional[float] = None        # current nozzle Z (M114), for first-layer / layer-timelapse
 
     last_error: Optional[str] = None
 
@@ -76,6 +79,7 @@ class PrinterStatus:
             "progress": self.progress,
             "elapsed_seconds": self.elapsed_seconds,
             "remaining_seconds": self.remaining_seconds,
+            "z_height": self.z_height,
             "elapsed_str": _fmt_duration(self.elapsed_seconds),
             "remaining_str": _fmt_duration(self.remaining_seconds),
         }
@@ -235,13 +239,21 @@ class PrinterController:
         elif not self.status.printing:
             self.status.remaining_seconds = None
 
+    def query_position(self) -> None:
+        """Update current nozzle Z height via M114 (for first-layer / layer timelapse)."""
+        resp = self.send("M114")
+        m = _POS_RE.search(resp)
+        if m:
+            self.status.z_height = float(m.group(1))
+
     def refresh_status(self) -> None:
-        """One combined poll: temps, print state/percent, and time."""
+        """One combined poll: temps, print state/percent, time, and Z height."""
         self.query_temps()
         if not self.connected:
             return
         self.query_progress()
         self.query_print_time()
+        self.query_position()
 
     # ------------------------------------------------------------------ #
     # Interventions                                                        #
