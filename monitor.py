@@ -39,6 +39,8 @@ TIMELAPSE_INTERVAL = 30     # seconds between timelapse frames (time-based mode)
 LAYER_Z_THRESHOLD_MM = 0.04
 # First-layer fallback window when no USB Z is available (seconds after print starts).
 FIRST_LAYER_FALLBACK_SECONDS = 300
+# Heaters are "at temp" within this many degrees of target (signal-based warmup).
+WARMUP_TEMP_TOLERANCE = 5.0
 
 # Print-complete detection: stop after this many consecutive still frames
 NO_MOTION_LIMIT = 4         # 4 × 30 s = 2 minutes
@@ -137,8 +139,15 @@ class Monitor:
         self.failure_count = 0
         self.last_frame_time: Optional[datetime] = None
 
-        # Startup grace period — skip detection while printer warms up (time-based)
-        self._grace_until: float = 0.0   # set in start()
+        # Warmup gating — signal-based when USB connected, else time-based grace
+        self._grace_until: float = 0.0   # set in start() (no-USB fallback)
+        self._warmup_done: bool = False
+
+        # Auto-start: begin monitoring when the printer starts a print (rising edge)
+        self.auto_start_enabled: bool = config.auto_start_on_print
+        self._poll_prev_printing: Optional[bool] = None   # None until first poll
+        self._default_camera_index: Optional[int] = None
+        self._default_frame_provider: Optional[FrameProvider] = None
 
         # Print-complete detection
         self._no_motion_count: int = 0
@@ -191,6 +200,27 @@ class Monitor:
         )
         self._printer_poll_thread.start()
 
+    def set_default_source(self, camera_index: Optional[int],
+                           frame_provider: Optional[FrameProvider]) -> None:
+        """Register a default camera/frame source so auto-start can begin
+        monitoring on its own (called by the web UI with its shared stream)."""
+        self._default_camera_index = camera_index
+        self._default_frame_provider = frame_provider
+
+    def _maybe_auto_start(self) -> None:
+        """Begin monitoring on a fresh idle→printing transition (rising edge)."""
+        printing = bool(self.printer.connected and self.printer.status.printing)
+        prev = self._poll_prev_printing
+        self._poll_prev_printing = printing
+        if prev is None:
+            return   # first observation — establish baseline, don't act
+        rising_edge = printing and not prev
+        if (rising_edge and self.auto_start_enabled and not self._running
+                and self._default_frame_provider is not None):
+            print("\n  [AUTO] Printer started a print — auto-starting monitoring.")
+            self.start(camera_index=self._default_camera_index,
+                       frame_provider=self._default_frame_provider)
+
     def _printer_poll_loop(self) -> None:
         """Poll temps/progress while connected; auto-reconnect when not.
 
@@ -204,6 +234,7 @@ class Monitor:
         while not self._printer_poll_stop.is_set():
             if self.printer.connected:
                 self.printer.refresh_status()   # temps + print state + time + Z
+                self._maybe_auto_start()        # begin monitoring on print start
                 self._maybe_capture_layer_frame()
             elif ticks % reconnect_ticks == 0:
                 self.printer.connect()          # quiet retry; logged on transition below
@@ -240,6 +271,46 @@ class Monitor:
             if frame is not None:
                 self.timelapse.save_frame(frame)
                 self._last_layer_z = z
+
+    def _warmup_gate(self):
+        """Decide whether to skip analysis during warmup.
+
+        Returns (skip: bool, status_message: Optional[str]). With USB connected
+        we gate on real signals — printing must have started and heaters must be
+        within tolerance of target. Without USB we fall back to the time-based
+        grace window. Once cleared, the gate stays open for the rest of the run.
+        """
+        if self._warmup_done:
+            return False, None
+
+        pr = self.printer.status if self.printer.connected else None
+        if pr is not None:
+            if not pr.printing:
+                return True, "Waiting for print to start…"
+            n, nt = pr.nozzle_temp, pr.nozzle_target
+            b, bt = pr.bed_temp, pr.bed_target
+            heating = (
+                (nt and n is not None and n < nt - WARMUP_TEMP_TOLERANCE) or
+                (bt and b is not None and b < bt - WARMUP_TEMP_TOLERANCE)
+            )
+            if heating:
+                msg = "Warming up…"
+                if n is not None and nt:
+                    msg += f" (nozzle {n:.0f}/{nt:.0f}°"
+                    if b is not None and bt:
+                        msg += f", bed {b:.0f}/{bt:.0f}°"
+                    msg += ")"
+                return True, msg
+            self._warmup_done = True
+            return False, None
+
+        # No USB — time-based grace fallback.
+        if time.time() < self._grace_until:
+            secs = int(self._grace_until - time.time())
+            return True, (f"Warming up… ({secs // 60}m {secs % 60}s remaining)"
+                          if secs > 0 else "Warming up… (almost ready)")
+        self._warmup_done = True
+        return False, None
 
     def _in_first_layer(self) -> bool:
         """True while the nozzle is on/near the first layer (failure-prone)."""
@@ -320,18 +391,15 @@ class Monitor:
                 if needs_analysis:
                     last_capture = now
 
-                    # ── Startup grace period (time-based) ──────────────── #
-                    if time.time() < self._grace_until:
-                        secs_left = int(self._grace_until - time.time())
+                    # ── Warmup gate (signal-based w/ USB, else time-based) ── #
+                    skip_warmup, warmup_msg = self._warmup_gate()
+                    if skip_warmup:
                         with self._lock:
-                            self.status = (
-                                f"Warming up… ({secs_left // 60}m {secs_left % 60}s remaining)"
-                                if secs_left > 0 else "Warming up… (almost ready)"
-                            )
+                            self.status = warmup_msg or "Warming up…"
                         self._prev_analysis_frame = frame.copy()
                         if self._running:
                             _print_status(self)
-                        continue   # skip motion check and LLM during grace period
+                        continue   # skip motion check and LLM until warmed up
 
                     # ── Printer-authoritative status (preferred) ───────── #
                     printer_connected = self.printer.connected
@@ -633,6 +701,7 @@ class Monitor:
         self.last_result = None
         self.status = "Monitoring…"
         self._grace_until = time.time() + STARTUP_GRACE_SECONDS
+        self._warmup_done = False
         self._no_motion_count = 0
         self._prev_analysis_frame = None
         self._print_motion_seen = False

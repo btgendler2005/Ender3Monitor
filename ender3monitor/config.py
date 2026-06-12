@@ -61,6 +61,9 @@ class Config:
     first_layer_interval: int    # seconds between analyses while on the first layer
     first_layer_max_z: float     # Z height (mm) at/under which we treat it as first layer
 
+    # Auto-start monitoring when the printer begins a print (USB)
+    auto_start_on_print: bool
+
     # Timelapse
     timelapse_mode: str          # "auto" | "layer" | "time"
     timelapse_max_sessions: int
@@ -120,6 +123,8 @@ class Config:
             capture_interval=max(10, int(os.getenv("CAPTURE_INTERVAL_SECONDS", "300"))),
             first_layer_interval=max(10, int(os.getenv("FIRST_LAYER_INTERVAL_SECONDS", "60"))),
             first_layer_max_z=float(os.getenv("FIRST_LAYER_MAX_Z_MM", "0.6")),
+            auto_start_on_print=os.getenv("AUTO_START_ON_PRINT", "true").strip().lower()
+                in ("1", "true", "yes", "on"),
             maintenance_reminder_hours=int(os.getenv("MAINTENANCE_REMINDER_HOURS", "250")),
             printer_port=os.getenv("PRINTER_PORT", "").strip(),
             printer_baud=int(os.getenv("PRINTER_BAUD", "115200")),

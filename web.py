@@ -251,6 +251,15 @@ def _tg_maintenance(args):
     return _monitor.maintenance.summary()
 
 
+def _tg_autostart(args):
+    if _monitor is None:
+        return "Not ready."
+    arg = (args[0].lower() if args else "")
+    if arg in ("on", "off"):
+        _monitor.auto_start_enabled = (arg == "on")
+    return f"Auto-start is {'ON' if _monitor.auto_start_enabled else 'OFF'}."
+
+
 def _tg_ask(args):
     """Free-form question about the live frame, answered by the vision model."""
     if _monitor is None or _stream is None:
@@ -276,6 +285,7 @@ def _build_telegram_handlers():
         "go":       (_tg_go,       "start monitoring"),
         "stop":     (_tg_stop,     "stop monitoring"),
         "maintenance": (_tg_maintenance, "print hours + upkeep status"),
+        "autostart": (_tg_autostart, "auto-start on print: /autostart on|off"),
     }
 
     def _help(args):
@@ -313,6 +323,8 @@ async def lifespan(app: FastAPI):
     _stream = StreamCapture(_resolve_stream_index(),
                             flip=_config.camera_flip)
     _stream.start()
+    # Let the printer poller auto-start monitoring using the shared stream.
+    _monitor.set_default_source(_stream.index, _stream.latest_frame)
 
     # Interactive Telegram bot (optional)
     if _config.telegram_bot_token:
@@ -373,6 +385,7 @@ def _state() -> dict:
         "camera_index": _monitor.camera.camera_index if _monitor.camera else None,
         "printer": _monitor.printer.status.as_dict(),
         "push_channels": _monitor.push.channels(),
+        "auto_start": _monitor.auto_start_enabled,
     }
 
 
@@ -389,6 +402,19 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
 
 # ── REST API ──────────────────────────────────────────────────────────────────
+
+class AutoStartBody(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/autostart")
+async def api_autostart(body: AutoStartBody):
+    if _monitor is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    _monitor.auto_start_enabled = body.enabled
+    await _broadcast()
+    return {"auto_start": _monitor.auto_start_enabled}
+
 
 @app.get("/api/cameras")
 async def api_cameras(scan: bool = False):
@@ -794,6 +820,9 @@ header{
 #cam-select:disabled{opacity:.4;cursor:not-allowed}
 .btn-scan{background:var(--surf3);border-color:var(--border);color:var(--muted);padding:8px 12px}
 .btn-scan:hover{color:var(--text)}
+.autostart-toggle{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);
+  cursor:pointer;padding:0 6px;user-select:none}
+.autostart-toggle input{width:15px;height:15px;accent-color:var(--blue);cursor:pointer}
 
 /* ── Controls ── */
 .controls{
@@ -1059,6 +1088,10 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
     </svg>
     Download Timelapse
   </button>
+  <label class="autostart-toggle" title="Automatically start monitoring when the printer begins a print">
+    <input type="checkbox" id="autostart-cb" onchange="toggleAutoStart()">
+    <span>Auto-start</span>
+  </label>
 </div>
 
 <!-- Event log -->
@@ -1124,6 +1157,12 @@ function render(d) {
   // Backend
   if (d.backend) {
     document.getElementById('backend-row').textContent = 'Backend: ' + d.backend;
+  }
+
+  // Auto-start toggle reflects server state
+  if (typeof d.auto_start === 'boolean') {
+    const cb = document.getElementById('autostart-cb');
+    if (cb && document.activeElement !== cb) cb.checked = d.auto_start;
   }
 
   // Printer (USB) temps + progress
@@ -1253,6 +1292,19 @@ async function doTimelapse() {
   } else {
     toast((data && data.error) ? data.error : 'No timelapse to download yet');
   }
+}
+
+// Toggle auto-start-on-print
+async function toggleAutoStart() {
+  const cb = document.getElementById('autostart-cb');
+  try {
+    const res = await fetch('/api/autostart', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ enabled: cb.checked }),
+    });
+    const d = await res.json();
+    toast('Auto-start ' + (d.auto_start ? 'on' : 'off'));
+  } catch(e) { toast('Could not update auto-start'); }
 }
 
 // Manual printer control over USB

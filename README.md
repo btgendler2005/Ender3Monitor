@@ -13,6 +13,7 @@ Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, f
 - **Frame pre-validation** — OpenCV checks brightness, contrast, and edge density before sending to AI; rejects dark, covered, or off-target frames without burning API calls
 - **Print completion detection** — uses the printer's own status over USB when available (stops exactly when the print finishes); falls back to camera stillness (4 consecutive still frames) when no printer is connected
 - **Printer control over USB** — live nozzle/bed temps, print progress and time remaining, auto-pause/cooldown on a confirmed failure, and manual pause/resume/cooldown/e-stop from the dashboard
+- **Hands-off start** — auto-starts monitoring when the printer begins a print (USB), and gates warmup on real signals (waits until printing has started and heaters are at target) instead of a fixed timer; falls back to a timer without USB
 - **First-layer inspection** — analyzes more frequently with an adhesion/squish focus during the failure-prone first layer (uses USB Z height)
 - **Layer-synced timelapse** — captures one frame per layer (via USB Z) for a smooth, consistent timelapse; falls back to time-based without USB
 - **Auto completion report** — on finish, sends stats + final photo + the timelapse video to Telegram
@@ -89,6 +90,7 @@ cp .env.example .env
 | `CAPTURE_INTERVAL_SECONDS` | `300` | Seconds between AI analyses — main cost dial (30≈$1/hr, 60≈$0.48/hr, 300≈$0.10/hr) |
 | `FIRST_LAYER_INTERVAL_SECONDS` | `60` | Tighter analysis cadence while on the first layer |
 | `FIRST_LAYER_MAX_Z_MM` | `0.6` | Z height (mm) at/under which it's treated as the first layer |
+| `AUTO_START_ON_PRINT` | `true` | Auto-start monitoring when the printer begins a print (USB); toggle in UI/Telegram |
 | `TIMELAPSE_MODE` | `auto` | `auto` (layer-synced when USB Z available, else time), `layer`, or `time` |
 | `MAINTENANCE_REMINDER_HOURS` | `250` | Push an upkeep reminder every N print-hours |
 | `METRICS_PORT` | `8000` | Prometheus metrics port |
@@ -278,6 +280,7 @@ Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `TELEGRAM_ALLOWED_CHATS` (chat
 | `/snapshot` | Live camera photo |
 | `/pause` `/resume` `/cooldown` | Printer control over USB |
 | `/go` `/stop` | Start / stop monitoring |
+| `/autostart on\|off` | Toggle auto-start-on-print |
 | `/maintenance` | Print hours + upkeep status |
 | `/help` | List commands |
 
@@ -316,8 +319,8 @@ Ender3Monitor/
 
 ## How it works
 
-1. A background thread wakes up every `CAPTURE_INTERVAL_SECONDS` (default 60s)
-2. A single frame is captured from the webcam, then the camera is immediately released (prevents OpenCV's background thread from running continuously)
+1. Monitoring starts automatically when the printer begins a print (USB, `AUTO_START_ON_PRINT`), or manually via the UI/CLI/Telegram. During warmup, analysis is gated on real signals — it waits until the print has started and the heaters reach target (a fixed timer is used as a fallback without USB)
+2. A background thread wakes up every `CAPTURE_INTERVAL_SECONDS` (default 300s; tighter during the first layer) and captures a single frame, then releases the camera
 3. Three fast OpenCV pre-checks run locally (brightness, contrast, edge density) — frames that are too dark, featureless, or not aimed at a printer are rejected without an API call
 4. Valid frames are sent to Claude or llava:7b with a structured prompt; the model returns JSON with `failure_detected`, `failure_type`, `confidence`, and `description`
 5. If confidence ≥ `CONFIDENCE_THRESHOLD` and a real failure is detected, an email alert is sent with the frame attached
