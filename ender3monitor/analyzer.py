@@ -4,7 +4,7 @@ import re
 import cv2
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Optional
 
 # Anthropic model — claude-sonnet-4-6 is the current ID
 # (formerly advertised as claude-sonnet-4-20250514, which is deprecated)
@@ -419,8 +419,3 @@ def create_analyzer(
         return AnthropicAnalyzer(api_key=anthropic_api_key, model=anthropic_model,
                                  capture_interval=capture_interval)
     raise ValueError(f"Unknown ANALYZER_BACKEND '{backend}'. Choose 'anthropic' or 'ollama'.")
-
-
-# Legacy alias so existing code that does `PrintAnalyzer(api_key=...)` still works.
-class PrintAnalyzer(AnthropicAnalyzer):
-    pass

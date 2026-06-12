@@ -30,10 +30,7 @@ from ender3monitor import ops_metrics as ops
 PRINTER_POLL_INTERVAL = 5        # seconds between temperature polls over USB
 PRINTER_RECONNECT_INTERVAL = 10  # seconds between reconnect attempts when dropped
 
-# Default seconds between analysis frames. Overridable per-run via the
-# CAPTURE_INTERVAL_SECONDS env var (see Config) to trade cost vs responsiveness:
-# 30 ≈ $1/hr (Claude), 60 ≈ $0.48/hr, 90 ≈ $0.32/hr.
-DEFAULT_CAPTURE_INTERVAL = 60
+# Analysis cadence comes from config.capture_interval (CAPTURE_INTERVAL_SECONDS).
 TIMELAPSE_INTERVAL = 30     # seconds between timelapse frames (time-based mode)
 
 # Layer-synced timelapse: capture when Z rises by at least this much (mm).

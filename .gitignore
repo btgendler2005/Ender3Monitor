@@ -30,3 +30,5 @@ timelapse_frames/
 
 # Maintenance/health state
 maintenance.json
+.env.bak
+*.env.bak

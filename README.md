@@ -86,6 +86,7 @@ cp .env.example .env
 | `SMTP_SENDER` | — | From address |
 | `SMTP_RECIPIENT` | — | Where to send alerts |
 | `CAMERA_INDEX` | `-1` | Camera to use; `-1` = prompt at startup |
+| `WEB_USERNAME` / `WEB_PASSWORD` | — | Dashboard login (Basic Auth). **Recommended** — gates printer controls. Empty = open on the LAN |
 | `CONFIDENCE_THRESHOLD` | `0.70` | Alert when confidence ≥ this value |
 | `CAPTURE_INTERVAL_SECONDS` | `300` | Seconds between AI analyses — main cost dial (30≈$1/hr, 60≈$0.48/hr, 300≈$0.10/hr) |
 | `FIRST_LAYER_INTERVAL_SECONDS` | `60` | Tighter analysis cadence while on the first layer |
@@ -344,6 +345,8 @@ Ender3Monitor/
 │   ├── dashboard.json          # Print-monitoring Grafana dashboard
 │   ├── printer_dashboard.json  # Printer telemetry Grafana dashboard
 │   └── web_dashboard.json      # Operational / SRE Grafana dashboard
+├── tests/
+│   └── test_core.py        # Unit tests — run with: python3 -m pytest tests/
 ├── monitor.py              # CLI entry point — run with: python monitor.py
 ├── web.py                  # Web UI entry point — run with: python web.py
 ├── requirements.txt        # Python dependencies
@@ -352,6 +355,17 @@ Ender3Monitor/
 ├── LICENSE
 └── README.md
 ```
+
+### Running the tests
+
+```bash
+pip install pytest
+python3 -m pytest tests/ -q
+```
+
+Covers the parsing/decision logic: AI response normalization, G-code reply
+regexes (M105/M27/M31/M114/M78), frame pre-checks and motion diff, camera-flip
+parsing, and maintenance persistence/alerts.
 
 ---
 
