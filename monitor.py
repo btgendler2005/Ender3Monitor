@@ -38,6 +38,9 @@ TIMELAPSE_INTERVAL = 30     # seconds between timelapse frames (time-based mode)
 
 # Layer-synced timelapse: capture when Z rises by at least this much (mm).
 LAYER_Z_THRESHOLD_MM = 0.04
+# A drop this large means the head re-homed / a new print began below the old
+# baseline — re-baseline instead of waiting for Z to exceed the stale high mark.
+LAYER_Z_RESET_MM = 1.0
 # First-layer fallback window when no USB Z is available (seconds after print starts).
 FIRST_LAYER_FALLBACK_SECONDS = 300
 # Heaters are "at temp" within this many degrees of target (signal-based warmup).
@@ -237,6 +240,7 @@ class Monitor:
                 self.printer.refresh_status()   # temps + print state + time + Z
                 self._maybe_auto_start()        # begin monitoring on print start
                 self._maybe_capture_layer_frame()
+                self._check_printer_completion()  # falling-edge finish at 5 s cadence
             elif ticks % reconnect_ticks == 0:
                 self.printer.connect()          # quiet retry; logged on transition below
 
@@ -268,14 +272,62 @@ class Monitor:
         """
         if not (self._running and self._timelapse_layer_mode and self._frame_provider):
             return
+        if not self.printer.status.printing:
+            return   # ignore homing/parking moves outside an active print
         z = self.printer.status.z_height
         if z is None:
+            return
+        # The head ended the previous job parked high (e.g. Z=80). Without this
+        # reset the baseline would start there and a new print whose layers are
+        # all lower would never trigger a capture for the entire run.
+        if self._last_layer_z is not None and z < self._last_layer_z - LAYER_Z_RESET_MM:
+            self._last_layer_z = z
             return
         if self._last_layer_z is None or z >= self._last_layer_z + LAYER_Z_THRESHOLD_MM:
             frame = self._frame_provider()
             if frame is not None:
                 self.timelapse.save_frame(frame)
                 self._last_layer_z = z
+
+    def _check_printer_completion(self) -> None:
+        """Detect print completion from the printer's own state (falling edge).
+
+        Runs in the 5 s poll loop rather than the analysis loop, so completion
+        is noticed within seconds of the job ending — at a 5-minute analysis
+        cadence the old in-loop check could fire up to 5 minutes late, by which
+        time the part may already be off the bed (empty-bed "final photo").
+        """
+        printing = bool(self.printer.status.printing)
+        if self._running and printing:
+            self._seen_printer_printing = True
+            if self._print_active_since is None:
+                self._print_active_since = time.time()
+        falling = self._printer_was_printing and not printing
+        self._printer_was_printing = printing
+
+        if not (falling and self._running and self._seen_printer_printing):
+            return
+
+        # Grab the final frame NOW, while the finished part is still on the bed.
+        frame = None
+        if self._frame_provider is not None:
+            frame = self._frame_provider()
+        elif self.camera is not None:
+            frame = self.camera.snapshot()
+        if frame is None:
+            frame = self._prev_analysis_frame
+
+        with self._lock:
+            self.status = "Print Complete"
+            self._running = False
+        self._stop_event.set()   # wake the analysis loop so it exits promptly
+        print("\n  ✓ Print complete (reported by printer).")
+
+        # Heavy I/O (email, timelapse compile, Telegram video) runs on its own
+        # thread so this poll loop keeps polling temps without a long stall.
+        threading.Thread(
+            target=self._send_completion, args=(frame,), daemon=True
+        ).start()
 
     def _warmup_gate(self):
         """Decide whether to skip analysis during warmup.
@@ -291,7 +343,11 @@ class Monitor:
         pr = self.printer.status if self.printer.connected else None
         if pr is not None:
             if not pr.printing:
-                return True, "Waiting for print to start…"
+                # Don't gate forever — if the printer never reports an SD print
+                # (M27 quirk, or the user is monitoring something else), fall
+                # through to the heater check once the grace window expires.
+                if time.time() < self._grace_until:
+                    return True, "Waiting for print to start…"
             n, nt = pr.nozzle_temp, pr.nozzle_target
             b, bt = pr.bed_temp, pr.bed_target
             heating = (
@@ -406,29 +462,12 @@ class Monitor:
                             _print_status(self)
                         continue   # skip motion check and LLM until warmed up
 
-                    # ── Printer-authoritative status (preferred) ───────── #
-                    printer_connected = self.printer.connected
-                    pr = self.printer.status if printer_connected else None
-                    printer_printing = bool(pr and pr.printing)
-                    if printer_printing:
-                        self._seen_printer_printing = True
-                        if self._print_active_since is None:
-                            self._print_active_since = time.time()
+                    # Printer-reported completion is detected in the 5 s poll loop
+                    # (_check_printer_completion); here we only read the flags it
+                    # maintains. use_printer_completion disables the camera-motion
+                    # fallback once the printer has proven it reports SD status.
+                    pr = self.printer.status if self.printer.connected else None
                     use_printer_completion = self._seen_printer_printing
-
-                    # Only evaluate printer completion when actually CONNECTED —
-                    # a USB drop mid-print must not be read as "finished".
-                    if use_printer_completion and printer_connected:
-                        # active → not-printing means the job finished (or was stopped).
-                        if self._printer_was_printing and not printer_printing:
-                            with self._lock:
-                                self.status = "Print Complete"
-                                self._running = False
-                            print("\n  ✓ Print complete (reported by printer).")
-                            self._send_completion(frame)
-                            _print_status(self)
-                            break
-                        self._printer_was_printing = printer_printing
 
                     # Near the end the head parks away from the model → looks like a
                     # gap/stopped-extrusion. Suppress failure flagging past the cutoff.
@@ -604,13 +643,14 @@ class Monitor:
         except Exception as exc:
             print(f"\n  [EMAIL ERROR] {exc}")
 
-    def _send_completion(self, frame: np.ndarray) -> None:
-        # Email (existing behaviour)
-        try:
-            self.notifier.send_completion(frame, self.frame_count)
-            print(f"\n  [EMAIL] Completion notice sent to {self.config.smtp_recipient}")
-        except Exception as exc:
-            print(f"\n  [EMAIL ERROR] {exc}")
+    def _send_completion(self, frame: Optional[np.ndarray]) -> None:
+        # Email (existing behaviour) — needs a frame for the attachment
+        if frame is not None:
+            try:
+                self.notifier.send_completion(frame, self.frame_count)
+                print(f"\n  [EMAIL] Completion notice sent to {self.config.smtp_recipient}")
+            except Exception as exc:
+                print(f"\n  [EMAIL ERROR] {exc}")
 
         # Rich report (stats + final photo + compiled timelapse) to push channels
         try:
@@ -654,9 +694,10 @@ class Monitor:
         # 1. Text summary (all channels)
         self.push.send(title="✅ Print complete", message=stats, priority="default")
         # 2. Final photo (Telegram)
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        if ok:
-            self.push.send_photo(buf.tobytes(), caption="Final frame")
+        if frame is not None:
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if ok:
+                self.push.send_photo(buf.tobytes(), caption="Final frame")
         # 3. Compiled timelapse video (Telegram, if not too large)
         try:
             mp4 = self.timelapse.compile()
