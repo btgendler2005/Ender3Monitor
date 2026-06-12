@@ -13,6 +13,11 @@ Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, f
 - **Frame pre-validation** — OpenCV checks brightness, contrast, and edge density before sending to AI; rejects dark, covered, or off-target frames without burning API calls
 - **Print completion detection** — uses the printer's own status over USB when available (stops exactly when the print finishes); falls back to camera stillness (4 consecutive still frames) when no printer is connected
 - **Printer control over USB** — live nozzle/bed temps, print progress and time remaining, auto-pause/cooldown on a confirmed failure, and manual pause/resume/cooldown/e-stop from the dashboard
+- **First-layer inspection** — analyzes more frequently with an adhesion/squish focus during the failure-prone first layer (uses USB Z height)
+- **Layer-synced timelapse** — captures one frame per layer (via USB Z) for a smooth, consistent timelapse; falls back to time-based without USB
+- **Auto completion report** — on finish, sends stats + final photo + the timelapse video to Telegram
+- **Interactive Telegram bot** — two-way control and `/ask` natural-language questions about the live print ("is the first layer sticking?")
+- **Maintenance tracking** — cumulative print hours with upkeep reminders and a "possible clog" heads-up when stopped-extrusion recurs
 - **Push notifications** — instant phone alerts via ntfy, Discord, or Telegram
 - **Email alerts** — SMTP notification with failure type, confidence score, and attached snapshot
 - **Web UI** — clean dark-theme dashboard at `http://localhost:8080`; start/stop monitoring, live camera feed, confidence gauge, AI observations, and event log
@@ -81,7 +86,11 @@ cp .env.example .env
 | `SMTP_RECIPIENT` | — | Where to send alerts |
 | `CAMERA_INDEX` | `-1` | Camera to use; `-1` = prompt at startup |
 | `CONFIDENCE_THRESHOLD` | `0.70` | Alert when confidence ≥ this value |
-| `CAPTURE_INTERVAL_SECONDS` | `60` | Seconds between AI analyses — main cost dial (30≈$1/hr, 60≈$0.48/hr, 90≈$0.32/hr) |
+| `CAPTURE_INTERVAL_SECONDS` | `300` | Seconds between AI analyses — main cost dial (30≈$1/hr, 60≈$0.48/hr, 300≈$0.10/hr) |
+| `FIRST_LAYER_INTERVAL_SECONDS` | `60` | Tighter analysis cadence while on the first layer |
+| `FIRST_LAYER_MAX_Z_MM` | `0.6` | Z height (mm) at/under which it's treated as the first layer |
+| `TIMELAPSE_MODE` | `auto` | `auto` (layer-synced when USB Z available, else time), `layer`, or `time` |
+| `MAINTENANCE_REMINDER_HOURS` | `250` | Push an upkeep reminder every N print-hours |
 | `METRICS_PORT` | `8000` | Prometheus metrics port |
 | `TIMELAPSE_DIR` | `timelapse_frames` | Where to save timelapse frames |
 | `TIMELAPSE_MAX_SESSIONS` | `20` | Keep at most this many recent print folders (older pruned) |
@@ -258,15 +267,37 @@ curl http://localhost:8000/metrics
 
 ---
 
+## Telegram control
+
+Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `TELEGRAM_ALLOWED_CHATS` (chat IDs allowed to issue commands — your alert channel's ID works) to control the printer from anywhere, with no exposed web server. Commands:
+
+| Command | Action |
+|---|---|
+| `/status` | Monitoring state, temps, progress, lifetime hours |
+| `/ask <question>` | Ask the AI about the live frame (e.g. `/ask is the first layer sticking?`) |
+| `/snapshot` | Live camera photo |
+| `/pause` `/resume` `/cooldown` | Printer control over USB |
+| `/go` `/stop` | Start / stop monitoring |
+| `/maintenance` | Print hours + upkeep status |
+| `/help` | List commands |
+
+On completion the bot also auto-sends a report: stats, final photo, and the timelapse video.
+
+---
+
 ## Project structure
 
 ```
 Ender3Monitor/
 ├── ender3monitor/          # Core package
 │   ├── __init__.py
-│   ├── analyzer.py         # AI analysis — pre-checks + Anthropic/Ollama backends
+│   ├── analyzer.py         # AI analysis — pre-checks + Anthropic/Ollama backends, /ask
 │   ├── camera.py           # Camera detection and snapshot capture
 │   ├── config.py           # Configuration loaded from .env
+│   ├── printer.py          # USB serial G-code control (temps, Z, progress, pause/cooldown)
+│   ├── push.py             # ntfy / Discord / Telegram notifications + media
+│   ├── telegram_bot.py     # Interactive Telegram command bot (/status, /ask, …)
+│   ├── maintenance.py      # Print-hours + health tracking (reminders, clog trend)
 │   ├── metrics.py          # Prometheus metrics
 │   ├── notifier.py         # SMTP email alerts
 │   └── timelapse.py        # Frame saving and MP4 compilation
