@@ -46,6 +46,17 @@ HARD RULES to avoid false alarms:
 Only choose a non-"none" failure_type when your confidence is >= 0.85."""
 
 
+# Appended to the prompt during the first layer, where most failures originate.
+_FIRST_LAYER_NOTE = (
+    "FIRST-LAYER CHECK: the print is on its first layer right now — the most "
+    "failure-prone phase. Look specifically for: filament NOT sticking to the bed, "
+    "lines not bonding to each other (gaps/spaces between them), corners already "
+    "lifting, or the extruded line being dragged around by the nozzle. These map to "
+    "'detached' or 'warping'. Normal first layers look like flat, even, touching "
+    "lines — that is 'none'. Still require high confidence before flagging."
+)
+
+
 @dataclass
 class AnalysisResult:
     failure_detected: bool
@@ -208,21 +219,21 @@ class AnthropicAnalyzer:
             },
         }
 
-    def analyze_frame(self, frame: np.ndarray) -> AnalysisResult:
+    def analyze_frame(self, frame: np.ndarray, first_layer: bool = False) -> AnalysisResult:
         early = _precheck_frame(frame, backend=f"anthropic/{self._model}")
         if early:
             self._prev_frame = frame.copy()
             return early
 
-        # Temporal context: show the previous analysis frame (~30 s ago) before
-        # the current one. A real failure persists or worsens between frames; a
-        # print that looks normal in both is normal. This sharply cuts single-
-        # frame misreads (e.g. an attached print called "detached" from one odd
-        # angle).
+        # Temporal context: show the previous analysis frame (from the last
+        # interval) before the current one. A real failure persists or worsens
+        # between frames; a print that looks normal in both is normal. This
+        # sharply cuts single-frame misreads (e.g. an attached print called
+        # "detached" from one odd angle).
         content = []
         if self._prev_frame is not None:
             content.append({"type": "text",
-                            "text": "FRAME 1 — about 30 seconds ago (for comparison only):"})
+                            "text": "FRAME 1 — the previous capture, earlier (for comparison only):"})
             content.append(self._image_block(self._prev_frame))
             content.append({"type": "text",
                             "text": "FRAME 2 — NOW. Judge this current frame. A genuine "
@@ -232,6 +243,8 @@ class AnthropicAnalyzer:
         else:
             content.append({"type": "text", "text": "Current printer frame:"})
             content.append(self._image_block(frame))
+        if first_layer:
+            content.append({"type": "text", "text": _FIRST_LAYER_NOTE})
         content.append({"type": "text",
                         "text": "Respond with the JSON object only."})
 
@@ -267,6 +280,27 @@ class AnthropicAnalyzer:
         raw_text = next((b.text for b in response.content if b.type == "text"), "{}")
         return _parse_response(raw_text, backend=f"anthropic/{self._model}")
 
+    def ask(self, frame: np.ndarray, question: str) -> str:
+        """Answer a free-form question about the current frame (for /ask)."""
+        q = (question or "").strip() or "How does this print look?"
+        try:
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=400,
+                system=("You are a helpful 3D-printing assistant looking at a live webcam "
+                        "frame of a print in progress. Answer the user's question concisely "
+                        "(1–3 sentences), grounded in what you actually see. If you can't tell "
+                        "from the image, say so."),
+                messages=[{"role": "user", "content": [
+                    self._image_block(frame),
+                    {"type": "text", "text": q},
+                ]}],
+            )
+            return next((b.text for b in response.content if b.type == "text"), "").strip() \
+                or "I couldn't generate a response."
+        except Exception as exc:
+            return f"Couldn't analyze the frame: {exc}"
+
 
 # ------------------------------------------------------------------ #
 # Ollama backend                                                        #
@@ -297,7 +331,7 @@ class OllamaAnalyzer:
             import os
             os.environ.setdefault("OLLAMA_HOST", host)
 
-    def analyze_frame(self, frame: np.ndarray) -> AnalysisResult:
+    def analyze_frame(self, frame: np.ndarray, first_layer: bool = False) -> AnalysisResult:
         early = _precheck_frame(frame, backend=f"ollama/{self._model}")
         if early:
             return early
@@ -306,7 +340,10 @@ class OllamaAnalyzer:
 
         # Combine system prompt into the user message — many llava builds
         # ignore a separate system role, so embedding it is more reliable.
-        prompt = f"{SYSTEM_PROMPT}\n\nAnalyze this 3D printer image for failures. Respond with the JSON object only."
+        prompt = f"{SYSTEM_PROMPT}\n\nAnalyze this 3D printer image for failures."
+        if first_layer:
+            prompt += f"\n\n{_FIRST_LAYER_NOTE}"
+        prompt += "\n\nRespond with the JSON object only."
 
         response = self._ollama.chat(
             model=self._model,
@@ -320,6 +357,21 @@ class OllamaAnalyzer:
         )
         raw_text = response["message"]["content"]
         return _parse_response(raw_text, backend=f"ollama/{self._model}")
+
+    def ask(self, frame: np.ndarray, question: str) -> str:
+        """Answer a free-form question about the current frame (for /ask)."""
+        q = (question or "").strip() or "How does this print look?"
+        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        prompt = ("You are looking at a live webcam frame of a 3D print in progress. "
+                  "Answer concisely (1-3 sentences), based on what you see.\n\n" + q)
+        try:
+            response = self._ollama.chat(
+                model=self._model,
+                messages=[{"role": "user", "content": prompt, "images": [buf.tobytes()]}],
+            )
+            return (response["message"]["content"] or "").strip() or "No response."
+        except Exception as exc:
+            return f"Couldn't analyze the frame: {exc}"
 
 
 # ------------------------------------------------------------------ #

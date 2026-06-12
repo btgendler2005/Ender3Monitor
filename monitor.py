@@ -32,7 +32,12 @@ PRINTER_RECONNECT_INTERVAL = 10  # seconds between reconnect attempts when dropp
 # CAPTURE_INTERVAL_SECONDS env var (see Config) to trade cost vs responsiveness:
 # 30 ≈ $1/hr (Claude), 60 ≈ $0.48/hr, 90 ≈ $0.32/hr.
 DEFAULT_CAPTURE_INTERVAL = 60
-TIMELAPSE_INTERVAL = 30     # seconds between timelapse frames
+TIMELAPSE_INTERVAL = 30     # seconds between timelapse frames (time-based mode)
+
+# Layer-synced timelapse: capture when Z rises by at least this much (mm).
+LAYER_Z_THRESHOLD_MM = 0.04
+# First-layer fallback window when no USB Z is available (seconds after print starts).
+FIRST_LAYER_FALLBACK_SECONDS = 300
 
 # Print-complete detection: stop after this many consecutive still frames
 NO_MOTION_LIMIT = 4         # 4 × 30 s = 2 minutes
@@ -130,8 +135,8 @@ class Monitor:
         self.failure_count = 0
         self.last_frame_time: Optional[datetime] = None
 
-        # Startup grace period — skip detection while printer warms up
-        self._grace_frames_remaining: int = 0   # set in start() from the interval
+        # Startup grace period — skip detection while printer warms up (time-based)
+        self._grace_until: float = 0.0   # set in start()
 
         # Print-complete detection
         self._no_motion_count: int = 0
@@ -141,6 +146,16 @@ class Monitor:
         # Printer-authoritative completion (preferred over camera stillness)
         self._seen_printer_printing: bool = False  # saw an active SD/USB print
         self._printer_was_printing: bool = False   # previous poll's printing state
+        self._print_active_since: Optional[float] = None  # when printing/motion first seen
+
+        # Layer-synced timelapse (driven by the printer Z poller)
+        self._timelapse_layer_mode: bool = False
+        self._last_layer_z: Optional[float] = None
+
+        # Per-run analysis stats (for the completion report)
+        self._conf_sum: float = 0.0
+        self._conf_n: int = 0
+        self._conf_peak: float = 0.0
 
         # Failure confirmation — require consecutive frames before alerting
         self._pending_failure_type: Optional[str] = None
@@ -185,7 +200,8 @@ class Monitor:
         was_connected = self.printer.connected
         while not self._printer_poll_stop.is_set():
             if self.printer.connected:
-                self.printer.refresh_status()   # temps + print state + time
+                self.printer.refresh_status()   # temps + print state + time + Z
+                self._maybe_capture_layer_frame()
             elif ticks % reconnect_ticks == 0:
                 self.printer.connect()          # quiet retry; logged on transition below
 
@@ -204,6 +220,34 @@ class Monitor:
             ticks += 1
             self._printer_poll_stop.wait(timeout=PRINTER_POLL_INTERVAL)
 
+    def _maybe_capture_layer_frame(self) -> None:
+        """Layer-synced timelapse: save one frame whenever the Z height steps up.
+
+        Runs in the printer poll loop (every ~5 s) so it sees fresh Z. Only active
+        while monitoring with a shared frame source (web UI). Z-hop travel moves
+        are mostly sampled-over at 5 s, so this yields ~one frame per layer.
+        """
+        if not (self._running and self._timelapse_layer_mode and self._frame_provider):
+            return
+        z = self.printer.status.z_height
+        if z is None:
+            return
+        if self._last_layer_z is None or z >= self._last_layer_z + LAYER_Z_THRESHOLD_MM:
+            frame = self._frame_provider()
+            if frame is not None:
+                self.timelapse.save_frame(frame)
+                self._last_layer_z = z
+
+    def _in_first_layer(self) -> bool:
+        """True while the nozzle is on/near the first layer (failure-prone)."""
+        pr = self.printer.status if self.printer.connected else None
+        if pr and pr.printing and pr.z_height is not None:
+            return pr.z_height <= self.config.first_layer_max_z
+        # Fallback with no USB Z: first few minutes after printing/motion began.
+        if self._print_active_since is not None:
+            return (time.time() - self._print_active_since) <= FIRST_LAYER_FALLBACK_SECONDS
+        return False
+
     def close(self) -> None:
         """Release printer resources (call on app shutdown)."""
         self._printer_poll_stop.set()
@@ -218,18 +262,23 @@ class Monitor:
     def _monitoring_loop(self) -> None:
         last_capture = 0.0
         last_timelapse = 0.0
-        interval = self.config.capture_interval
 
         self.metrics.monitoring_active.set(1)
         try:
             while self._running:
-                # Sleep until the next event (analysis or timelapse) rather than
-                # waking every second and grabbing a frame we'll discard.
+                # Cadence is dynamic: tighter while on the first layer. The printer
+                # poller keeps z_height fresh, so we can decide before sleeping.
+                first_layer = self._in_first_layer()
+                interval = (self.config.first_layer_interval if first_layer
+                            else self.config.capture_interval)
+                # Time-based timelapse only when NOT in layer-synced mode.
+                time_timelapse = not self._timelapse_layer_mode
+
+                # Sleep until the next event (analysis or, in time mode, timelapse).
                 now = time.time()
-                next_event = min(
-                    last_capture + interval,
-                    last_timelapse + TIMELAPSE_INTERVAL,
-                )
+                next_event = last_capture + interval
+                if time_timelapse:
+                    next_event = min(next_event, last_timelapse + TIMELAPSE_INTERVAL)
                 sleep_for = max(1.0, next_event - now)
                 # Event.wait() returns immediately when stop() sets _stop_event,
                 # so we never block the UI for the full interval waiting on a sleep.
@@ -240,7 +289,7 @@ class Monitor:
 
                 now = time.time()
                 needs_analysis = now - last_capture >= interval
-                needs_timelapse = now - last_timelapse >= TIMELAPSE_INTERVAL
+                needs_timelapse = time_timelapse and (now - last_timelapse >= TIMELAPSE_INTERVAL)
 
                 if not (needs_analysis or needs_timelapse):
                     continue
@@ -259,23 +308,21 @@ class Monitor:
                         self.status = "Camera error – no frame"
                     continue
 
-                # Timelapse frame every 60 s
+                # Time-based timelapse (layer-synced capture happens in the poller)
                 if needs_timelapse:
                     self.timelapse.save_frame(frame)
                     last_timelapse = now
 
-                # Analysis frame every 30 s
+                # Analysis frame
                 if needs_analysis:
                     last_capture = now
 
-                    # ── Startup grace period ───────────────────────────── #
-                    if self._grace_frames_remaining > 0:
-                        self._grace_frames_remaining -= 1
-                        secs_left = self._grace_frames_remaining * interval
-                        mins_left = secs_left // 60
+                    # ── Startup grace period (time-based) ──────────────── #
+                    if time.time() < self._grace_until:
+                        secs_left = int(self._grace_until - time.time())
                         with self._lock:
                             self.status = (
-                                f"Warming up… ({mins_left}m {secs_left % 60}s remaining)"
+                                f"Warming up… ({secs_left // 60}m {secs_left % 60}s remaining)"
                                 if secs_left > 0 else "Warming up… (almost ready)"
                             )
                         self._prev_analysis_frame = frame.copy()
@@ -289,6 +336,8 @@ class Monitor:
                     printer_printing = bool(pr and pr.printing)
                     if printer_printing:
                         self._seen_printer_printing = True
+                        if self._print_active_since is None:
+                            self._print_active_since = time.time()
                     use_printer_completion = self._seen_printer_printing
 
                     # Only evaluate printer completion when actually CONNECTED —
@@ -324,6 +373,8 @@ class Monitor:
                                         f"resetting idle counter (was {self._no_motion_count})"
                                     )
                                 self._print_motion_seen = True
+                                if self._print_active_since is None:
+                                    self._print_active_since = time.time()
                                 self._no_motion_count = 0
                             else:
                                 if self._print_motion_seen:
@@ -349,9 +400,10 @@ class Monitor:
 
                     # ── LLM analysis ───────────────────────────────────── #
                     with self._lock:
-                        self.status = "Analyzing frame…"
+                        self.status = ("Analyzing first layer…" if first_layer
+                                       else "Analyzing frame…")
                     try:
-                        result = self.analyzer.analyze_frame(frame)
+                        result = self.analyzer.analyze_frame(frame, first_layer=first_layer)
                     except Exception as exc:
                         with self._lock:
                             self.status = f"Analysis error: {exc}"
@@ -362,6 +414,10 @@ class Monitor:
                         self.frame_count += 1
                         self.last_result = result
                         self.last_frame_time = datetime.now()
+                        # Per-run confidence stats (for the completion report)
+                        self._conf_sum += result.confidence
+                        self._conf_n += 1
+                        self._conf_peak = max(self._conf_peak, result.confidence)
                         self.metrics.record_analysis(
                             result.confidence,
                             result.failure_type,
@@ -523,16 +579,24 @@ class Monitor:
         self.failure_count = 0
         self.last_result = None
         self.status = "Monitoring…"
-        self._grace_frames_remaining = max(
-            1, round(STARTUP_GRACE_SECONDS / self.config.capture_interval)
-        )
+        self._grace_until = time.time() + STARTUP_GRACE_SECONDS
         self._no_motion_count = 0
         self._prev_analysis_frame = None
         self._print_motion_seen = False
         self._seen_printer_printing = False
         self._printer_was_printing = False
+        self._print_active_since = None
         self._pending_failure_type = None
         self._pending_failure_count = 0
+        self._last_layer_z = None
+        self._conf_sum = 0.0
+        self._conf_n = 0
+        self._conf_peak = 0.0
+        # Layer-synced timelapse when the printer reports Z (auto/layer modes).
+        self._timelapse_layer_mode = (
+            self.config.timelapse_mode == "layer"
+            or (self.config.timelapse_mode == "auto" and self.printer.connected)
+        )
 
         self._monitor_thread = threading.Thread(
             target=self._monitoring_loop, daemon=True
