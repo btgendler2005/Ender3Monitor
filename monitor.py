@@ -25,6 +25,7 @@ from ender3monitor.timelapse import TimelapseManager
 from ender3monitor.printer import PrinterController
 from ender3monitor.push import PushNotifier
 from ender3monitor.maintenance import MaintenanceTracker
+from ender3monitor import ops_metrics as ops
 
 PRINTER_POLL_INTERVAL = 5        # seconds between temperature polls over USB
 PRINTER_RECONNECT_INTERVAL = 10  # seconds between reconnect attempts when dropped
@@ -241,6 +242,7 @@ class Monitor:
 
             # Log + clean up on connect/disconnect transitions
             now_connected = self.printer.connected
+            ops.printer_connected.set(1 if now_connected else 0)
             if was_connected and not now_connected:
                 print("\n  [PRINTER] Connection lost — retrying in the background…")
                 s = self.printer.status
@@ -249,6 +251,7 @@ class Monitor:
                 s.progress = s.elapsed_seconds = s.remaining_seconds = None
             elif not was_connected and now_connected:
                 print(f"\n  [PRINTER] Reconnected on {self.printer.status.port}.")
+                ops.printer_reconnects_total.inc()
             was_connected = now_connected
 
             ticks += 1
@@ -473,9 +476,13 @@ class Monitor:
                     with self._lock:
                         self.status = ("Analyzing first layer…" if first_layer
                                        else "Analyzing frame…")
+                    _t0 = time.perf_counter()
                     try:
                         result = self.analyzer.analyze_frame(frame, first_layer=first_layer)
+                        ops.analysis_duration_seconds.labels(
+                            self.config.analyzer_backend).observe(time.perf_counter() - _t0)
                     except Exception as exc:
+                        ops.analysis_errors_total.labels(self.config.analyzer_backend).inc()
                         with self._lock:
                             self.status = f"Analysis error: {exc}"
                         continue

@@ -48,11 +48,24 @@ class PushNotifier:
     def send(self, title: str, message: str, priority: str = "default") -> None:
         """Fire the notification to every configured channel. Never raises."""
         if self.ntfy_topic:
-            self._safe(self._send_ntfy, title, message, priority)
+            self._safe_channel("ntfy", self._send_ntfy, title, message, priority)
         if self.discord_webhook:
-            self._safe(self._send_discord, title, message, priority)
+            self._safe_channel("discord", self._send_discord, title, message, priority)
         if self.telegram_bot_token and self.telegram_chat_id:
-            self._safe(self._send_telegram, title, message, priority)
+            self._safe_channel("telegram", self._send_telegram, title, message, priority)
+
+    def _safe_channel(self, channel: str, fn, *args) -> None:
+        result = "ok"
+        try:
+            fn(*args)
+        except Exception as exc:
+            result = "fail"
+            print(f"  [PUSH] {fn.__name__} failed: {exc}")
+        try:
+            from ender3monitor import ops_metrics as _ops
+            _ops.push_notifications_total.labels(channel, result).inc()
+        except Exception:
+            pass
 
     @staticmethod
     def _safe(fn, *args) -> None:

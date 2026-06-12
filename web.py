@@ -31,6 +31,7 @@ log = logging.getLogger("ender3monitor")
 from ender3monitor.camera import CameraManager
 from ender3monitor.config import Config
 from ender3monitor.telegram_bot import TelegramBot
+from ender3monitor import ops_metrics as ops
 from monitor import Monitor
 
 # ── global state ──────────────────────────────────────────────────────────────
@@ -118,10 +119,12 @@ class StreamCapture:
                     continue
             ok, frame = cap.read()
             if not ok or frame is None:
+                ops.camera_frames_total.labels("fail").inc()
                 cap.release()
                 cap = None
                 time.sleep(0.3)
                 continue
+            ops.camera_frames_total.labels("ok").inc()
             if self.flip is not None:
                 frame = cv2.flip(frame, self.flip)
             with self._lock:
@@ -305,7 +308,14 @@ def _build_telegram_handlers():
 
     handlers["help"] = (_help, "alias")             # listed manually below
     handlers["start"] = (_help, "alias of /help")   # /start is Telegram's default
-    return handlers
+
+    # Wrap every handler to count command usage in Prometheus.
+    def _counted(name, fn):
+        def wrapper(args):
+            ops.telegram_commands_total.labels(name).inc()
+            return fn(args)
+        return wrapper
+    return {cmd: (_counted(cmd, fn), desc) for cmd, (fn, desc) in handlers.items()}
 
 
 def _parse_allowed_chats(raw: str) -> set:
@@ -325,6 +335,7 @@ async def lifespan(app: FastAPI):
     global _config, _monitor, _stream, _telegram
     _config = Config.from_env()
     _monitor = Monitor(_config)
+    ops.register_system_collector()          # host CPU/mem/disk on the metrics endpoint
     _monitor.metrics.start_server(_config.metrics_port)
     _stream = StreamCapture(_resolve_stream_index(),
                             flip=_config.camera_flip)
@@ -354,6 +365,34 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Ender3Monitor", lifespan=lifespan)
+
+
+# ── Prometheus HTTP request metrics ───────────────────────────────────────────
+
+# /stream is a long-lived MJPEG response — its "duration" is the whole stream
+# lifetime, so we count it but don't pollute the latency histogram with it.
+_NO_LATENCY_PATHS = {"/stream"}
+
+
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    ops.http_requests_in_progress.inc()
+    start = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        ops.http_requests_in_progress.dec()
+        # Use the matched route template (not the raw URL) to bound cardinality.
+        route = request.scope.get("route")
+        path = getattr(route, "path", None) or "other"
+        method = request.method
+        ops.http_requests_total.labels(method, path, str(status)).inc()
+        if path not in _NO_LATENCY_PATHS:
+            ops.http_request_duration_seconds.labels(method, path).observe(
+                time.perf_counter() - start)
 
 
 # ── WebSocket broadcast ───────────────────────────────────────────────────────
@@ -399,12 +438,14 @@ def _state() -> dict:
 async def ws_endpoint(ws: WebSocket) -> None:
     await ws.accept()
     _clients.add(ws)
+    ops.ws_clients.set(len(_clients))
     await ws.send_text(json.dumps(_state()))
     try:
         while True:
             await ws.receive_text()   # keep-alive drain
     except WebSocketDisconnect:
         _clients.discard(ws)
+        ops.ws_clients.set(len(_clients))
 
 
 # ── REST API ──────────────────────────────────────────────────────────────────

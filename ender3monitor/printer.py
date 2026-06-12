@@ -205,6 +205,11 @@ class PrinterController:
         except Exception as exc:
             self.status.last_error = f"Serial write failed: {exc}"
             self.status.connected = False
+            try:
+                from ender3monitor import ops_metrics as _ops
+                _ops.printer_serial_errors_total.inc()
+            except Exception:
+                pass
             return ""
 
     # ------------------------------------------------------------------ #
