@@ -24,6 +24,7 @@ from ender3monitor.metrics import MonitorMetrics
 from ender3monitor.timelapse import TimelapseManager
 from ender3monitor.printer import PrinterController
 from ender3monitor.push import PushNotifier
+from ender3monitor.maintenance import MaintenanceTracker
 
 PRINTER_POLL_INTERVAL = 5        # seconds between temperature polls over USB
 PRINTER_RECONNECT_INTERVAL = 10  # seconds between reconnect attempts when dropped
@@ -117,6 +118,7 @@ class Monitor:
             telegram_bot_token=config.telegram_bot_token,
             telegram_chat_id=config.telegram_chat_id,
         )
+        self.maintenance = MaintenanceTracker(reminder_hours=config.maintenance_reminder_hours)
 
         self._running = False
         self._stop_event = threading.Event()
@@ -156,6 +158,7 @@ class Monitor:
         self._conf_sum: float = 0.0
         self._conf_n: int = 0
         self._conf_peak: float = 0.0
+        self._run_failure_types: set = set()   # confirmed failure types this run
 
         # Failure confirmation — require consecutive frames before alerting
         self._pending_failure_type: Optional[str] = None
@@ -489,6 +492,8 @@ class Monitor:
 
     def _handle_confirmed_failure(self, result: AnalysisResult, frame: np.ndarray) -> None:
         """All side effects for a confirmed failure: email, push, auto-pause."""
+        self._run_failure_types.add(result.failure_type)   # for maintenance trend tracking
+
         # 1. Email (existing behaviour)
         self._send_alert(result, frame)
 
@@ -535,6 +540,18 @@ class Monitor:
             self._send_completion_report(frame)
         except Exception as exc:
             print(f"\n  [REPORT ERROR] {exc}")
+
+        # Maintenance/health tracking — log this print and push any reminders
+        try:
+            elapsed = self.printer.status.elapsed_seconds
+            if elapsed is None and self._print_active_since:
+                elapsed = int(time.time() - self._print_active_since)
+            for alert in self.maintenance.record_print(elapsed, self._run_failure_types):
+                print(f"\n  [MAINT] {alert}")
+                if self.push.enabled:
+                    self.push.send(title="Maintenance", message=alert, priority="default")
+        except Exception as exc:
+            print(f"\n  [MAINT ERROR] {exc}")
 
     def _build_report_stats(self) -> str:
         """One-line-per-stat summary text for the completion report."""
@@ -628,6 +645,7 @@ class Monitor:
         self._conf_sum = 0.0
         self._conf_n = 0
         self._conf_peak = 0.0
+        self._run_failure_types = set()
         # Layer-synced timelapse when the printer reports Z (auto/layer modes).
         self._timelapse_layer_mode = (
             self.config.timelapse_mode == "layer"

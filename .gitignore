@@ -27,3 +27,6 @@ timelapse_frames/
 .idea/
 *.swp
 *.swo
+
+# Maintenance/health state
+maintenance.json

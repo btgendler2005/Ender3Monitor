@@ -203,6 +203,7 @@ def _tg_status(args):
     if ft and ft not in ("none", "no_printer"):
         out.append(f"Last: {ft} ({(s.get('confidence') or 0)*100:.0f}%)")
     out += _printer_status_lines()
+    out.append(f"Lifetime: {_monitor.maintenance.total_hours:.1f} h printed")
     return "\n".join(out)
 
 
@@ -244,6 +245,12 @@ def _tg_stop(args):
     _monitor.stop(); return "⏹ Monitoring stopped."
 
 
+def _tg_maintenance(args):
+    if _monitor is None:
+        return "Not ready."
+    return _monitor.maintenance.summary()
+
+
 def _tg_ask(args):
     """Free-form question about the live frame, answered by the vision model."""
     if _monitor is None or _stream is None:
@@ -268,6 +275,7 @@ def _build_telegram_handlers():
         "cooldown": (_tg_cooldown, "pause + heaters off"),
         "go":       (_tg_go,       "start monitoring"),
         "stop":     (_tg_stop,     "stop monitoring"),
+        "maintenance": (_tg_maintenance, "print hours + upkeep status"),
     }
 
     def _help(args):
