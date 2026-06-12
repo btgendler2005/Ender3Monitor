@@ -500,6 +500,7 @@ def _state() -> dict:
         "printer": _monitor.printer.status.as_dict(),
         "push_channels": _monitor.push.channels(),
         "auto_start": _monitor.auto_start_enabled,
+        "threshold": _config.confidence_threshold if _config else 0.7,
     }
 
 
@@ -1137,7 +1138,7 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
       <div class="card-label">Confidence</div>
       <div class="conf-header">
         <div class="conf-num" id="conf-num">—</div>
-        <div style="font-size:11px;color:var(--muted)">threshold 70%</div>
+        <div style="font-size:11px;color:var(--muted)" id="conf-thresh">threshold —</div>
       </div>
       <div class="conf-track">
         <div class="conf-fill" id="conf-fill" style="width:0;background:var(--green)"></div>
@@ -1261,13 +1262,15 @@ function render(d) {
   pill.className = 'pill ' + pillClass(s);
   document.getElementById('pill-text').textContent = s;
 
-  // Confidence
+  // Confidence — colors and label track the real configured threshold
   const pct = (d.confidence || 0) * 100;
+  const thr = (d.threshold ?? 0.7) * 100;
   document.getElementById('conf-num').textContent =
     d.frame_count > 0 ? pct.toFixed(1) + '%' : '—';
+  document.getElementById('conf-thresh').textContent = `threshold ${Math.round(thr)}%`;
   const fill = document.getElementById('conf-fill');
   fill.style.width = pct + '%';
-  fill.style.background = pct >= 70 ? 'var(--red)' : pct >= 40 ? 'var(--amber)' : 'var(--green)';
+  fill.style.background = pct >= thr ? 'var(--red)' : pct >= thr * 0.55 ? 'var(--amber)' : 'var(--green)';
 
   // Type
   const tv = document.getElementById('type-val');

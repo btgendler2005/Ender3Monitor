@@ -1,4 +1,5 @@
 import shutil
+import subprocess
 import time
 import cv2
 import numpy as np
@@ -122,8 +123,20 @@ class TimelapseManager:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_file = str(self.output_dir / f"timelapse_{ts}.mp4")
 
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(output_file, fourcc, fps, (w, h))
+        # Prefer H.264 (avc1): Telegram/iOS/browsers play it inline, whereas
+        # mp4v (MPEG-4 Part 2) usually shows up as a non-previewable file.
+        # avc1 works on macOS via VideoToolbox; fall back to mp4v elsewhere.
+        writer = None
+        codec_used = None
+        for codec in ("avc1", "mp4v"):
+            writer = cv2.VideoWriter(output_file, cv2.VideoWriter_fourcc(*codec), fps, (w, h))
+            if writer.isOpened():
+                codec_used = codec
+                break
+            writer.release()
+        if writer is None or not writer.isOpened():
+            print("Cannot open a video writer (no usable codec).")
+            return None
 
         for f in frames:
             img = cv2.imread(str(f))
@@ -131,7 +144,24 @@ class TimelapseManager:
                 writer.write(img)
 
         writer.release()
-        print(f"Timelapse compiled: {output_file} ({len(frames)} frames @ {fps} fps)")
+
+        # Last-resort compatibility pass: if we were stuck with mp4v but
+        # ffmpeg is available, transcode to H.264 so chat apps preview it.
+        if codec_used == "mp4v" and shutil.which("ffmpeg"):
+            tmp = output_file + ".h264.mp4"
+            rc = subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", output_file,
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                 "-movflags", "+faststart", tmp],
+            ).returncode
+            if rc == 0 and Path(tmp).exists():
+                Path(tmp).replace(output_file)
+                codec_used = "h264 (ffmpeg)"
+            else:
+                Path(tmp).unlink(missing_ok=True)
+
+        print(f"Timelapse compiled: {output_file} "
+              f"({len(frames)} frames @ {fps} fps, codec {codec_used})")
 
         # Reclaim the (now redundant) frames if configured to.
         if self.delete_frames_after_compile and self._session_dir:
