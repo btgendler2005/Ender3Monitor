@@ -523,17 +523,53 @@ class Monitor:
             print(f"\n  [EMAIL ERROR] {exc}")
 
     def _send_completion(self, frame: np.ndarray) -> None:
+        # Email (existing behaviour)
         try:
             self.notifier.send_completion(frame, self.frame_count)
             print(f"\n  [EMAIL] Completion notice sent to {self.config.smtp_recipient}")
         except Exception as exc:
             print(f"\n  [EMAIL ERROR] {exc}")
-        if self.push.enabled:
-            self.push.send(
-                title="✅ Print complete",
-                message=f"Monitoring finished after {self.frame_count} analyzed frames.",
-                priority="default",
-            )
+
+        # Rich report (stats + final photo + compiled timelapse) to push channels
+        try:
+            self._send_completion_report(frame)
+        except Exception as exc:
+            print(f"\n  [REPORT ERROR] {exc}")
+
+    def _build_report_stats(self) -> str:
+        """One-line-per-stat summary text for the completion report."""
+        from ender3monitor.printer import _fmt_duration
+        avg = (self._conf_sum / self._conf_n) if self._conf_n else 0.0
+        # Prefer the printer's job timer; fall back to wall-clock since print start.
+        elapsed = self.printer.status.elapsed_seconds
+        if elapsed is None and self._print_active_since:
+            elapsed = int(time.time() - self._print_active_since)
+        lines = [
+            f"Duration: {_fmt_duration(elapsed) or '—'}",
+            f"Frames analyzed: {self.frame_count}",
+            f"Failures: {self.failure_count}",
+            f"Avg/peak confidence: {avg:.0%} / {self._conf_peak:.0%}",
+            f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        ]
+        return "\n".join(lines)
+
+    def _send_completion_report(self, frame: np.ndarray) -> None:
+        if not self.push.enabled:
+            return
+        stats = self._build_report_stats()
+        # 1. Text summary (all channels)
+        self.push.send(title="✅ Print complete", message=stats, priority="default")
+        # 2. Final photo (Telegram)
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if ok:
+            self.push.send_photo(buf.tobytes(), caption="Final frame")
+        # 3. Compiled timelapse video (Telegram, if not too large)
+        try:
+            mp4 = self.timelapse.compile()
+            if mp4:
+                self.push.send_video(mp4, caption="Timelapse")
+        except Exception as exc:
+            print(f"\n  [REPORT] timelapse compile/send skipped: {exc}")
 
     # ------------------------------------------------------------------ #
     # Public control methods                                               #
