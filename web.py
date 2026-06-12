@@ -80,6 +80,17 @@ class StreamCapture:
         self._paused = False          # when True, release the camera (for scans)
         self._thread: Optional[threading.Thread] = None
 
+        # Demand tracking — with no MJPEG viewers and no recent snapshot
+        # requests, the loop drops to ~2 fps reads and ~0.5 fps encodes instead
+        # of reading the camera at full rate and JPEG-encoding 12 fps around the
+        # clock. Analysis/timelapse sample latest_frame() at ≥5 s cadence, so a
+        # ≤0.5 s-old idle frame is just as good for them.
+        self._viewers = 0                  # active MJPEG stream connections
+        self._last_jpeg_demand = 0.0       # last latest_jpeg() call (snapshots)
+        self._IDLE_DEMAND_WINDOW = 5.0     # seconds a snapshot keeps us "active"
+        self._IDLE_READ_SLEEP = 0.5        # idle: ~2 fps camera reads
+        self._IDLE_ENCODE_INTERVAL = 2.0   # idle: refresh the jpeg every 2 s
+
     # ── lifecycle ──
     def start(self) -> None:
         if self._running:
@@ -132,12 +143,18 @@ class StreamCapture:
             with self._lock:
                 self._latest_raw = frame
             now = time.time()
-            if now - last_encode >= self._encode_interval:
+            active = self._has_demand()
+            encode_interval = (self._encode_interval if active
+                               else self._IDLE_ENCODE_INTERVAL)
+            if now - last_encode >= encode_interval:
                 ok2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
                 if ok2:
                     with self._lock:
                         self._latest_jpeg = buf.tobytes()
                 last_encode = now
+            if not active:
+                # Idle: don't spin the camera at full rate for nobody.
+                time.sleep(self._IDLE_READ_SLEEP)
         if cap is not None:
             cap.release()
 
@@ -158,8 +175,24 @@ class StreamCapture:
         time.sleep(0.3)
         self._paused = False
 
+    # ── demand tracking ──
+    def add_viewer(self) -> None:
+        with self._lock:
+            self._viewers += 1
+
+    def remove_viewer(self) -> None:
+        with self._lock:
+            self._viewers = max(0, self._viewers - 1)
+
+    def _has_demand(self) -> bool:
+        return (self._viewers > 0
+                or (time.time() - self._last_jpeg_demand) < self._IDLE_DEMAND_WINDOW)
+
     # ── readers ──
     def latest_jpeg(self) -> Optional[bytes]:
+        # Reading the jpeg signals demand — wakes the encoder for a few seconds
+        # so an on-demand /snapshot (UI, Telegram) gets a fresh image next call.
+        self._last_jpeg_demand = time.time()
         with self._lock:
             return self._latest_jpeg
 
@@ -706,18 +739,32 @@ async def snapshot():
 
 
 async def _mjpeg_generator():
-    """Yield MJPEG frames from the shared live buffer at _STREAM_FPS."""
-    interval = 1.0 / _STREAM_FPS
-    while True:
-        frame = _stream.latest_jpeg() if _stream else None
-        if frame:
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" +
-                frame +
-                b"\r\n"
-            )
-        await asyncio.sleep(interval)
+    """Yield MJPEG frames from the shared live buffer at _STREAM_FPS.
+
+    Registers as a viewer so the capture loop runs at full rate while at least
+    one stream is open. Skips unchanged frames (identity check — the encoder
+    replaces the buffer object on every encode) so we never resend the same
+    JPEG, which matters on phone connections.
+    """
+    if _stream:
+        _stream.add_viewer()
+    try:
+        interval = 1.0 / _STREAM_FPS
+        last_sent = None
+        while True:
+            frame = _stream.latest_jpeg() if _stream else None
+            if frame is not None and frame is not last_sent:
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" +
+                    frame +
+                    b"\r\n"
+                )
+                last_sent = frame
+            await asyncio.sleep(interval)
+    finally:
+        if _stream:
+            _stream.remove_viewer()
 
 
 @app.get("/stream")
