@@ -340,14 +340,12 @@ class Monitor:
 
         pr = self.printer.status if self.printer.connected else None
         if pr is not None:
-            if not pr.printing:
-                # Don't gate forever — if the printer never reports an SD print
-                # (M27 quirk, or the user is monitoring something else), fall
-                # through to the heater check once the grace window expires.
-                if time.time() < self._grace_until:
-                    return True, "Waiting for print to start…"
             n, nt = pr.nozzle_temp, pr.nozzle_target
             b, bt = pr.bed_temp, pr.bed_target
+
+            # Heaters still climbing → warming up (checked FIRST: the printer's
+            # "printing" flag (M27) can lag through the whole heat phase, so we
+            # must not let it mask a clearly-warming-up print as "Waiting…").
             heating = (
                 (nt and n is not None and n < nt - WARMUP_TEMP_TOLERANCE) or
                 (bt and b is not None and b < bt - WARMUP_TEMP_TOLERANCE)
@@ -360,6 +358,18 @@ class Monitor:
                         msg += f", bed {b:.0f}/{bt:.0f}°"
                     msg += ")"
                 return True, msg
+
+            # Heaters at/above target. If a heat target is set (or M27 confirms
+            # printing), the job is underway → start analyzing. Don't gate on the
+            # unreliable printing flag alone.
+            if pr.printing or (nt and nt > 0) or (bt and bt > 0):
+                self._warmup_done = True
+                return False, None
+
+            # Genuinely idle (no heat set, not printing) — wait briefly for the
+            # job to spin up, then proceed so we never stall forever.
+            if time.time() < self._grace_until:
+                return True, "Waiting for print to start…"
             self._warmup_done = True
             return False, None
 
