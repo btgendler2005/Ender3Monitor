@@ -1108,8 +1108,85 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
 }
 #toast.show{transform:translateX(-50%) translateY(0)}
 
+/* ── Header right cluster + icon button ── */
+.header-right{display:flex;align-items:center;gap:12px}
+.icon-btn{
+  display:flex;align-items:center;justify-content:center;
+  width:34px;height:34px;padding:0;border-radius:9px;
+  background:var(--surf3);border:1px solid var(--border);color:var(--muted);
+  cursor:pointer;transition:all .15s;
+}
+.icon-btn:hover{color:var(--text);border-color:rgba(255,255,255,.14)}
+
+/* ── Modal ── */
+.modal-overlay{
+  position:fixed;inset:0;z-index:200;
+  background:rgba(0,0,0,.55);backdrop-filter:blur(2px);
+  display:none;align-items:flex-start;justify-content:center;
+  padding:40px 16px;overflow-y:auto;
+}
+.modal-overlay.show{display:flex}
+.modal{
+  background:var(--surf);border:1px solid var(--border);border-radius:14px;
+  width:100%;max-width:560px;box-shadow:var(--shadow);
+  display:flex;flex-direction:column;max-height:calc(100vh - 80px);
+}
+.modal-head{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:18px 22px;border-bottom:1px solid var(--border);
+}
+.modal-head h2{font-size:16px;font-weight:700}
+.modal-body{padding:8px 22px;overflow-y:auto}
+.modal-foot{
+  display:flex;align-items:center;gap:10px;
+  padding:14px 22px;border-top:1px solid var(--border);
+}
+#settings-msg{font-size:12px}
+#settings-msg.err{color:var(--red)}
+#settings-msg.ok{color:var(--green)}
+.sec-warn{
+  margin:14px 22px 0;padding:10px 12px;border-radius:9px;font-size:12px;line-height:1.5;
+  background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.3);color:var(--amber);
+}
+.sec-warn code{background:rgba(0,0,0,.25);padding:1px 5px;border-radius:4px;font-size:11px}
+.set-group-label{
+  font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
+  color:var(--muted);margin:18px 0 8px;
+}
+.set-row{
+  display:flex;align-items:center;gap:12px;
+  padding:9px 0;border-bottom:1px solid var(--border);
+}
+.set-row:last-child{border-bottom:none}
+.set-info{flex:1;min-width:0}
+.set-name{font-size:13.5px;display:flex;align-items:center;gap:7px}
+.set-help{font-size:11px;color:var(--muted);margin-top:2px}
+.set-restart{
+  font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--amber);background:rgba(251,191,36,.12);padding:1px 6px;border-radius:4px;
+}
+.set-control{flex:0 0 auto}
+.set-control input[type=number],.set-control select{
+  background:var(--surf3);border:1px solid var(--border);color:var(--text);
+  border-radius:8px;padding:7px 10px;font-size:13px;width:130px;
+}
+.set-control input:focus,.set-control select:focus{outline:none;border-color:var(--blue)}
+/* toggle */
+.tgl{display:inline-block;position:relative;width:42px;height:24px;cursor:pointer;flex:0 0 auto}
+.tgl input{opacity:0;width:0;height:0;position:absolute}
+.tgl .track{position:absolute;inset:0;background:var(--surf3);border:1px solid var(--border);
+  border-radius:100px;transition:.2s}
+.tgl .knob{position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;
+  background:var(--muted);transition:.2s}
+.tgl input:checked + .track{background:rgba(79,142,247,.25);border-color:var(--blue)}
+.tgl input:checked + .track .knob{transform:translateX(18px);background:var(--blue)}
+.set-info-row{font-size:11.5px;color:var(--muted);padding:6px 0;display:flex;justify-content:space-between}
+
 /* ── Mobile / narrow screens ── */
 @media (max-width:760px){
+  .modal-overlay{padding:0}
+  .modal{max-width:none;border-radius:0;min-height:100vh;max-height:100vh}
+  .set-control input[type=number],.set-control select{width:108px}
   header{padding:12px 16px}
   .logo{font-size:15px}
   .pill{padding:5px 10px;font-size:10px}
@@ -1168,11 +1245,42 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
     </svg>
     Ender3Monitor
   </div>
-  <div class="pill pill-idle" id="pill">
-    <div class="dot"></div>
-    <span id="pill-text">Idle</span>
+  <div class="header-right">
+    <div class="pill pill-idle" id="pill">
+      <div class="dot"></div>
+      <span id="pill-text">Idle</span>
+    </div>
+    <button class="icon-btn" id="settings-btn" title="Settings" onclick="openSettings()">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+      </svg>
+    </button>
   </div>
 </header>
+
+<!-- Settings modal -->
+<div id="settings-overlay" class="modal-overlay" onclick="if(event.target===this)closeSettings()">
+  <div class="modal" role="dialog" aria-label="Settings">
+    <div class="modal-head">
+      <h2>Settings</h2>
+      <button class="icon-btn" onclick="closeSettings()" title="Close">✕</button>
+    </div>
+    <div id="settings-secwarn" class="sec-warn" style="display:none">
+      ⚠ No dashboard login set — anyone on your network can change these and
+      control the printer. Set <code>WEB_USERNAME</code>/<code>WEB_PASSWORD</code> in
+      <code>.env</code>.
+    </div>
+    <div id="settings-body" class="modal-body"></div>
+    <div class="modal-foot">
+      <span id="settings-msg"></span>
+      <div style="flex:1"></div>
+      <button onclick="closeSettings()">Cancel</button>
+      <button class="btn-start" id="settings-save" onclick="saveSettings()">Save</button>
+    </div>
+  </div>
+</div>
 
 <div class="page">
 
@@ -1582,6 +1690,131 @@ function toast(msg, ms=3000) {
   t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), ms);
 }
+
+// ── Settings panel ──────────────────────────────────────────────────────────
+let settingsSchema = null, settingsValues = {};
+
+function esc(s){ return String(s).replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function openSettings() {
+  const overlay = document.getElementById('settings-overlay');
+  const body = document.getElementById('settings-body');
+  const msg = document.getElementById('settings-msg');
+  msg.textContent = ''; msg.className = '';
+  body.innerHTML = '<div style="padding:24px;color:var(--muted)">Loading…</div>';
+  overlay.classList.add('show');
+  let data;
+  try {
+    const res = await fetch('/api/settings');
+    if (!res.ok) throw new Error(res.status);
+    data = await res.json();
+  } catch(e) {
+    body.innerHTML = '<div style="padding:24px;color:var(--red)">Could not load settings.</div>';
+    return;
+  }
+  settingsSchema = data.schema; settingsValues = data.values;
+  document.getElementById('settings-secwarn').style.display =
+    data.info && data.info.auth_enabled ? 'none' : 'block';
+  renderSettings(body, data);
+}
+
+function renderSettings(body, data) {
+  // Group fields in schema order
+  const groups = [];
+  const byGroup = {};
+  for (const f of settingsSchema) {
+    if (!byGroup[f.group]) { byGroup[f.group] = []; groups.push(f.group); }
+    byGroup[f.group].push(f);
+  }
+  let html = '';
+  for (const g of groups) {
+    html += `<div class="set-group-label">${esc(g)}</div>`;
+    for (const f of byGroup[g]) html += fieldRow(f);
+  }
+  // Read-only structural info (never secrets)
+  if (data.info) {
+    html += `<div class="set-group-label">System (set in .env — restart to change)</div>`;
+    html += infoRow('AI backend', `${esc(data.info.backend)} · ${esc(data.info.model||'—')}`);
+    html += infoRow('Configured camera index', data.info.camera_index);
+    html += infoRow('Dashboard login', data.info.auth_enabled ? 'enabled' : 'OFF');
+  }
+  body.innerHTML = html;
+}
+
+function fieldRow(f) {
+  const v = settingsValues[f.key];
+  const restart = f.live ? '' : '<span class="set-restart">restart</span>';
+  let control = '';
+  if (f.type === 'bool') {
+    control = `<label class="tgl"><input type="checkbox" data-key="${f.key}" ${v ? 'checked':''}>
+                 <span class="track"><span class="knob"></span></span></label>`;
+  } else if (f.type === 'enum') {
+    control = `<select data-key="${f.key}">` +
+      f.choices.map(c => `<option ${c===v?'selected':''} value="${esc(c)}">${esc(c)}</option>`).join('') +
+      `</select>`;
+  } else {
+    const step = f.type === 'float' ? '0.05' : '1';
+    const mn = f.min!=null ? `min="${f.min}"` : '', mx = f.max!=null ? `max="${f.max}"` : '';
+    control = `<input type="number" data-key="${f.key}" data-type="${f.type}" value="${esc(v)}" step="${step}" ${mn} ${mx}>`;
+  }
+  return `<div class="set-row">
+    <div class="set-info">
+      <div class="set-name">${esc(f.label)} ${restart}</div>
+      ${f.help ? `<div class="set-help">${esc(f.help)}</div>` : ''}
+    </div>
+    <div class="set-control">${control}</div>
+  </div>`;
+}
+
+function infoRow(label, val) {
+  return `<div class="set-info-row"><span>${esc(label)}</span><span>${esc(val)}</span></div>`;
+}
+
+function closeSettings() {
+  document.getElementById('settings-overlay').classList.remove('show');
+}
+
+async function saveSettings() {
+  const body = {};
+  document.querySelectorAll('#settings-body [data-key]').forEach(el => {
+    const k = el.dataset.key;
+    if (el.type === 'checkbox') body[k] = el.checked;
+    else if (el.dataset.type) body[k] = el.value === '' ? null : Number(el.value);
+    else body[k] = el.value;
+  });
+  // Only send changed values
+  const changed = {};
+  for (const k in body) if (body[k] !== settingsValues[k]) changed[k] = body[k];
+  const msg = document.getElementById('settings-msg');
+  if (!Object.keys(changed).length) { msg.className=''; msg.textContent='No changes.'; return; }
+
+  const btn = document.getElementById('settings-save');
+  btn.disabled = true; msg.className=''; msg.textContent = 'Saving…';
+  try {
+    const res = await fetch('/api/settings', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(changed)
+    });
+    const data = await res.json();
+    settingsValues = data.values || settingsValues;
+    if (data.errors && data.errors.length) {
+      msg.className='err'; msg.textContent = data.errors.join('  ·  ');
+    } else {
+      msg.className='ok';
+      msg.textContent = (data.restart_required && data.restart_required.length)
+        ? 'Saved — some changes need a restart.' : 'Saved ✓';
+      toast('Settings saved');
+      setTimeout(closeSettings, 700);
+    }
+  } catch(e) {
+    msg.className='err'; msg.textContent = 'Save failed.';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Esc closes the modal
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSettings(); });
 
 // ── Boot ───────────────────────────────────────────────────────────────────
 scanCameras();
