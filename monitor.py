@@ -25,7 +25,12 @@ from ender3monitor.timelapse import TimelapseManager
 from ender3monitor.printer import PrinterController
 from ender3monitor.push import PushNotifier
 from ender3monitor.maintenance import MaintenanceTracker
+from ender3monitor.settings import Settings
 from ender3monitor import ops_metrics as ops
+
+# Camera-flip string (settings/UI) ↔ cv2.flip code (capture).
+_FLIP_STR_TO_CODE = {"none": None, "180": -1, "vertical": 0, "horizontal": 1}
+_FLIP_CODE_TO_STR = {None: "none", -1: "180", 0: "vertical", 1: "horizontal"}
 
 PRINTER_POLL_INTERVAL = 5        # seconds between temperature polls over USB
 PRINTER_RECONNECT_INTERVAL = 10  # seconds between reconnect attempts when dropped
@@ -107,11 +112,35 @@ class Monitor:
             recipient=config.smtp_recipient,
         )
         self.metrics = MonitorMetrics()
+
+        # Runtime-editable operational settings (seeded from .env/Config on first
+        # run, then settings.json wins). Live keys are read straight from here in
+        # the loop; constructed-object keys are applied via _apply_setting.
+        self.settings = Settings(
+            seed={
+                "capture_interval": config.capture_interval,
+                "confidence_threshold": config.confidence_threshold,
+                "first_layer_interval": config.first_layer_interval,
+                "first_layer_max_z": config.first_layer_max_z,
+                "camera_flip": _FLIP_CODE_TO_STR.get(config.camera_flip, "none"),
+                "auto_start_on_print": config.auto_start_on_print,
+                "auto_pause_on_failure": config.auto_pause_on_failure,
+                "auto_pause_action": config.auto_pause_action,
+                "timelapse_mode": config.timelapse_mode,
+                "timelapse_max_sessions": config.timelapse_max_sessions,
+                "timelapse_retention_days": config.timelapse_retention_days,
+                "timelapse_delete_frames_after_compile":
+                    config.timelapse_delete_frames_after_compile,
+                "maintenance_reminder_hours": config.maintenance_reminder_hours,
+            },
+            on_change=self._apply_setting,
+        )
+
         self.timelapse = TimelapseManager(
             config.timelapse_dir,
-            max_sessions=config.timelapse_max_sessions,
-            retention_days=config.timelapse_retention_days,
-            delete_frames_after_compile=config.timelapse_delete_frames_after_compile,
+            max_sessions=self.settings.get("timelapse_max_sessions"),
+            retention_days=self.settings.get("timelapse_retention_days"),
+            delete_frames_after_compile=self.settings.get("timelapse_delete_frames_after_compile"),
         )
 
         # Optional printer USB control + push notifications
@@ -122,7 +151,8 @@ class Monitor:
             telegram_bot_token=config.telegram_bot_token,
             telegram_chat_id=config.telegram_chat_id,
         )
-        self.maintenance = MaintenanceTracker(reminder_hours=config.maintenance_reminder_hours)
+        self.maintenance = MaintenanceTracker(
+            reminder_hours=self.settings.get("maintenance_reminder_hours"))
 
         self._running = False
         self._stop_event = threading.Event()
@@ -146,7 +176,7 @@ class Monitor:
         self._warmup_done: bool = False
 
         # Auto-start: begin monitoring when the printer starts a print (rising edge)
-        self.auto_start_enabled: bool = config.auto_start_on_print
+        self.auto_start_enabled: bool = self.settings.get("auto_start_on_print")
         self._poll_prev_printing: Optional[bool] = None   # None until first poll
         self._default_camera_index: Optional[int] = None
         self._default_frame_provider: Optional[FrameProvider] = None
@@ -201,6 +231,27 @@ class Monitor:
             target=self._printer_poll_loop, daemon=True
         )
         self._printer_poll_thread.start()
+
+    def _apply_setting(self, key: str, value) -> None:
+        """Push a changed setting into already-constructed objects.
+
+        Loop-read keys (interval, threshold, first-layer, auto-pause, timelapse
+        mode) need no action — the loop reads them live from self.settings.
+        camera_flip's stream side is applied by the web layer (it owns the
+        stream); here we cover the standalone-CLI camera.
+        """
+        if key == "auto_start_on_print":
+            self.auto_start_enabled = bool(value)
+        elif key == "maintenance_reminder_hours":
+            self.maintenance.reminder_hours = max(1, int(value))
+        elif key == "timelapse_max_sessions":
+            self.timelapse.max_sessions = max(1, int(value))
+        elif key == "timelapse_retention_days":
+            self.timelapse.retention_days = max(0, int(value))
+        elif key == "timelapse_delete_frames_after_compile":
+            self.timelapse.delete_frames_after_compile = bool(value)
+        elif key == "camera_flip" and self.camera is not None:
+            self.camera._flip = _FLIP_STR_TO_CODE.get(value)
 
     def set_default_source(self, camera_index: Optional[int],
                            frame_provider: Optional[FrameProvider]) -> None:
@@ -385,7 +436,7 @@ class Monitor:
         """True while the nozzle is on/near the first layer (failure-prone)."""
         pr = self.printer.status if self.printer.connected else None
         if pr and pr.printing and pr.z_height is not None:
-            return pr.z_height <= self.config.first_layer_max_z
+            return pr.z_height <= self.settings.get("first_layer_max_z")
         # Fallback with no USB Z: first few minutes after printing/motion began.
         if self._print_active_since is not None:
             return (time.time() - self._print_active_since) <= FIRST_LAYER_FALLBACK_SECONDS
@@ -412,8 +463,8 @@ class Monitor:
                 # Cadence is dynamic: tighter while on the first layer. The printer
                 # poller keeps z_height fresh, so we can decide before sleeping.
                 first_layer = self._in_first_layer()
-                interval = (self.config.first_layer_interval if first_layer
-                            else self.config.capture_interval)
+                interval = (self.settings.get("first_layer_interval") if first_layer
+                            else self.settings.get("capture_interval"))
                 # Time-based timelapse only when NOT in layer-synced mode.
                 time_timelapse = not self._timelapse_layer_mode
 
@@ -545,17 +596,18 @@ class Monitor:
                         self._conf_sum += result.confidence
                         self._conf_n += 1
                         self._conf_peak = max(self._conf_peak, result.confidence)
+                        threshold = self.settings.get("confidence_threshold")
                         self.metrics.record_analysis(
                             result.confidence,
                             result.failure_type,
-                            self.config.confidence_threshold,
+                            threshold,
                         )
 
                         # Only update status if stop() hasn't already set it to Idle
                         if self._running:
                             is_failure = (
                                 result.failure_detected
-                                and result.confidence >= self.config.confidence_threshold
+                                and result.confidence >= threshold
                                 and result.failure_type not in ("no_printer", "none")
                                 # Don't flag a "gap" failure when the print is basically done
                                 and not near_completion
@@ -631,14 +683,15 @@ class Monitor:
             )
 
         # 3. Auto-pause / cooldown / e-stop over USB
-        if self.config.auto_pause_on_failure:
+        if self.settings.get("auto_pause_on_failure"):
+            action = self.settings.get("auto_pause_action")
             if self.printer.connected:
-                action_result = self.printer.apply_failure_action(self.config.auto_pause_action)
-                print(f"\n  [PRINTER] Auto-{self.config.auto_pause_action}: {action_result}")
+                action_result = self.printer.apply_failure_action(action)
+                print(f"\n  [PRINTER] Auto-{action}: {action_result}")
                 if self.push.enabled:
                     self.push.send(
                         title="🛑 Printer action taken",
-                        message=f"Auto-{self.config.auto_pause_action}: {action_result}",
+                        message=f"Auto-{action}: {action_result}",
                         priority="high",
                     )
             else:
@@ -776,16 +829,18 @@ class Monitor:
         self._conf_peak = 0.0
         self._run_failure_types = set()
         # Layer-synced timelapse when the printer reports Z (auto/layer modes).
+        tl_mode = self.settings.get("timelapse_mode")
         self._timelapse_layer_mode = (
-            self.config.timelapse_mode == "layer"
-            or (self.config.timelapse_mode == "auto" and self.printer.connected)
+            tl_mode == "layer"
+            or (tl_mode == "auto" and self.printer.connected)
         )
 
         self._monitor_thread = threading.Thread(
             target=self._monitoring_loop, daemon=True
         )
         self._monitor_thread.start()
-        print(f"  Monitoring started (camera {idx}). Analysis every {self.config.capture_interval}s.")
+        print(f"  Monitoring started (camera {idx}). "
+              f"Analysis every {self.settings.get('capture_interval')}s.")
 
     def stop(self) -> None:
         if not self._running:

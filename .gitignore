@@ -32,3 +32,7 @@ timelapse_frames/
 maintenance.json
 .env.bak
 *.env.bak
+
+# Runtime settings (app-owned)
+settings.json
+settings.json.tmp

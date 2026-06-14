@@ -33,8 +33,9 @@ log = logging.getLogger("ender3monitor")
 from ender3monitor.camera import CameraManager
 from ender3monitor.config import Config
 from ender3monitor.telegram_bot import TelegramBot
+from ender3monitor.settings import Settings
 from ender3monitor import ops_metrics as ops
-from monitor import Monitor
+from monitor import Monitor, _FLIP_STR_TO_CODE
 
 # ── global state ──────────────────────────────────────────────────────────────
 
@@ -300,7 +301,7 @@ def _tg_autostart(args):
         return "Not ready."
     arg = (args[0].lower() if args else "")
     if arg in ("on", "off"):
-        _monitor.auto_start_enabled = (arg == "on")
+        _monitor.settings.update({"auto_start_on_print": arg == "on"})
     return f"Auto-start is {'ON' if _monitor.auto_start_enabled else 'OFF'}."
 
 
@@ -533,7 +534,8 @@ class AutoStartBody(BaseModel):
 async def api_autostart(body: AutoStartBody):
     if _monitor is None:
         return JSONResponse({"error": "not initialised"}, 503)
-    _monitor.auto_start_enabled = body.enabled
+    # Through Settings so the choice persists (on_change syncs auto_start_enabled).
+    _monitor.settings.update({"auto_start_on_print": body.enabled})
     await _broadcast()
     return {"auto_start": _monitor.auto_start_enabled}
 
@@ -711,6 +713,61 @@ async def download_timelapse(name: Optional[str] = None):
 @app.get("/api/status")
 async def api_status():
     return _state()
+
+
+@app.get("/api/settings")
+async def api_settings_get():
+    """Schema + current values for the settings panel.
+
+    Only ever returns the non-secret allowlist (Settings has no secret keys).
+    `info` carries read-only context — never credentials.
+    """
+    if _monitor is None or _config is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    model = (_config.anthropic_model if _config.analyzer_backend == "anthropic"
+             else _config.ollama_model)
+    return {
+        "schema": Settings.schema_public(),
+        "values": _monitor.settings.public_dict(),
+        "info": {
+            "backend": _config.analyzer_backend,
+            "model": model,
+            "camera_index": _config.camera_index,
+            "auth_enabled": _auth_enabled(),
+        },
+    }
+
+
+@app.post("/api/settings")
+async def api_settings_post(request: Request):
+    """Validate + apply a batch of setting changes.
+
+    Every key is validated server-side by Settings.update against the schema;
+    unknown or out-of-range values are rejected and never stored. Only schema
+    keys exist, so there is no path to read or write a secret here.
+    """
+    if _monitor is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, 400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "expected a JSON object of key→value"}, 400)
+
+    applied, errors, restart_required = _monitor.settings.update(body)
+
+    # camera_flip's stream side is web-owned (the monitor handled CLI camera).
+    if "camera_flip" in applied and _stream is not None:
+        _stream.flip = _FLIP_STR_TO_CODE.get(applied["camera_flip"])
+
+    await _broadcast()
+    return {
+        "applied": applied,
+        "errors": errors,
+        "restart_required": restart_required,
+        "values": _monitor.settings.public_dict(),
+    }
 
 
 class PreviewBody(BaseModel):
