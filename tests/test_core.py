@@ -18,6 +18,7 @@ from ender3monitor.analyzer import (
 )
 from ender3monitor.config import _parse_flip
 from ender3monitor.maintenance import MaintenanceTracker
+from ender3monitor.settings import SCHEMA, Settings, _coerce
 from ender3monitor.printer import (
     _M78_TOTAL_RE, _POS_RE, _PRINTTIME_RE, _SD_RE, _TEMP_RE, _fmt_duration,
 )
@@ -200,3 +201,78 @@ def test_maintenance_roundtrip_and_alerts(tmp_path):
     t2 = MaintenanceTracker(reminder_hours=10, path=store)
     assert t2.data["prints_completed"] == 5
     assert t2.total_hours == pytest.approx(t.total_hours)
+
+
+# ── settings: SECURITY — no secret may ever enter the schema ─────────────────
+
+def test_settings_schema_has_no_secrets():
+    secrets = {"anthropic_api_key", "smtp_password", "smtp_username",
+               "telegram_bot_token", "telegram_chat_id", "web_password",
+               "web_username", "discord_webhook", "printer_port"}
+    assert secrets.isdisjoint(SCHEMA.keys())
+    # and every schema field is one of the safe, declared types
+    assert all(s["type"] in ("int", "float", "bool", "enum") for s in SCHEMA.values())
+
+
+def test_settings_public_surfaces_bounded_to_schema(tmp_path):
+    s = Settings(path=tmp_path / "s.json")
+    assert set(s.public_dict()) <= set(SCHEMA)
+    assert {f["key"] for f in Settings.schema_public()} == set(SCHEMA)
+    # schema metadata never carries a value/default (avoids leaking seeded creds-by-accident)
+    assert all("default" not in f and "value" not in f for f in Settings.schema_public())
+
+
+# ── settings: validation / coercion ─────────────────────────────────────────
+
+@pytest.mark.parametrize("key,raw,ok,val", [
+    ("capture_interval", "120", True, 120),
+    ("capture_interval", 5, False, None),            # below min
+    ("capture_interval", 99999, False, None),        # above max
+    ("confidence_threshold", "0.9", True, 0.9),
+    ("confidence_threshold", 1.5, False, None),      # above max
+    ("auto_pause_action", "estop", True, "estop"),
+    ("auto_pause_action", "rm -rf /", False, None),  # not a choice
+    ("auto_start_on_print", "off", True, False),
+    ("auto_start_on_print", "yes", True, True),
+    ("camera_flip", "180", True, "180"),
+    ("camera_flip", "sideways", False, None),
+    ("anthropic_api_key", "stolen", False, None),    # unknown/secret -> rejected
+    ("nonexistent", 1, False, None),
+])
+def test_settings_coerce(key, raw, ok, val):
+    got_ok, got = _coerce(key, raw)
+    assert got_ok is ok
+    if ok:
+        assert got == val
+
+
+# ── settings: batch update, persistence, precedence ─────────────────────────
+
+def test_settings_update_partial_and_persist(tmp_path):
+    store = tmp_path / "s.json"
+    fired = []
+    s = Settings(seed={"capture_interval": 300}, path=store,
+                 on_change=lambda k, v: fired.append((k, v)))
+    assert store.exists()                              # seed persisted on first run
+
+    applied, errors, restart = s.update({
+        "capture_interval": 120,        # valid
+        "auto_pause_action": "BAD",     # invalid choice
+        "anthropic_api_key": "x",       # not in schema
+    })
+    assert applied == {"capture_interval": 120}
+    assert len(errors) == 2 and s.get("capture_interval") == 120
+    assert ("capture_interval", 120) in fired
+    assert "anthropic_api_key" not in s.public_dict()  # secret never created
+
+    # settings.json wins over a different seed on reload
+    s2 = Settings(seed={"capture_interval": 999}, path=store)
+    assert s2.get("capture_interval") == 120
+
+
+def test_settings_atomic_save_leaves_no_tmp(tmp_path):
+    store = tmp_path / "s.json"
+    s = Settings(path=store)
+    s.update({"capture_interval": 90})
+    assert store.exists()
+    assert not (tmp_path / "s.json.tmp").exists()      # temp renamed, not left behind

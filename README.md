@@ -66,11 +66,22 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Copy the example and fill in your values:
+There are two layers:
 
-```bash
-cp .env.example .env
-```
+- **`.env`** — secrets and bootstrap (API keys, SMTP/Telegram credentials, ports,
+  dashboard login, AI backend, printer port). Copy the example and fill it in:
+  ```bash
+  cp .env.example .env
+  ```
+- **Settings panel** (the ⚙ in the dashboard header) — the day-to-day operational
+  tunables (analysis interval, alert threshold, auto-start/pause, timelapse mode
+  and retention, maintenance reminder, camera flip). These persist to an
+  app-owned `settings.json` and most apply **live, no restart**. They're edited
+  only through the validated UI/API — secrets are never exposed there.
+
+> **Lock down the dashboard.** Set `WEB_USERNAME` / `WEB_PASSWORD` in `.env`. They
+> gate the whole dashboard *including* printer controls (pause / e-stop / heaters)
+> and the settings panel. Without them, anyone on your network has full control.
 
 | Variable | Default | Description |
 |---|---|---|
