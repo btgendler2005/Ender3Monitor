@@ -1,0 +1,26 @@
+# Ender3Monitor systemd unit (template).
+#
+# install_pi.sh generates the real unit with your user/paths filled in and
+# installs it. This copy is for reference / manual installs — replace the
+# __USER__ and __DIR__ placeholders, then:
+#   sudo cp ender3monitor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ender3monitor
+
+[Unit]
+Description=Ender3Monitor — 3D print failure detection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=__DIR__/.venv/bin/python web.py
+Restart=always
+RestartSec=5
+# Keep the SD card / logs tidy; app logs go to the journal (journalctl -u ender3monitor)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

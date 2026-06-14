@@ -13,6 +13,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import secrets
 import threading
 import time
@@ -46,10 +47,13 @@ _telegram: Optional[TelegramBot] = None
 DEFAULT_PORT = 8080
 
 # ── Live-view tuning ────────────────────────────────────────────────────────
-_STREAM_FPS = 12          # live-view frames per second served to the browser
-_STREAM_QUALITY = 70      # JPEG quality for the live stream
-_STREAM_WIDTH = 1280
-_STREAM_HEIGHT = 720
+# Env-overridable so weaker hardware (e.g. a Raspberry Pi) can dial the live
+# stream down without code edits. Analysis quality is unaffected — it samples
+# raw frames independently of these.
+_STREAM_FPS = int(os.getenv("STREAM_FPS", "12"))          # live-view fps to the browser
+_STREAM_QUALITY = int(os.getenv("STREAM_QUALITY", "70"))  # live-view JPEG quality
+_STREAM_WIDTH = int(os.getenv("STREAM_WIDTH", "1280"))
+_STREAM_HEIGHT = int(os.getenv("STREAM_HEIGHT", "720"))
 
 
 class StreamCapture:

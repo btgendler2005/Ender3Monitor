@@ -219,6 +219,32 @@ If `CAMERA_INDEX=-1` (the default), the app will detect all cameras, save a snap
 
 ---
 
+## Run on a Raspberry Pi (recommended for 24/7 use)
+
+A Pi makes the best home for this — always-on, low-power, sitting right next to the printer, with your Mac free. Because the app is a headless web service, moving to a Pi is packaging, not a rewrite. Plug the **printer's USB** and a **USB webcam** into the Pi.
+
+**Requirements:** Raspberry Pi 4 (4 GB+) or Pi 5, Raspberry Pi OS (64-bit), the **Anthropic backend** (local Ollama vision models are too heavy for a Pi).
+
+```bash
+git clone https://github.com/btgendler2005/Ender3Monitor.git
+cd Ender3Monitor
+bash deploy/install_pi.sh        # venv, headless OpenCV, ffmpeg, serial/camera access, systemd service
+nano .env                        # set ANTHROPIC_API_KEY, WEB_USERNAME/WEB_PASSWORD, ANALYZER_BACKEND=anthropic
+sudo reboot                      # apply the dialout/video group membership
+# after reboot it auto-starts; or: sudo systemctl start ender3monitor
+```
+
+Then open `http://<pi-ip>:8080`. Logs: `journalctl -u ender3monitor -f`.
+
+**Pi notes**
+- The installer adds you to the `dialout` (serial) and `video` (camera) groups — needs a re-login/reboot to take effect.
+- The printer enumerates as `/dev/ttyUSB0` or `/dev/ttyACM0`; `PRINTER_PORT=auto` finds it.
+- **Spare the SD card:** point timelapse at a USB stick — `TIMELAPSE_DIR=/mnt/usb/timelapse`.
+- **Dial the live view down** if CPU is tight (analysis quality is unaffected): `STREAM_FPS=6  STREAM_WIDTH=960  STREAM_HEIGHT=540` in `.env`.
+- The service auto-restarts on crash and on boot.
+
+---
+
 ## Prometheus & Grafana (optional)
 
 ### 1. Install Prometheus
@@ -367,20 +393,28 @@ Ender3Monitor/
 │   ├── push.py             # ntfy / Discord / Telegram notifications + media
 │   ├── telegram_bot.py     # Interactive Telegram command bot (/status, /ask, …)
 │   ├── maintenance.py      # Print-hours + health tracking (reminders, clog trend)
-│   ├── metrics.py          # Prometheus metrics
+│   ├── metrics.py          # Prometheus print metrics
+│   ├── ops_metrics.py      # Operational/SRE + printer telemetry metrics
 │   ├── notifier.py         # SMTP email alerts
+│   ├── settings.py         # Runtime-editable settings (settings.json), validated
 │   └── timelapse.py        # Frame saving and MP4 compilation
 ├── grafana/
 │   ├── dashboard.json          # Print-monitoring Grafana dashboard
 │   ├── printer_dashboard.json  # Printer telemetry Grafana dashboard
 │   └── web_dashboard.json      # Operational / SRE Grafana dashboard
+├── prometheus/
+│   └── thermal_alert.rules.yml # Thermal-safety alerting rules
+├── deploy/
+│   ├── ender3monitor.service   # systemd unit template
+│   └── install_pi.sh           # Raspberry Pi installer
 ├── tests/
 │   └── test_core.py        # Unit tests — run with: python3 -m pytest tests/
+├── .github/workflows/ci.yml    # CI: runs the tests on every push/PR
 ├── monitor.py              # CLI entry point — run with: python monitor.py
 ├── web.py                  # Web UI entry point — run with: python web.py
 ├── requirements.txt        # Python dependencies
 ├── .env.example            # Environment variable template
-├── .gitignore              # Excludes .env, timelapse output, caches
+├── .gitignore              # Excludes .env, settings.json, timelapse output
 ├── LICENSE
 └── README.md
 ```
