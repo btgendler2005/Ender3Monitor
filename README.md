@@ -1,5 +1,7 @@
 # Ender3Monitor
 
+[![CI](https://github.com/btgendler2005/Ender3Monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/btgendler2005/Ender3Monitor/actions/workflows/ci.yml)
+
 A 3D print failure detection system that watches your printer through a USB webcam, uses AI vision to spot problems in real time, fires email alerts when something goes wrong, and records a timelapse of every print.
 
 Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, free, runs locally on your machine).
