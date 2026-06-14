@@ -242,6 +242,22 @@ brew services start prometheus
 # Dashboard at http://localhost:9090
 ```
 
+#### Thermal-safety alerts (optional, recommended)
+
+`prometheus/thermal_alert.rules.yml` adds fire-safety alerts (nozzle/bed
+over-temperature, heater runaway above target, failure to reach temp,
+suspect thermistor) — defense-in-depth on top of Marlin's own protection.
+Copy it next to `prometheus.yml` and reference it:
+
+```yaml
+rule_files:
+  - thermal_alert.rules.yml
+```
+
+Reload Prometheus; firing alerts show in **Prometheus → Alerts** and
+**Grafana → Alerting**. Point Alertmanager or a Grafana contact point at them
+for phone/email push.
+
 ### 2. Install Grafana
 
 ```bash

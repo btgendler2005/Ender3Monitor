@@ -1,0 +1,84 @@
+# Ender3Monitor — thermal-safety alerting rules (Prometheus).
+#
+# These watch the printer telemetry gauges exported on :8000 and fire on the
+# dangerous conditions a stuck heater / failing thermistor produces. They are
+# defense-in-depth ON TOP OF Marlin's own thermal-runaway protection — not a
+# replacement for it.
+#
+# Install:
+#   1. Copy this file next to prometheus.yml (e.g. /opt/homebrew/etc/).
+#   2. Reference it in prometheus.yml:
+#        rule_files:
+#          - thermal_alert.rules.yml
+#   3. Reload Prometheus (brew services restart prometheus).
+#   4. Firing alerts appear in Prometheus → Alerts and in Grafana → Alerting.
+#      To get a phone/email push, point Alertmanager (or a Grafana contact
+#      point) at them.
+#
+# NaN-safe: when the printer is disconnected the gauges are NaN, and PromQL
+# comparisons against NaN are false, so none of these fire while unplugged.
+
+groups:
+  - name: ender3monitor_thermal
+    rules:
+      # ── Absolute over-temperature (fire risk) ──
+      # Above any sane setpoint for an Ender 3 V3 SE — a stuck/runaway heater.
+      - alert: NozzleOverTemperature
+        expr: e3m_printer_nozzle_temp_celsius > 275
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Nozzle over-temperature ({{ $value | printf \"%.0f\" }}°C)"
+          description: "Nozzle exceeded 275°C — possible heater runaway. Check the printer NOW."
+
+      - alert: BedOverTemperature
+        expr: e3m_printer_bed_temp_celsius > 115
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Bed over-temperature ({{ $value | printf \"%.0f\" }}°C)"
+          description: "Bed exceeded 115°C — possible heater runaway. Check the printer NOW."
+
+      # ── Runaway above target (climbing past where it should hold) ──
+      - alert: NozzleRunawayAboveTarget
+        expr: (e3m_printer_nozzle_temp_celsius - e3m_printer_nozzle_target_celsius) > 20
+              and e3m_printer_nozzle_target_celsius > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Nozzle 20°C+ above target for 2m"
+          description: "Nozzle is {{ $value | printf \"%.0f\" }}°C above its setpoint — heater not regulating."
+
+      - alert: BedRunawayAboveTarget
+        expr: (e3m_printer_bed_temp_celsius - e3m_printer_bed_target_celsius) > 15
+              and e3m_printer_bed_target_celsius > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Bed 15°C+ above target for 2m"
+          description: "Bed is {{ $value | printf \"%.0f\" }}°C above its setpoint — heater not regulating."
+
+      # ── Failure to heat (thermistor fault / heater not connected) ──
+      - alert: NozzleNotReachingTarget
+        expr: (e3m_printer_nozzle_target_celsius - e3m_printer_nozzle_temp_celsius) > 15
+              and e3m_printer_nozzle_target_celsius > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Nozzle not reaching target for 10m"
+          description: "Nozzle stuck {{ $value | printf \"%.0f\" }}°C below setpoint — possible heater/thermistor fault."
+
+      # ── Implausible reading (thermistor disconnected reads near 0 / negative) ──
+      - alert: NozzleThermistorSuspect
+        expr: e3m_printer_nozzle_temp_celsius < 5 and e3m_printer_printing == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Nozzle reads <5°C while printing"
+          description: "Implausible nozzle reading during a print — thermistor may be disconnected."
