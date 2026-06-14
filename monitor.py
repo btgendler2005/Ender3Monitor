@@ -4,6 +4,7 @@
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -170,6 +171,9 @@ class Monitor:
         self.frame_count = 0
         self.failure_count = 0
         self.last_frame_time: Optional[datetime] = None
+        # Server-side event log (survives browser reloads) + per-print API cost.
+        self.events: deque = deque(maxlen=50)
+        self.session_cost_usd: float = 0.0
 
         # Warmup gating — signal-based when USB connected, else time-based grace
         self._grace_until: float = 0.0   # set in start() (no-USB fallback)
@@ -592,6 +596,15 @@ class Monitor:
                         self.frame_count += 1
                         self.last_result = result
                         self.last_frame_time = datetime.now()
+                        self.session_cost_usd += getattr(result, "cost_usd", 0.0) or 0.0
+                        # Server-side event log (replayed to browsers on reload).
+                        self.events.append({
+                            "t": time.time(),
+                            "type": result.failure_type,
+                            "conf": round(result.confidence, 3),
+                            "desc": (result.description or "")[:140],
+                            "detected": result.failure_detected,
+                        })
                         # Per-run confidence stats (for the completion report)
                         self._conf_sum += result.confidence
                         self._conf_n += 1
@@ -811,6 +824,7 @@ class Monitor:
         self._running = True
         self.frame_count = 0
         self.failure_count = 0
+        self.session_cost_usd = 0.0
         self.last_result = None
         self.status = "Monitoring…"
         self._grace_until = time.time() + STARTUP_GRACE_SECONDS

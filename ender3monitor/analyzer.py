@@ -57,6 +57,26 @@ _FIRST_LAYER_NOTE = (
 )
 
 
+# Approximate Anthropic Claude Sonnet pricing, USD per token — used only for the
+# live cost meter. Update if Anthropic changes pricing. Ollama is local = $0.
+_PRICE_IN = 3.0 / 1e6
+_PRICE_OUT = 15.0 / 1e6
+_PRICE_CACHE_WRITE = 3.75 / 1e6
+_PRICE_CACHE_READ = 0.30 / 1e6
+
+
+def _usage_cost(usage) -> float:
+    """Estimate USD cost of one Anthropic response from its usage block."""
+    if usage is None:
+        return 0.0
+    inp = getattr(usage, "input_tokens", 0) or 0
+    out = getattr(usage, "output_tokens", 0) or 0
+    cw = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    cr = getattr(usage, "cache_read_input_tokens", 0) or 0
+    return (inp * _PRICE_IN + out * _PRICE_OUT
+            + cw * _PRICE_CACHE_WRITE + cr * _PRICE_CACHE_READ)
+
+
 @dataclass
 class AnalysisResult:
     failure_detected: bool
@@ -64,6 +84,7 @@ class AnalysisResult:
     confidence: float
     description: str
     backend: str = "unknown"
+    cost_usd: float = 0.0       # estimated API cost of this call (0 for local)
 
     @property
     def summary(self) -> str:
@@ -295,7 +316,9 @@ class AnthropicAnalyzer:
                     self._cache_logged = True
 
         raw_text = next((b.text for b in response.content if b.type == "text"), "{}")
-        return _parse_response(raw_text, backend=f"anthropic/{self._model}")
+        result = _parse_response(raw_text, backend=f"anthropic/{self._model}")
+        result.cost_usd = _usage_cost(getattr(response, "usage", None))
+        return result
 
     def ask(self, frame: np.ndarray, question: str) -> str:
         """Answer a free-form question about the current frame (for /ask)."""

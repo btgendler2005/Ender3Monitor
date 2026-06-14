@@ -276,3 +276,32 @@ def test_settings_atomic_save_leaves_no_tmp(tmp_path):
     s.update({"capture_interval": 90})
     assert store.exists()
     assert not (tmp_path / "s.json.tmp").exists()      # temp renamed, not left behind
+
+
+# ── API cost meter ──────────────────────────────────────────────────────────
+
+class _FakeUsage:
+    def __init__(self, inp=0, out=0, cw=0, cr=0):
+        self.input_tokens = inp
+        self.output_tokens = out
+        self.cache_creation_input_tokens = cw
+        self.cache_read_input_tokens = cr
+
+
+def test_usage_cost_components():
+    from ender3monitor.analyzer import _usage_cost
+    # all four token buckets priced independently
+    c = _usage_cost(_FakeUsage(inp=1000, out=100, cw=200, cr=5000))
+    expect = (1000*3 + 100*15 + 200*3.75 + 5000*0.30) / 1e6
+    assert abs(c - expect) < 1e-12
+
+
+def test_usage_cost_none_is_zero():
+    from ender3monitor.analyzer import _usage_cost
+    assert _usage_cost(None) == 0.0          # Ollama / missing usage → free
+
+
+def test_analysis_result_defaults_cost_zero():
+    from ender3monitor.analyzer import AnalysisResult
+    r = AnalysisResult(False, "none", 0.1, "x")
+    assert r.cost_usd == 0.0

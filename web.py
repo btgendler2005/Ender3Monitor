@@ -501,7 +501,9 @@ def _state() -> dict:
         "printer": _monitor.printer.status.as_dict(),
         "push_channels": _monitor.push.channels(),
         "auto_start": _monitor.auto_start_enabled,
-        "threshold": _config.confidence_threshold if _config else 0.7,
+        "threshold": _monitor.settings.get("confidence_threshold"),
+        "cost_usd": round(_monitor.session_cost_usd, 4),
+        "events": list(_monitor.events),
     }
 
 
@@ -713,6 +715,15 @@ async def download_timelapse(name: Optional[str] = None):
 @app.get("/api/status")
 async def api_status():
     return _state()
+
+
+@app.post("/api/events/clear")
+async def api_events_clear():
+    if _monitor is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    _monitor.events.clear()
+    await _broadcast()
+    return {"cleared": True}
 
 
 @app.get("/api/settings")
@@ -1326,6 +1337,11 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
       </div>
     </div>
 
+    <div class="count-box" id="cost-box" style="margin-top:10px">
+      <div class="lbl">Est. API cost · this print</div>
+      <div class="num" id="cost" style="color:var(--green)">$0.00</div>
+    </div>
+
     <!-- Printer (USB) — hidden until a printer is connected -->
     <div id="printer-block" style="display:none">
       <div class="card-label" style="margin-top:18px">Printer</div>
@@ -1449,6 +1465,12 @@ function render(d) {
   fel.textContent   = d.failure_count  ?? 0;
   fel.style.color   = (d.failure_count ?? 0) > 0 ? 'var(--red)' : 'var(--text)';
 
+  // Live API cost (this print)
+  if (typeof d.cost_usd === 'number') {
+    document.getElementById('cost').textContent =
+      '≈$' + d.cost_usd.toFixed(d.cost_usd < 1 ? 3 : 2);
+  }
+
   // Description
   if (d.description) {
     const desc = document.getElementById('description');
@@ -1501,11 +1523,8 @@ function render(d) {
   document.getElementById('btn-start').disabled = !!d.is_running;
   document.getElementById('btn-stop').disabled  = !d.is_running;
 
-  // New frame → log entry
-  if (d.frame_count > lastFrames && d.frame_count > 0) {
-    lastFrames = d.frame_count;
-    addLog(d);
-  }
+  // Event log — rendered from the server-side history so it survives reloads.
+  if (Array.isArray(d.events)) renderEvents(d.events);
 }
 
 function pillClass(s) {
@@ -1642,35 +1661,40 @@ async function api(action, body = null) {
   } catch(e) { toast('Network error'); return null; }
 }
 
-// ── Event log ──────────────────────────────────────────────────────────────
-function addLog(d) {
-  const log = document.getElementById('log');
-  log.querySelector('.log-empty')?.remove();
-
-  const now  = new Date().toTimeString().slice(0,8);
-  const isFail = d.failure_detected;
-  const isDone = (d.status||'').toLowerCase().includes('complete');
-  const cls  = isFail ? 'badge-fail' : isDone ? 'badge-done' : 'badge-ok';
-  const lbl  = isFail ? (d.failure_type||'failure') : isDone ? 'complete' : 'ok';
-  const desc = (d.description||'').slice(0, 220);
-  const conf = d.confidence ? (d.confidence*100).toFixed(0)+'%' : '';
-
-  const row = document.createElement('div');
-  row.className = 'ev';
-  row.innerHTML = `
-    <span class="ev-time">${now}</span>
-    <span class="badge ${cls}">${lbl}</span>
-    <span class="ev-desc">${desc}</span>
-    <span class="ev-conf">${conf}</span>
-  `;
-  log.prepend(row);
-  while (log.children.length > 60) log.removeChild(log.lastChild);
+// ── Event log (server-driven; persists across reloads) ──────────────────────
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
 
-function clearLog() {
+function renderEvents(events) {
   const log = document.getElementById('log');
-  log.innerHTML = '<div class="log-empty">Log cleared.</div>';
-  lastFrames = -1;
+  if (!events.length) {
+    log.innerHTML = '<div class="log-empty">No events yet — start monitoring to begin.</div>';
+    return;
+  }
+  // Newest first.
+  const rows = events.slice().reverse().map(e => {
+    const t = new Date((e.t || 0) * 1000).toTimeString().slice(0, 8);
+    const isFail = e.detected;
+    const ft = e.type || 'none';
+    const cls = isFail ? 'badge-fail' : 'badge-ok';
+    const lbl = isFail ? ft : (ft === 'no_printer' ? 'no printer' : 'ok');
+    const conf = e.conf != null ? Math.round(e.conf * 100) + '%' : '';
+    return `<div class="ev">
+      <span class="ev-time">${t}</span>
+      <span class="badge ${cls}">${esc(lbl)}</span>
+      <span class="ev-desc">${esc((e.desc || '').slice(0, 220))}</span>
+      <span class="ev-conf">${conf}</span>
+    </div>`;
+  });
+  log.innerHTML = rows.join('');
+}
+
+async function clearLog() {
+  await api('events/clear');   // server clears; next state push re-renders empty
+  document.getElementById('log').innerHTML =
+    '<div class="log-empty">Log cleared.</div>';
 }
 
 // ── Stream link — show full LAN URL so user can open on phone ─────────────
