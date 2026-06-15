@@ -305,3 +305,44 @@ def test_analysis_result_defaults_cost_zero():
     from ender3monitor.analyzer import AnalysisResult
     r = AnalysisResult(False, "none", 0.1, "x")
     assert r.cost_usd == 0.0
+
+
+# ── Pricing ──────────────────────────────────────────────────────────────────
+
+class _PriceSettings:
+    def __init__(self, **kw):
+        self.v = dict(
+            pricing_enabled=True, currency_symbol="$", filament_price_per_kg=20.0,
+            electricity_rate_per_kwh=0.15, printer_watts=120, machine_rate_per_hour=1.0,
+            labor_flat=2.0, markup_multiplier=2.0,
+        )
+        self.v.update(kw)
+    def get(self, k): return self.v[k]
+
+
+def test_pricing_breakdown_and_markup():
+    from ender3monitor.pricing import compute_price
+    p = compute_price(5 * 3600, 30, _PriceSettings())   # 30 g, 5 h
+    assert abs(p["material"] - 0.60) < 1e-9
+    assert abs(p["electricity"] - 0.09) < 1e-9
+    assert abs(p["machine"] - 5.0) < 1e-9
+    assert abs(p["cost"] - 7.69) < 1e-9
+    assert abs(p["price"] - 15.38) < 1e-9
+
+
+def test_pricing_disabled_returns_none():
+    from ender3monitor.pricing import compute_price
+    assert compute_price(3600, 30, _PriceSettings(pricing_enabled=False)) is None
+
+
+def test_pricing_handles_none_time_and_zero_grams():
+    from ender3monitor.pricing import compute_price
+    p = compute_price(None, 0, _PriceSettings())
+    assert p["price"] == p["labor"] * p["markup"]       # only labor survives
+
+
+def test_pricing_keys_are_in_settings_schema():
+    from ender3monitor.settings import SCHEMA
+    for k in ("pricing_enabled", "filament_grams", "filament_price_per_kg",
+              "markup_multiplier", "currency_symbol"):
+        assert k in SCHEMA

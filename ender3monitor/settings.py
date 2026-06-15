@@ -89,6 +89,35 @@ SCHEMA: Dict[str, dict] = {
     "maintenance_reminder_hours": _field(
         "int", 250, "Maintenance", "Upkeep reminder (h)", min=1, max=100000,
         help="Push an upkeep nudge every N hours of printing."),
+
+    # ── Pricing (suggested sell price on the completion report) ──
+    "pricing_enabled": _field(
+        "bool", True, "Pricing", "Show suggested price",
+        help="Add a suggested sell price to the print-complete summary."),
+    "currency_symbol": _field(
+        "enum", "$", "Pricing", "Currency", choices=["$", "€", "£", "¥"],
+        help="Currency symbol for the price."),
+    "filament_grams": _field(
+        "float", 30.0, "Pricing", "Filament weight (g)", min=0.0, max=100000.0,
+        help="Grams of filament per print (from your slicer). Used for material cost."),
+    "filament_price_per_kg": _field(
+        "float", 20.0, "Pricing", "Filament price (/kg)", min=0.0, max=100000.0,
+        help="What you pay per kilogram of filament."),
+    "electricity_rate_per_kwh": _field(
+        "float", 0.15, "Pricing", "Electricity (/kWh)", min=0.0, max=100.0,
+        help="Your power rate per kWh."),
+    "printer_watts": _field(
+        "int", 120, "Pricing", "Printer power (W)", min=0, max=5000,
+        help="Average draw while printing (Ender 3 V3 SE ≈ 120 W)."),
+    "machine_rate_per_hour": _field(
+        "float", 1.0, "Pricing", "Machine rate (/h)", min=0.0, max=100000.0,
+        help="Hourly charge for wear, depreciation, and failed-print buffer."),
+    "labor_flat": _field(
+        "float", 2.0, "Pricing", "Labor (flat)", min=0.0, max=100000.0,
+        help="Flat post-processing / handling fee per print."),
+    "markup_multiplier": _field(
+        "float", 2.0, "Pricing", "Markup (×)", min=0.0, max=100.0,
+        help="Multiply total cost by this for the sell price (2–3× typical)."),
 }
 
 _TRUE = {"1", "true", "yes", "on", "t", "y"}

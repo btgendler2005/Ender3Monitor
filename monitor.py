@@ -761,6 +761,13 @@ class Monitor:
             f"Avg/peak confidence: {avg:.0%} / {self._conf_peak:.0%}",
             f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         ]
+        if self.session_cost_usd > 0:
+            lines.append(f"AI cost: ${self.session_cost_usd:.2f}")
+
+        # Suggested sell price (manual filament weight + configured rates).
+        from ender3monitor.pricing import compute_price, format_price_lines
+        price = compute_price(elapsed, self.settings.get("filament_grams"), self.settings)
+        lines += format_price_lines(price)
         return "\n".join(lines)
 
     def _send_completion_report(self, frame: np.ndarray) -> None:

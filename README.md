@@ -396,6 +396,7 @@ Ender3Monitor/
 │   ├── metrics.py          # Prometheus print metrics
 │   ├── ops_metrics.py      # Operational/SRE + printer telemetry metrics
 │   ├── notifier.py         # SMTP email alerts
+│   ├── pricing.py          # Suggested sell-price calc for the completion report
 │   ├── settings.py         # Runtime-editable settings (settings.json), validated
 │   └── timelapse.py        # Frame saving and MP4 compilation
 ├── grafana/
