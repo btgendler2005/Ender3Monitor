@@ -346,3 +346,9 @@ def test_pricing_keys_are_in_settings_schema():
     for k in ("pricing_enabled", "filament_grams", "filament_price_per_kg",
               "markup_multiplier", "currency_symbol"):
         assert k in SCHEMA
+
+
+def test_first_layer_mode_toggle_in_schema():
+    from ender3monitor.settings import SCHEMA
+    assert SCHEMA["first_layer_mode"]["type"] == "bool"
+    assert SCHEMA["first_layer_mode"]["default"] is True   # on by default (current behavior)

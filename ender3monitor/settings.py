@@ -45,9 +45,13 @@ SCHEMA: Dict[str, dict] = {
     "confidence_threshold": _field(
         "float", 0.85, "Detection", "Alert threshold", min=0.0, max=1.0,
         help="Flag a failure only at/above this confidence."),
+    "first_layer_mode": _field(
+        "bool", True, "Detection", "First-layer mode",
+        help="Analyze more often (and with adhesion focus) on the first layers — "
+             "where most failures start. Off = use the main interval throughout."),
     "first_layer_interval": _field(
         "int", 60, "Detection", "First-layer interval (s)", min=10, max=3600,
-        help="Tighter analysis cadence while on the first layer."),
+        help="Tighter analysis cadence while on the first layer (when first-layer mode is on)."),
     "first_layer_max_z": _field(
         "float", 0.6, "Detection", "First-layer max Z (mm)", min=0.0, max=20.0,
         help="Treat Z at/under this as the first layer."),

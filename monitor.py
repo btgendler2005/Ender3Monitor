@@ -438,6 +438,8 @@ class Monitor:
 
     def _in_first_layer(self) -> bool:
         """True while the nozzle is on/near the first layer (failure-prone)."""
+        if not self.settings.get("first_layer_mode"):
+            return False   # feature off → use the main interval throughout
         pr = self.printer.status if self.printer.connected else None
         if pr and pr.printing and pr.z_height is not None:
             return pr.z_height <= self.settings.get("first_layer_max_z")
@@ -663,6 +665,8 @@ class Monitor:
                                     self.status = "Finishing… (near complete)"
                                 elif result.failure_type == "no_printer":
                                     self.status = "Monitoring… (no printer in frame)"
+                                elif first_layer:
+                                    self.status = "Monitoring… (first layer)"
                                 else:
                                     self.status = "Monitoring…"
 
