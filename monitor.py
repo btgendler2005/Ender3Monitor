@@ -787,7 +787,7 @@ class Monitor:
                 self.push.send_photo(buf.tobytes(), caption="Final frame")
         # 3. Compiled timelapse video (Telegram, if not too large)
         try:
-            mp4 = self.timelapse.compile()
+            mp4 = self.timelapse.compile(**self._timelapse_compile_kwargs())
             if mp4:
                 self.push.send_video(mp4, caption="Timelapse")
         except Exception as exc:
@@ -887,9 +887,41 @@ class Monitor:
             self.status = "Idle"
         print("  Monitoring stopped.")
 
+    def _timelapse_overlay_lines(self) -> list:
+        """Build the burn-in caption lines per the configured toggles.
+
+        Empty when the overlay is off, so callers can pass it unconditionally.
+        """
+        if not self.settings.get("timelapse_overlay"):
+            return []
+        lines: list = []
+        if self.settings.get("timelapse_overlay_elapsed"):
+            elapsed = self.printer.status.elapsed_seconds
+            if elapsed is None and self._print_active_since:
+                elapsed = int(time.time() - self._print_active_since)
+            dur = _fmt_duration(elapsed)
+            if dur:
+                lines.append(f"Print time: {dur}")
+        if self.settings.get("timelapse_overlay_filament"):
+            grams = self.settings.get("filament_grams")
+            if grams:
+                lines.append(f"Filament: {grams:g} g")
+        if self.settings.get("timelapse_overlay_date"):
+            lines.append(datetime.now().strftime("%Y-%m-%d"))
+        return lines
+
+    def _timelapse_compile_kwargs(self) -> dict:
+        """Aspect/fit/fps/overlay for compile(), read live from settings."""
+        return {
+            "fps": int(self.settings.get("timelapse_fps")),
+            "aspect": self.settings.get("camera_aspect"),
+            "fit": self.settings.get("camera_fit"),
+            "overlay_lines": self._timelapse_overlay_lines(),
+        }
+
     def compile_timelapse(self) -> Optional[str]:
         print("  Compiling timelapse…")
-        result = self.timelapse.compile()
+        result = self.timelapse.compile(**self._timelapse_compile_kwargs())
         if result:
             print(f"  Saved: {result}")
         return result

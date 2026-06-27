@@ -28,6 +28,7 @@ Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, f
 - **Prometheus metrics** — `/metrics` endpoint for frames analyzed, failure counts by type, and confidence score trends
 - **Grafana dashboard** — pre-built JSON ready to import
 - **Timelapse** — saves a frame every 30 seconds and compiles to a downloadable MP4 on demand
+- **Social-ready framing** — pick an aspect ratio (9:16 Reels/Stories, 4:5 IG feed, 1:1, or native) for the live view and timelapse, with a blurred-fill / letterbox / crop mode and an optional burn-in caption (print time, filament, date). AI detection still uses the full frame. All in the ⚙ settings panel
 - **Multi-camera support** — auto-detects cameras, opens Preview snapshots so you can visually identify which index maps to your printer
 
 ---

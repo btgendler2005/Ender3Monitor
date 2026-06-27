@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from ender3monitor.framing import reframe, draw_overlay
+
 
 class TimelapseManager:
     """Saves timelapse frames and compiles them to MP4, with disk retention.
@@ -103,7 +105,9 @@ class TimelapseManager:
     # Compile                                                              #
     # ------------------------------------------------------------------ #
 
-    def compile(self, fps: int = 24, output_file: Optional[str] = None) -> Optional[str]:
+    def compile(self, fps: int = 24, output_file: Optional[str] = None,
+                aspect: str = "native", fit: str = "pad_blur",
+                overlay_lines: Optional[list] = None) -> Optional[str]:
         if self._session_dir is None:
             print("No timelapse session to compile.")
             return None
@@ -118,6 +122,10 @@ class TimelapseManager:
             print("Cannot read frames.")
             return None
 
+        # Reframe to the configured aspect ratio (e.g. 9:16 for Instagram).
+        # Derive the output dimensions from a reframed sample so every frame
+        # written matches the writer's expected size.
+        sample = reframe(sample, aspect, fit)
         h, w = sample.shape[:2]
         if output_file is None:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -140,8 +148,16 @@ class TimelapseManager:
 
         for f in frames:
             img = cv2.imread(str(f))
-            if img is not None:
-                writer.write(img)
+            if img is None:
+                continue
+            img = reframe(img, aspect, fit)
+            if overlay_lines:
+                draw_overlay(img, overlay_lines)
+            # Guard against any size drift from rounding so the writer accepts
+            # every frame (a mismatched size is silently dropped by OpenCV).
+            if img.shape[1] != w or img.shape[0] != h:
+                img = cv2.resize(img, (w, h))
+            writer.write(img)
 
         writer.release()
 
