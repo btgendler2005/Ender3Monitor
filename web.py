@@ -33,7 +33,6 @@ log = logging.getLogger("ender3monitor")
 
 from ender3monitor.camera import CameraManager
 from ender3monitor.config import Config
-from ender3monitor.framing import reframe
 from ender3monitor.telegram_bot import TelegramBot
 from ender3monitor.settings import Settings
 from ender3monitor import ops_metrics as ops
@@ -71,14 +70,9 @@ class StreamCapture:
 
     def __init__(self, index: int, flip: Optional[int],
                  width: int = _STREAM_WIDTH, height: int = _STREAM_HEIGHT,
-                 fps: int = _STREAM_FPS, quality: int = _STREAM_QUALITY,
-                 aspect: str = "native", fit: str = "pad_blur") -> None:
+                 fps: int = _STREAM_FPS, quality: int = _STREAM_QUALITY) -> None:
         self.index = index
         self.flip = flip
-        # Reframe only the live view; _latest_raw stays full-frame so the AI
-        # failure detector keeps seeing the whole bed.
-        self.aspect = aspect
-        self.fit = fit
         self.width = width
         self.height = height
         self._encode_interval = 1.0 / max(1, fps)
@@ -158,8 +152,7 @@ class StreamCapture:
             encode_interval = (self._encode_interval if active
                                else self._IDLE_ENCODE_INTERVAL)
             if now - last_encode >= encode_interval:
-                display = reframe(frame, self.aspect, self.fit)
-                ok2, buf = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+                ok2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
                 if ok2:
                     with self._lock:
                         self._latest_jpeg = buf.tobytes()
@@ -385,9 +378,7 @@ async def lifespan(app: FastAPI):
     ops.register_system_collector()          # host CPU/mem/disk on the metrics endpoint
     _monitor.metrics.start_server(_config.metrics_port)
     _stream = StreamCapture(_resolve_stream_index(),
-                            flip=_config.camera_flip,
-                            aspect=_monitor.settings.get("camera_aspect"),
-                            fit=_monitor.settings.get("camera_fit"))
+                            flip=_config.camera_flip)
     _stream.start()
     # Let the printer poller auto-start monitoring using the shared stream.
     _monitor.set_default_source(_stream.index, _stream.latest_frame)
@@ -784,12 +775,6 @@ async def api_settings_post(request: Request):
     # camera_flip's stream side is web-owned (the monitor handled CLI camera).
     if "camera_flip" in applied and _stream is not None:
         _stream.flip = _FLIP_STR_TO_CODE.get(applied["camera_flip"])
-    # Aspect ratio / fit mode are likewise applied to the live stream here;
-    # the timelapse reads them at compile time straight from settings.
-    if "camera_aspect" in applied and _stream is not None:
-        _stream.aspect = applied["camera_aspect"]
-    if "camera_fit" in applied and _stream is not None:
-        _stream.fit = applied["camera_fit"]
 
     await _broadcast()
     return {
@@ -973,7 +958,7 @@ header{
 .cam-card{grid-row:1/3;display:flex;flex-direction:column;gap:14px}
 #cam{
   width:100%;aspect-ratio:16/9;
-  border-radius:8px;object-fit:contain;
+  border-radius:8px;object-fit:cover;
   background:#000;display:block;
 }
 .cam-meta{font-size:11.5px;color:var(--muted);display:flex;justify-content:space-between;

@@ -61,17 +61,6 @@ SCHEMA: Dict[str, dict] = {
         "enum", "none", "Camera", "Image flip", live=True,
         choices=["none", "180", "vertical", "horizontal"],
         help="Rotate/flip the camera image (180 for an upside-down mount)."),
-    "camera_aspect": _field(
-        "enum", "native", "Camera", "Aspect ratio", live=True,
-        choices=["native", "9:16", "4:5", "1:1"],
-        help="Reframe the live view and timelapse. 9:16 = Reels/Stories, "
-             "4:5 = IG feed portrait, 1:1 = square. AI detection always uses "
-             "the full frame, so failures aren't missed at the edges."),
-    "camera_fit": _field(
-        "enum", "pad_blur", "Camera", "Reframe mode", live=True,
-        choices=["pad_blur", "letterbox", "crop"],
-        help="How to hit the ratio: pad_blur fills with a blurred copy "
-             "(nothing cut), letterbox uses black bars, crop cuts the sides."),
 
     # ── Automation ──
     "auto_start_on_print": _field(
@@ -99,6 +88,17 @@ SCHEMA: Dict[str, dict] = {
     "timelapse_delete_frames_after_compile": _field(
         "bool", False, "Timelapse", "Delete frames after compile",
         help="Reclaim space by dropping JPEGs once compiled to MP4."),
+    "camera_aspect": _field(
+        "enum", "native", "Timelapse", "Aspect ratio", live=True,
+        choices=["native", "9:16", "4:5", "1:1"],
+        help="Reframe the compiled timelapse. 9:16 = Reels/Stories, "
+             "4:5 = IG feed portrait, 1:1 = square. The live view and AI "
+             "detection always use the full frame."),
+    "camera_fit": _field(
+        "enum", "pad_blur", "Timelapse", "Reframe mode", live=True,
+        choices=["pad_blur", "letterbox", "crop"],
+        help="How to hit the ratio: pad_blur fills with a blurred copy "
+             "(nothing cut), letterbox uses black bars, crop cuts the sides."),
     "timelapse_fps": _field(
         "int", 24, "Timelapse", "Output FPS", min=1, max=60,
         help="Frames per second of the compiled MP4. Lower = shorter, "
