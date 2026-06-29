@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import secrets
+import signal
 import threading
 import time
 import traceback
@@ -26,6 +27,7 @@ import cv2
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response, JSONResponse, StreamingResponse, FileResponse
+from starlette.datastructures import Headers
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -210,6 +212,34 @@ class StreamCapture:
 # The single shared capture instance (created in lifespan once config is loaded)
 _stream: Optional[StreamCapture] = None
 
+# Set the instant a shutdown signal arrives so long-lived responses (the MJPEG
+# stream) can stop themselves and let the connection close, instead of being
+# force-cancelled past uvicorn's graceful window (which logs a CancelledError).
+_shutting_down = threading.Event()
+
+
+def _install_shutdown_hook() -> None:
+    """Chain a flag-setting handler ahead of uvicorn's signal handlers.
+
+    Called from lifespan startup, by which point uvicorn has already installed
+    its own SIGINT/SIGTERM handlers — we wrap them so the printer's normal
+    shutdown still runs, but our streaming generators learn about it first.
+    """
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous = signal.getsignal(sig)
+
+        def handler(signum, frame, _previous=previous):
+            _shutting_down.set()
+            if callable(_previous):
+                _previous(signum, frame)
+
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            # Not in the main thread (e.g. under --reload) — skip; the graceful
+            # timeout still bounds shutdown, just a touch less tidily.
+            pass
+
 
 def _resolve_stream_index() -> int:
     """Pick the camera index for the live stream at startup."""
@@ -373,6 +403,7 @@ def _parse_allowed_chats(raw: str) -> set:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _config, _monitor, _stream, _telegram
+    _install_shutdown_hook()
     _config = Config.from_env()
     _monitor = Monitor(_config)
     ops.register_system_collector()          # host CPU/mem/disk on the metrics endpoint
@@ -394,6 +425,10 @@ async def lifespan(app: FastAPI):
     push_task = asyncio.create_task(_push_loop())
     yield
     push_task.cancel()
+    try:
+        await push_task
+    except asyncio.CancelledError:
+        pass
     if _telegram:
         _telegram.stop()
     if _monitor and _monitor._running:
@@ -428,17 +463,30 @@ def _check_basic_auth(header: str) -> bool:
             and secrets.compare_digest(pwd, _config.web_password))
 
 
-@app.middleware("http")
-async def _auth_middleware(request: Request, call_next):
-    if not _auth_enabled():
-        return await call_next(request)
-    if _check_basic_auth(request.headers.get("authorization", "")):
-        return await call_next(request)
-    return Response(
-        status_code=401,
-        content="Authentication required",
-        headers={"WWW-Authenticate": 'Basic realm="Ender3Monitor"'},
-    )
+# NOTE: these are pure-ASGI middlewares (not @app.middleware("http"), which is
+# Starlette's BaseHTTPMiddleware). BaseHTTPMiddleware wraps responses in an
+# anyio memory stream; when a long-lived StreamingResponse like /stream is
+# cancelled at shutdown it raises a noisy "Exception in ASGI application"
+# CancelledError traceback. Pure-ASGI middleware passes cancellation straight
+# through and shuts down cleanly.
+
+class _AuthMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not _auth_enabled():
+            await self.app(scope, receive, send)
+            return
+        if _check_basic_auth(Headers(scope=scope).get("authorization", "")):
+            await self.app(scope, receive, send)
+            return
+        response = Response(
+            status_code=401,
+            content="Authentication required",
+            headers={"WWW-Authenticate": 'Basic realm="Ender3Monitor"'},
+        )
+        await response(scope, receive, send)
 
 
 # ── Prometheus HTTP request metrics ───────────────────────────────────────────
@@ -448,25 +496,41 @@ async def _auth_middleware(request: Request, call_next):
 _NO_LATENCY_PATHS = {"/stream"}
 
 
-@app.middleware("http")
-async def _metrics_middleware(request: Request, call_next):
-    ops.http_requests_in_progress.inc()
-    start = time.perf_counter()
-    status = 500
-    try:
-        response = await call_next(request)
-        status = response.status_code
-        return response
-    finally:
-        ops.http_requests_in_progress.dec()
-        # Use the matched route template (not the raw URL) to bound cardinality.
-        route = request.scope.get("route")
-        path = getattr(route, "path", None) or "other"
-        method = request.method
-        ops.http_requests_total.labels(method, path, str(status)).inc()
-        if path not in _NO_LATENCY_PATHS:
-            ops.http_request_duration_seconds.labels(method, path).observe(
-                time.perf_counter() - start)
+class _MetricsMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        ops.http_requests_in_progress.inc()
+        start = time.perf_counter()
+        status = {"code": 500}
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                status["code"] = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            ops.http_requests_in_progress.dec()
+            # Use the matched route template (not the raw URL) to bound cardinality.
+            route = scope.get("route")
+            path = getattr(route, "path", None) or "other"
+            method = scope.get("method", "")
+            ops.http_requests_total.labels(method, path, str(status["code"])).inc()
+            if path not in _NO_LATENCY_PATHS:
+                ops.http_request_duration_seconds.labels(method, path).observe(
+                    time.perf_counter() - start)
+
+
+# Add auth first, then metrics, so metrics wraps auth (outermost) and counts
+# 401s too — matching the original decorator ordering.
+app.add_middleware(_AuthMiddleware)
+app.add_middleware(_MetricsMiddleware)
 
 
 # ── WebSocket broadcast ───────────────────────────────────────────────────────
@@ -824,7 +888,7 @@ async def _mjpeg_generator():
     try:
         interval = 1.0 / _STREAM_FPS
         last_sent = None
-        while True:
+        while not _shutting_down.is_set():
             frame = _stream.latest_jpeg() if _stream else None
             if frame is not None and frame is not last_sent:
                 yield (
@@ -1858,4 +1922,8 @@ if __name__ == "__main__":
     import sys
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     print(f"\n  Ender3Monitor  →  http://localhost:{port}\n")
-    uvicorn.run("web:app", host="0.0.0.0", port=port, reload=False)
+    # timeout_graceful_shutdown caps how long uvicorn waits for open connections
+    # (e.g. the never-ending /stream socket) before force-closing them, so a
+    # single Ctrl+C exits cleanly instead of hanging until a second Ctrl+C.
+    uvicorn.run("web:app", host="0.0.0.0", port=port, reload=False,
+                timeout_graceful_shutdown=5)
