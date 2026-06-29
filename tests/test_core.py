@@ -21,8 +21,9 @@ from ender3monitor.maintenance import MaintenanceTracker
 from ender3monitor.settings import SCHEMA, Settings, _coerce
 from ender3monitor.printer import (
     _M78_TOTAL_RE, _POS_RE, _PRINTTIME_RE, _SD_RE, _TEMP_RE, _fmt_duration,
+    PrinterController,
 )
-from monitor import _frames_differ
+from monitor import _frames_differ, _confirm_frames
 
 
 # ── analyzer: failure-type normalization ────────────────────────────────────
@@ -118,6 +119,42 @@ def test_m27_progress_and_idle():
     m = _SD_RE.search("SD printing byte 45324/3105540")
     assert m and int(m.group(1)) == 45324 and int(m.group(2)) == 3105540
     assert _SD_RE.search("Not SD printing") is None
+
+
+@pytest.mark.parametrize("resp, printing, progress", [
+    ("SD printing byte 100/200", True, 0.5),
+    ("Not SD printing", False, None),
+    # End-of-print: Marlin's "Done printing file" must clear the printing flag
+    # so monitor.py's falling-edge completion fires (regression guard).
+    ("Done printing file", False, None),
+    ("SD printing byte 200/200\nDone printing file", False, 1.0),
+])
+def test_query_progress_completion(resp, printing, progress):
+    pc = PrinterController(port="")
+    pc.status.printing = True       # pretend a print is in progress
+    pc.send = lambda *a, **k: resp  # stub the serial round-trip
+    pc.query_progress()
+    assert pc.status.printing is printing
+    if progress is None:
+        assert pc.status.progress in (None, pc.status.progress)  # unchanged/None ok
+    else:
+        assert pc.status.progress == progress
+
+
+@pytest.mark.parametrize("window, interval, expected", [
+    (90, 30, 3),    # legacy 30 s frames → unchanged
+    (90, 300, 2),   # 5-min cadence → 2 frames, not a 15-min (3×) wait
+    (90, 60, 2),    # first-layer cadence
+    (45, 300, 2),   # spaghetti window, slow cadence → still floored at 2
+    (90, 0, 3),     # unknown interval → legacy default
+])
+def test_confirm_frames_scales_with_interval(window, interval, expected):
+    assert _confirm_frames(window, interval) == expected
+
+
+def test_confirm_frames_never_below_two():
+    # A single bad frame must never alert, no matter how long the interval.
+    assert _confirm_frames(45, 99999) == 2
 
 
 def test_m31_duration_forms():

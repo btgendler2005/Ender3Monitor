@@ -227,14 +227,22 @@ class PrinterController:
             self.status.bed_target = float(m.group(4))
 
     def query_progress(self) -> None:
-        """Update SD-print state + percent via M27 (meaningful for SD/USB prints)."""
+        """Update SD-print state + percent via M27 (meaningful for SD/USB prints).
+
+        Completion is recognised from either "Not SD printing" or Marlin's
+        end-of-print "Done printing file" line. The latter matters because a
+        finished print can report "Done printing file" before the next poll's
+        "Not SD printing"; without it the `printing` flag could stay stuck True
+        and the falling-edge completion in monitor.py would never fire.
+        """
         resp = self.send("M27")
         m = _SD_RE.search(resp)
         if m:
             done, total = int(m.group(1)), int(m.group(2))
-            self.status.printing = True
             self.status.progress = (done / total) if total > 0 else None
-        elif "Not SD printing" in resp:
+            # A "byte N/N" reading alongside "Done printing file" means finished.
+            self.status.printing = "Done printing" not in resp
+        elif "Not SD printing" in resp or "Done printing" in resp:
             self.status.printing = False
 
     def query_print_time(self) -> None:
