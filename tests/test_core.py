@@ -157,6 +157,69 @@ def test_confirm_frames_never_below_two():
     assert _confirm_frames(45, 99999) == 2
 
 
+def _completion_stub():
+    """Minimal stand-in exposing only what _check_printer_completion touches."""
+    import threading
+    from types import SimpleNamespace
+    from monitor import Monitor
+
+    stub = SimpleNamespace(
+        printer=SimpleNamespace(status=SimpleNamespace(
+            printing=False, nozzle_target=None, progress=None)),
+        _running=True,
+        _seen_printer_printing=False,
+        _print_active_since=None,
+        _printer_was_printing=False,
+        _nozzle_was_hot=False,
+        _frame_provider=lambda: None,
+        camera=None,
+        _prev_analysis_frame=None,
+        _lock=threading.Lock(),
+        _stop_event=threading.Event(),
+        status="Monitoring…",
+        _completion_frames=[],
+    )
+    stub._send_completion = lambda frame: stub._completion_frames.append(frame)
+    stub._poll = lambda: Monitor._check_printer_completion(stub)
+    return stub
+
+
+def test_completion_fires_on_heater_off_even_if_sd_progress_stuck():
+    # Reproduces the field bug: SD progress freezes (e.g. at 17%) and the
+    # printing flag never falls, but the end gcode turns the hotend off.
+    s = _completion_stub()
+    # Mid-print: printing, hotend at temp, progress stuck at 0.17
+    s.printer.status.printing = True
+    s.printer.status.nozzle_target = 200.0
+    s.printer.status.progress = 0.17
+    s._poll()
+    assert s.status != "Print Complete"
+    assert s._seen_printer_printing and s._nozzle_was_hot
+
+    # End gcode: printing flag still (wrongly) True, but hotend target → 0.
+    s.printer.status.nozzle_target = 0.0
+    s._poll()
+    assert s.status == "Print Complete"
+    assert s._running is False
+    # _send_completion runs on a daemon thread — wait briefly for it.
+    import time as _t
+    deadline = _t.time() + 2
+    while not s._completion_frames and _t.time() < deadline:
+        _t.sleep(0.01)
+    assert len(s._completion_frames) == 1
+
+
+def test_completion_does_not_fire_while_hotend_stays_hot():
+    s = _completion_stub()
+    s.printer.status.printing = True
+    s.printer.status.nozzle_target = 210.0
+    s._poll()
+    s.printer.status.nozzle_target = 208.0   # normal temperature wobble
+    s._poll()
+    assert s.status != "Print Complete"
+    assert s._running is True
+
+
 def test_m31_duration_forms():
     cases = {"echo:Print time: 1h 23m 45s": 5025,
              "echo:Print time: 2m 19s": 139,

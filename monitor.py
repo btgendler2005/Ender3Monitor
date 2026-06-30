@@ -53,6 +53,13 @@ WARMUP_TEMP_TOLERANCE = 5.0
 NO_MOTION_LIMIT = 4         # 4 × 30 s = 2 minutes
 MOTION_THRESHOLD = 5.0      # mean absolute pixel difference (0–255) to count as "changed"
 
+# Heater-off completion backstop: a hotend target at/above this means "printing
+# temperature", and a drop to/below HEATER_OFF_TARGET after that is the
+# end-of-print cool-down (M104 S0 in the end gcode). 150 °C clears every common
+# filament's print temp while excluding idle/standby.
+MIN_PRINT_NOZZLE_TARGET = 150.0
+HEATER_OFF_TARGET = 5.0
+
 # Failure confirmation: require sustained detection before alerting, to filter
 # single-frame false positives. Calibrated in *wall-clock seconds*, not a fixed
 # frame count — at long capture intervals a fixed count (e.g. 3) silently turned
@@ -213,6 +220,7 @@ class Monitor:
         # Printer-authoritative completion (preferred over camera stillness)
         self._seen_printer_printing: bool = False  # saw an active SD/USB print
         self._printer_was_printing: bool = False   # previous poll's printing state
+        self._nozzle_was_hot: bool = False         # saw a printing-temp hotend target
         self._print_active_since: Optional[float] = None  # when printing/motion first seen
 
         # Layer-synced timelapse (driven by the printer Z poller)
@@ -364,12 +372,21 @@ class Monitor:
                 self._last_layer_z = z
 
     def _check_printer_completion(self) -> None:
-        """Detect print completion from the printer's own state (falling edge).
+        """Detect print completion from the printer's own state.
 
         Runs in the 5 s poll loop rather than the analysis loop, so completion
         is noticed within seconds of the job ending — at a 5-minute analysis
         cadence the old in-loop check could fire up to 5 minutes late, by which
         time the part may already be off the bed (empty-bed "final photo").
+
+        Two independent triggers, because some printers/firmwares never report a
+        clean SD "printing → not printing" edge (their M27 byte progress can even
+        freeze partway, e.g. at 17 %):
+          1. The SD "printing" flag falling edge (M27), when it works.
+          2. The nozzle-heater-off edge — end-of-print gcode drops the hotend
+             target from a printing temperature to ~0. Temperatures (M105) are
+             reported reliably even when SD progress isn't, so this is the
+             firmware-agnostic backstop.
         """
         printing = bool(self.printer.status.printing)
         if self._running and printing:
@@ -377,20 +394,34 @@ class Monitor:
             if self._print_active_since is None:
                 self._print_active_since = time.time()
         falling = self._printer_was_printing and not printing
+
+        # Track the hotend target so we can spot the end-of-print cool-down edge.
+        nt = self.printer.status.nozzle_target
+        now_hot = nt is not None and nt >= MIN_PRINT_NOZZLE_TARGET
+        heater_off_edge = (self._nozzle_was_hot
+                           and nt is not None and nt <= HEATER_OFF_TARGET)
+        if now_hot:
+            self._nozzle_was_hot = True
+        elif nt is not None and nt <= HEATER_OFF_TARGET:
+            self._nozzle_was_hot = False
+        # (nt is None → reading missing this poll → keep the previous hot state)
+
         # Log every printing-state transition so a missed completion is
         # diagnosable from the console without reproducing under a debugger.
         if printing != self._printer_was_printing:
             pct = self.printer.status.progress
+            pct_str = f"{pct:.0%}" if pct is not None else "?"
             print(f"\n  [PRINTER] printing {self._printer_was_printing} → {printing}"
-                  f" (progress={pct:.0%} running={self._running}"
-                  f" seen_printing={self._seen_printer_printing})"
-                  if pct is not None else
-                  f"\n  [PRINTER] printing {self._printer_was_printing} → {printing}"
-                  f" (running={self._running} seen_printing={self._seen_printer_printing})")
+                  f" (progress={pct_str} nozzle_target={nt} running={self._running}"
+                  f" seen_printing={self._seen_printer_printing})")
         self._printer_was_printing = printing
 
-        if not (falling and self._running and self._seen_printer_printing):
+        if not (self._running and self._seen_printer_printing
+                and (falling or heater_off_edge)):
             return
+
+        reason = ("printer (SD finished)" if falling
+                  else "heaters turned off")
 
         # Grab the final frame NOW, while the finished part is still on the bed.
         frame = None
@@ -405,7 +436,7 @@ class Monitor:
             self.status = "Print Complete"
             self._running = False
         self._stop_event.set()   # wake the analysis loop so it exits promptly
-        print("\n  ✓ Print complete (reported by printer).")
+        print(f"\n  ✓ Print complete — detected via {reason}.")
 
         # Heavy I/O (email, timelapse compile, Telegram video) runs on its own
         # thread so this poll loop keeps polling temps without a long stall.
@@ -881,6 +912,7 @@ class Monitor:
         self._print_motion_seen = False
         self._seen_printer_printing = False
         self._printer_was_printing = False
+        self._nozzle_was_hot = False
         self._print_active_since = None
         self._pending_failure_type = None
         self._pending_failure_count = 0
