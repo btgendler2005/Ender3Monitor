@@ -53,10 +53,30 @@ WARMUP_TEMP_TOLERANCE = 5.0
 NO_MOTION_LIMIT = 4         # 4 × 30 s = 2 minutes
 MOTION_THRESHOLD = 5.0      # mean absolute pixel difference (0–255) to count as "changed"
 
-# Failure confirmation: require this many consecutive frames before alerting.
-# Eliminates single-frame false positives — a real failure persists.
-FAILURE_CONFIRM_FRAMES = 3          # 3 × 30 s = 1.5 min of sustained failure before alerting
-SPAGHETTI_CONFIRM_FRAMES = 2        # spaghetti needs 2 frames — 1 min — reduces blob/stringing false alarms
+# Failure confirmation: require sustained detection before alerting, to filter
+# single-frame false positives. Calibrated in *wall-clock seconds*, not a fixed
+# frame count — at long capture intervals a fixed count (e.g. 3) silently turned
+# into many minutes (3 × 300 s = 15 min), so a real failure could end the print
+# before ever crossing the alert threshold. We convert these windows into a
+# frame count using the active capture interval (see _confirm_frames), floored
+# at 2 so a lone bad frame never alerts regardless of interval.
+FAILURE_CONFIRM_SECONDS = 90        # ~1.5 min of sustained failure before alerting
+SPAGHETTI_CONFIRM_SECONDS = 45      # spaghetti is time-critical — confirm faster
+FAILURE_CONFIRM_FRAMES = 3          # legacy default (used if interval is unknown)
+SPAGHETTI_CONFIRM_FRAMES = 2
+
+
+def _confirm_frames(window_seconds: int, interval_seconds: float) -> int:
+    """Frames needed to span ``window_seconds`` at the current capture cadence.
+
+    Floored at 2 so a single false-positive frame can never trigger an alert,
+    and capped at the legacy 30 s-frame calibration so fast intervals don't
+    demand an unreasonable streak.
+    """
+    if not interval_seconds or interval_seconds <= 0:
+        return max(2, round(window_seconds / 30))
+    return max(2, min(round(window_seconds / 30),
+                      round(window_seconds / interval_seconds)))
 
 # Startup grace period: skip failure detection while the printer warms up.
 # The bed and nozzle take ~3-5 min to reach temperature; during this time
@@ -208,6 +228,7 @@ class Monitor:
         # Failure confirmation — require consecutive frames before alerting
         self._pending_failure_type: Optional[str] = None
         self._pending_failure_count: int = 0
+        self._pending_failure_alerted: bool = False   # alert once per incident
 
         # Optional external frame source (web UI shares its capture thread).
         # When set, the loop samples this instead of opening the camera.
@@ -356,6 +377,16 @@ class Monitor:
             if self._print_active_since is None:
                 self._print_active_since = time.time()
         falling = self._printer_was_printing and not printing
+        # Log every printing-state transition so a missed completion is
+        # diagnosable from the console without reproducing under a debugger.
+        if printing != self._printer_was_printing:
+            pct = self.printer.status.progress
+            print(f"\n  [PRINTER] printing {self._printer_was_printing} → {printing}"
+                  f" (progress={pct:.0%} running={self._running}"
+                  f" seen_printing={self._seen_printer_printing})"
+                  if pct is not None else
+                  f"\n  [PRINTER] printing {self._printer_was_printing} → {printing}"
+                  f" (running={self._running} seen_printing={self._seen_printer_printing})")
         self._printer_was_printing = printing
 
         if not (falling and self._running and self._seen_printer_printing):
@@ -631,9 +662,10 @@ class Monitor:
                                 # Spaghetti is time-critical — alert on the first frame.
                                 # All other failures require consecutive confirmation.
                                 is_spaghetti = "spaghetti" in result.failure_type.lower()
-                                confirm_needed = (
-                                    SPAGHETTI_CONFIRM_FRAMES if is_spaghetti
-                                    else FAILURE_CONFIRM_FRAMES
+                                confirm_needed = _confirm_frames(
+                                    SPAGHETTI_CONFIRM_SECONDS if is_spaghetti
+                                    else FAILURE_CONFIRM_SECONDS,
+                                    interval,
                                 )
 
                                 # Track consecutive frames with the same failure type
@@ -642,6 +674,7 @@ class Monitor:
                                 else:
                                     self._pending_failure_type = result.failure_type
                                     self._pending_failure_count = 1
+                                    self._pending_failure_alerted = False
 
                                 self.status = (
                                     f"Possible failure – {result.failure_type} "
@@ -650,9 +683,11 @@ class Monitor:
                                     else f"FAILURE DETECTED – {result.failure_type}"
                                 )
 
-                                if self._pending_failure_count == confirm_needed:
+                                if (self._pending_failure_count >= confirm_needed
+                                        and not self._pending_failure_alerted):
                                     # Confirmed — alert once per incident. Do the
                                     # actual I/O (email/push/serial) outside the lock.
+                                    self._pending_failure_alerted = True
                                     self.failure_count += 1
                                     self._no_motion_count = 0
                                     confirmed_failure = True
@@ -661,6 +696,7 @@ class Monitor:
                                 # reset pending failure
                                 self._pending_failure_type = None
                                 self._pending_failure_count = 0
+                                self._pending_failure_alerted = False
                                 if near_completion:
                                     self.status = "Finishing… (near complete)"
                                 elif result.failure_type == "no_printer":
@@ -848,6 +884,7 @@ class Monitor:
         self._print_active_since = None
         self._pending_failure_type = None
         self._pending_failure_count = 0
+        self._pending_failure_alerted = False
         self._last_layer_z = None
         self._conf_sum = 0.0
         self._conf_n = 0
