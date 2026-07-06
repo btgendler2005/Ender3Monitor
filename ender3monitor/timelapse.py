@@ -111,8 +111,19 @@ class TimelapseManager:
         if self._session_dir is None:
             print("No timelapse session to compile.")
             return None
+        return self.compile_session(self._session_dir, fps=fps, output_file=output_file,
+                                     aspect=aspect, fit=fit, overlay_lines=overlay_lines)
 
-        frames = sorted(self._session_dir.glob("frame_*.jpg"))
+    def compile_session(self, session_dir, fps: int = 24, output_file: Optional[str] = None,
+                         aspect: str = "native", fit: str = "pad_blur",
+                         overlay_lines: Optional[list] = None) -> Optional[str]:
+        """Compile a specific session folder (as returned by list_sessions())."""
+        session_dir = Path(session_dir)
+        if not session_dir.is_dir():
+            print(f"No such timelapse session: {session_dir}")
+            return None
+
+        frames = sorted(session_dir.glob("frame_*.jpg"))
         if not frames:
             print("No frames found to compile.")
             return None
@@ -180,8 +191,31 @@ class TimelapseManager:
               f"({len(frames)} frames @ {fps} fps, codec {codec_used})")
 
         # Reclaim the (now redundant) frames if configured to.
-        if self.delete_frames_after_compile and self._session_dir:
-            shutil.rmtree(self._session_dir, ignore_errors=True)
+        if self.delete_frames_after_compile:
+            shutil.rmtree(session_dir, ignore_errors=True)
             print("  [TIMELAPSE] Source frames deleted after compile (MP4 kept).")
 
         return output_file
+
+    # ------------------------------------------------------------------ #
+    # Session browsing                                                     #
+    # ------------------------------------------------------------------ #
+
+    def list_sessions(self, limit: int = 3) -> list:
+        """Most-recent-first summary of on-disk session folders.
+
+        Each entry: {"path", "name", "frame_count", "last_frame"} where
+        `last_frame` is the Path to that session's final captured JPEG (or
+        None if the folder has no frames yet).
+        """
+        dirs = list(reversed(self._session_dirs()))[:max(0, limit)]
+        out = []
+        for d in dirs:
+            frames = sorted(d.glob("frame_*.jpg"))
+            out.append({
+                "path": d,
+                "name": d.name,
+                "frame_count": len(frames),
+                "last_frame": frames[-1] if frames else None,
+            })
+        return out

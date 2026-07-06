@@ -352,6 +352,70 @@ def _tg_ask(args):
     return _monitor.analyzer.ask(frame, question)
 
 
+_TIMELAPSE_LIST_SIZE = 3
+
+
+def _read_mp4_as_video_reply(mp4: str, caption: str):
+    try:
+        with open(mp4, "rb") as f:
+            blob = f.read()
+    except Exception as exc:
+        return f"Compiled but couldn't read the file: {exc}"
+    if len(blob) > 49 * 1024 * 1024:
+        return (f"Timelapse compiled ({len(blob) / 1e6:.0f} MB) but exceeds "
+                f"Telegram's 50 MB bot upload limit.\nSaved at: {mp4}")
+    return ("video", blob, caption)
+
+
+def _tg_timelapse_list(args):
+    sessions = _monitor.timelapse.list_sessions(limit=_TIMELAPSE_LIST_SIZE)
+    if not sessions:
+        return "No timelapse sessions yet."
+    items = [f"Last {len(sessions)} timelapse session(s) — "
+             f"reply `/timelapse <n>` to compile + send one:"]
+    for i, s in enumerate(sessions, start=1):
+        caption = f"{i}) {s['name']} — {s['frame_count']} frame(s)"
+        if s["last_frame"] is not None:
+            try:
+                jpeg = s["last_frame"].read_bytes()
+                items.append(("photo", jpeg, caption))
+                continue
+            except Exception:
+                pass
+        items.append(caption + " (no frames)")
+    return items
+
+
+def _tg_timelapse_pick(index: int):
+    sessions = _monitor.timelapse.list_sessions(limit=_TIMELAPSE_LIST_SIZE)
+    if not (1 <= index <= len(sessions)):
+        return f"No session #{index}. Run /timelapse list to see the available ones."
+    session = sessions[index - 1]
+    mp4 = _monitor.compile_timelapse_session(session["path"])
+    if not mp4:
+        return f"Session {session['name']} has no frames to compile."
+    return _read_mp4_as_video_reply(mp4, f"Timelapse — {session['name']}")
+
+
+def _tg_timelapse(args):
+    """/timelapse           → current/most-recent session, compiled + sent as video
+       /timelapse list      → last few sessions with a thumbnail of each's final frame
+       /timelapse <n>       → compile + send the n-th session from that list
+    """
+    if _monitor is None:
+        return "Not ready."
+    sub = args[0].lower() if args else ""
+    if sub == "list":
+        return _tg_timelapse_list(args)
+    if sub.isdigit():
+        return _tg_timelapse_pick(int(sub))
+
+    mp4 = _monitor.compile_timelapse()
+    if not mp4:
+        return "No timelapse frames yet — start monitoring a print first."
+    return _read_mp4_as_video_reply(mp4, "Timelapse")
+
+
 def _build_telegram_handlers():
     handlers = {
         "status":   (_tg_status,   "current status + temps + progress"),
@@ -365,6 +429,8 @@ def _build_telegram_handlers():
         "stop":     (_tg_stop,     "stop monitoring"),
         "maintenance": (_tg_maintenance, "print hours + upkeep status"),
         "autostart": (_tg_autostart, "auto-start on print: /autostart on|off"),
+        "timelapse": (_tg_timelapse, "compile + send the timelapse so far; "
+                                     "/timelapse list or /timelapse <n> for older ones"),
     }
 
     def _help(args):

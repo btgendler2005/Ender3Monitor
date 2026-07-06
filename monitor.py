@@ -963,6 +963,13 @@ class Monitor:
             print(f"  Saved: {result}")
         return result
 
+    def compile_timelapse_session(self, session_dir) -> Optional[str]:
+        print(f"  Compiling timelapse session {session_dir}…")
+        result = self.timelapse.compile_session(session_dir, **self._timelapse_compile_kwargs())
+        if result:
+            print(f"  Saved: {result}")
+        return result
+
 
 # ------------------------------------------------------------------ #
 # Terminal UI helpers                                                   #
