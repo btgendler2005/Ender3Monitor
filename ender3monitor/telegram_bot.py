@@ -15,6 +15,8 @@ Handler protocol — each handler is (func, description) where func(args: list[s
 returns either:
   • a str                       → sent as a text reply
   • ("photo", jpeg_bytes, str)  → sent as a photo with a caption
+  • ("video", mp4_bytes, str)   → sent as a video with a caption
+  • a list of any of the above  → sent as a sequence of messages/media
 """
 from __future__ import annotations
 
@@ -24,9 +26,10 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Callable, Dict, Optional, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
-HandlerResult = Union[str, Tuple[str, bytes, str]]
+HandlerItem = Union[str, Tuple[str, bytes, str]]
+HandlerResult = Union[HandlerItem, List[HandlerItem]]
 Handler = Callable[[list], HandlerResult]
 
 _API = "https://api.telegram.org/bot{token}/{method}"
@@ -112,12 +115,23 @@ class TelegramBot:
             self.send_message(chat_id, f"⚠️ /{cmd} failed: {exc}")
             return
 
+        items = result if isinstance(result, list) else [result]
+        for item in items:
+            self._send_result_item(chat_id, item)
+
+    def _send_result_item(self, chat_id: int, result) -> None:
         if isinstance(result, tuple) and result and result[0] == "photo":
             _, jpeg, caption = result
             if jpeg:
                 self.send_photo(chat_id, jpeg, caption)
             else:
                 self.send_message(chat_id, caption or "No image available.")
+        elif isinstance(result, tuple) and result and result[0] == "video":
+            _, mp4, caption = result
+            if mp4:
+                self.send_video(chat_id, mp4, caption)
+            else:
+                self.send_message(chat_id, caption or "No video available.")
         elif result:
             self.send_message(chat_id, str(result))
 
@@ -172,5 +186,35 @@ class TelegramBot:
                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
             )
             urllib.request.urlopen(req, timeout=20).read()
+        except Exception:
+            pass
+
+    def send_video(self, chat_id: int, mp4: bytes, caption: str = "") -> None:
+        try:
+            url = _API.format(token=self.token, method="sendVideo")
+            boundary = "----E3M" + uuid.uuid4().hex
+            crlf = b"\r\n"
+            body = b""
+
+            def field(name: str, value: str) -> bytes:
+                return (f'--{boundary}\r\nContent-Disposition: form-data; '
+                        f'name="{name}"\r\n\r\n{value}\r\n').encode()
+
+            body += field("chat_id", str(chat_id))
+            if caption:
+                body += field("caption", caption)
+            body += (f'--{boundary}\r\nContent-Disposition: form-data; '
+                     f'name="video"; filename="timelapse.mp4"\r\n'
+                     f'Content-Type: video/mp4\r\n\r\n').encode()
+            body += mp4 + crlf
+            body += f"--{boundary}--\r\n".encode()
+
+            req = urllib.request.Request(
+                url, data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+            # Large uploads over a slow uplink take a while; give it more room
+            # than the photo/message calls.
+            urllib.request.urlopen(req, timeout=120).read()
         except Exception:
             pass
