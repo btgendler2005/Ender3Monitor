@@ -126,6 +126,16 @@ class PrinterController:
         self.status = PrinterStatus()
         self._refresh_count = 0   # paces the slow M78 statistics query
 
+        # Stall watchdog: some USB-serial adapters wedge a blocking read past
+        # its configured timeout (observed in the field — readline() never
+        # returned instead of erroring after ~2-4s), which freezes every poll
+        # forever since Python can't interrupt a blocked thread from outside.
+        # _call_started_at marks an in-flight send(); a separate watchdog
+        # thread force-closes the port if one runs suspiciously long.
+        self._call_started_at: Optional[float] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
+        self._watchdog_stop: Optional[threading.Event] = None
+
     # ------------------------------------------------------------------ #
     # Connection                                                           #
     # ------------------------------------------------------------------ #
@@ -174,6 +184,67 @@ class PrinterController:
         return self.status.connected and self._serial is not None
 
     # ------------------------------------------------------------------ #
+    # Stall watchdog                                                       #
+    # ------------------------------------------------------------------ #
+
+    def watchdog_tick(self, stall_seconds: float = 20.0) -> bool:
+        """Force-close the port if a send() call has been stuck this long.
+
+        Deliberately does NOT take `self._lock` — the whole point is to
+        break a call that's wedged while holding it. Reads/writes `_serial`
+        without the lock, which is an intentional, accepted race: the
+        alternative is a poll thread stuck forever inside a blocking read
+        that never honors its own timeout (seen in the field with some
+        USB-serial adapters). Closing the fd out from under that call
+        typically makes the blocked read error out, freeing the poll thread
+        to notice the disconnect and reconnect on its next cycle.
+
+        Returns True if it force-closed a stalled connection.
+        """
+        started = self._call_started_at
+        if started is None or (time.time() - started) < stall_seconds:
+            return False
+        ser = self._serial
+        self._serial = None
+        self.status.connected = False
+        self.status.last_error = f"Serial call stalled >{stall_seconds:.0f}s — watchdog force-closed the port"
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+        try:
+            from ender3monitor import ops_metrics as _ops
+            _ops.printer_watchdog_stalls_total.inc()
+        except Exception:
+            pass
+        return True
+
+    def start_watchdog(self, stall_seconds: float = 20.0, check_interval: float = 5.0) -> None:
+        """Start the background thread that runs watchdog_tick() periodically.
+
+        Idempotent — safe to call more than once (e.g. from tests or a
+        restart path); later calls are no-ops while a watchdog is running.
+        """
+        if self._watchdog_thread is not None:
+            return
+        self._watchdog_stop = threading.Event()
+
+        def _loop() -> None:
+            while not self._watchdog_stop.wait(check_interval):
+                self.watchdog_tick(stall_seconds)
+
+        self._watchdog_thread = threading.Thread(target=_loop, daemon=True)
+        self._watchdog_thread.start()
+
+    def stop_watchdog(self) -> None:
+        if self._watchdog_thread is None:
+            return
+        self._watchdog_stop.set()
+        self._watchdog_thread.join(timeout=2)
+        self._watchdog_thread = None
+
+    # ------------------------------------------------------------------ #
     # Low-level command exchange                                           #
     # ------------------------------------------------------------------ #
 
@@ -185,6 +256,7 @@ class PrinterController:
         """
         if not self.connected:
             return ""
+        self._call_started_at = time.time()   # cleared in `finally`; watchdog polls this
         try:
             with self._lock:
                 self._serial.reset_input_buffer()
@@ -211,6 +283,8 @@ class PrinterController:
             except Exception:
                 pass
             return ""
+        finally:
+            self._call_started_at = None
 
     # ------------------------------------------------------------------ #
     # Status queries                                                       #

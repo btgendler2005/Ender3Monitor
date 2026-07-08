@@ -274,6 +274,11 @@ class Monitor:
         else:
             print(f"  Printer not connected: {self.printer.status.last_error}")
             print("  Will keep retrying in the background…")
+        # Some USB-serial adapters wedge a blocking read past its own
+        # timeout, freezing the poll thread forever (field-observed). The
+        # watchdog runs on its own thread so it can force-close the port and
+        # unstick a stall even though the poll thread itself is unresponsive.
+        self.printer.start_watchdog()
         self._printer_poll_thread = threading.Thread(
             target=self._printer_poll_loop, daemon=True
         )
@@ -522,6 +527,7 @@ class Monitor:
         self._printer_poll_stop.set()
         if self._printer_poll_thread and self._printer_poll_thread.is_alive():
             self._printer_poll_thread.join(timeout=2)
+        self.printer.stop_watchdog()
         self.printer.disconnect()
 
     # ------------------------------------------------------------------ #

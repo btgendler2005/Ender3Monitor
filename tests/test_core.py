@@ -6,6 +6,7 @@ Covers the pure-logic layer only — no camera, no printer serial, no network.
 """
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -142,6 +143,41 @@ def test_query_progress_completion(resp, printing, progress):
         assert pc.status.progress in (None, pc.status.progress)  # unchanged/None ok
     else:
         assert pc.status.progress == progress
+
+
+# ── printer: stall watchdog ──────────────────────────────────────────────────
+
+class _DummySerial:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_watchdog_tick_ignores_no_call_in_flight():
+    pc = PrinterController(port="")
+    assert pc.watchdog_tick(stall_seconds=20) is False
+
+
+def test_watchdog_tick_ignores_call_within_budget():
+    pc = PrinterController(port="")
+    pc._call_started_at = time.time() - 2   # well under the 20s budget
+    assert pc.watchdog_tick(stall_seconds=20) is False
+
+
+def test_watchdog_tick_force_closes_stalled_call():
+    pc = PrinterController(port="")
+    pc.status.connected = True
+    dummy = _DummySerial()
+    pc._serial = dummy
+    pc._call_started_at = time.time() - 25   # past the 20s budget
+
+    assert pc.watchdog_tick(stall_seconds=20) is True
+    assert dummy.closed is True
+    assert pc._serial is None
+    assert pc.status.connected is False
+    assert pc.connected is False
 
 
 @pytest.mark.parametrize("window, interval, expected", [
