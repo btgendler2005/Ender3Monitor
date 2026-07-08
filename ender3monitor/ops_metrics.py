@@ -47,6 +47,10 @@ camera_frames_total = Counter(
 printer_connected = Gauge("e3m_printer_connected", "1 if the printer is connected over USB")
 printer_reconnects_total = Counter("e3m_printer_reconnects_total", "Printer USB reconnects")
 printer_serial_errors_total = Counter("e3m_printer_serial_errors_total", "Serial command failures")
+printer_watchdog_stalls_total = Counter(
+    "e3m_printer_watchdog_stalls_total",
+    "Times the watchdog force-closed a serial port stuck in a blocking read past its timeout",
+)
 
 # ── Printer telemetry (physical state, updated each poll) ─────────────────────
 printer_nozzle_temp = Gauge("e3m_printer_nozzle_temp_celsius", "Nozzle temperature (°C)")

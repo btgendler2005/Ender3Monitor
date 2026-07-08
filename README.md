@@ -350,6 +350,7 @@ Served from the same `:8000/metrics` endpoint, visualised by `web_dashboard.json
 | `e3m_camera_frames_total{result}` | Counter | Stream frames captured (ok/fail) |
 | `e3m_printer_connected` | Gauge | `1` if the printer is connected over USB |
 | `e3m_printer_reconnects_total` / `e3m_printer_serial_errors_total` | Counter | USB reconnects / serial errors |
+| `e3m_printer_watchdog_stalls_total` | Counter | Times the watchdog force-closed a port stuck in a blocking read past its timeout |
 | `e3m_ws_clients` | Gauge | Connected dashboard websocket clients |
 | `e3m_telegram_commands_total{command}` | Counter | Telegram commands handled |
 | `e3m_push_notifications_total{channel,result}` | Counter | Push notifications sent |
