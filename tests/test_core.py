@@ -23,7 +23,10 @@ from ender3monitor.printer import (
     _M78_TOTAL_RE, _POS_RE, _PRINTTIME_RE, _SD_RE, _TEMP_RE, _fmt_duration,
     PrinterController,
 )
-from monitor import _frames_differ, _confirm_frames
+from monitor import (
+    _frames_differ, _confirm_frames, _progress_stuck_since,
+    STUCK_AT_COMPLETION_PCT, STUCK_AT_COMPLETION_SECONDS,
+)
 
 
 # ── analyzer: failure-type normalization ────────────────────────────────────
@@ -155,6 +158,39 @@ def test_confirm_frames_scales_with_interval(window, interval, expected):
 def test_confirm_frames_never_below_two():
     # A single bad frame must never alert, no matter how long the interval.
     assert _confirm_frames(45, 99999) == 2
+
+
+# ── stuck-at-completion fallback: firmware that never falls out of "printing" ─
+
+def test_progress_stuck_since_starts_window_at_threshold():
+    # Not yet at the threshold — no window started.
+    assert _progress_stuck_since(None, True, 0.5, now=100.0) is None
+    # Crossing the threshold starts the window at `now`.
+    assert _progress_stuck_since(None, True, STUCK_AT_COMPLETION_PCT, now=100.0) == 100.0
+
+
+def test_progress_stuck_since_holds_start_time_while_pinned():
+    # Once started, the window's start time doesn't reset while still pinned.
+    since = _progress_stuck_since(100.0, True, 1.0, now=150.0)
+    assert since == 100.0
+
+
+def test_progress_stuck_since_resets_when_not_printing_or_below_threshold():
+    assert _progress_stuck_since(100.0, False, 1.0, now=150.0) is None
+    assert _progress_stuck_since(100.0, True, 0.9, now=150.0) is None
+    assert _progress_stuck_since(100.0, True, None, now=150.0) is None
+
+
+def test_progress_stuck_triggers_completion_after_timeout():
+    # Mirrors the `stuck` computation in Monitor._check_printer_completion.
+    since = _progress_stuck_since(None, True, 1.0, now=0.0)
+    assert since == 0.0
+
+    just_before = STUCK_AT_COMPLETION_SECONDS - 1
+    assert (just_before - since) < STUCK_AT_COMPLETION_SECONDS
+
+    at_timeout = STUCK_AT_COMPLETION_SECONDS
+    assert (at_timeout - since) >= STUCK_AT_COMPLETION_SECONDS
 
 
 def test_m31_duration_forms():
