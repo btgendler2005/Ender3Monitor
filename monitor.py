@@ -87,6 +87,27 @@ STARTUP_GRACE_SECONDS = 300         # ~5 min warm-up window (converted to frames
 # that looks like stopped-extrusion. Suppress failure flagging past this %.
 COMPLETION_SUPPRESS_PCT = 0.97
 
+# Some firmware/boards never send "Not SD printing" or "Done printing" once a
+# print actually finishes — M27 just keeps echoing the final "byte N/N" line
+# forever, so the printing flag's falling edge never arrives. If progress has
+# been pinned at/near 100% this long while `printing` is still (allegedly)
+# True, force completion rather than getting stuck in "Finishing…" forever.
+STUCK_AT_COMPLETION_PCT = 0.999
+STUCK_AT_COMPLETION_SECONDS = 120
+
+
+def _progress_stuck_since(current_since: Optional[float], printing: bool,
+                           progress: Optional[float], now: float) -> Optional[float]:
+    """Track how long progress has been pinned near 100% while still "printing".
+
+    Returns the timestamp progress first reached the threshold (unchanged
+    while it stays pinned), or None once it drops below the threshold or
+    printing stops — resetting the window.
+    """
+    if printing and progress is not None and progress >= STUCK_AT_COMPLETION_PCT:
+        return current_since if current_since is not None else now
+    return None
+
 
 def _frames_differ(f1: np.ndarray, f2: np.ndarray, threshold: float = MOTION_THRESHOLD) -> bool:
     """Return True if the two frames differ significantly (motion / print activity)."""
@@ -214,6 +235,7 @@ class Monitor:
         self._seen_printer_printing: bool = False  # saw an active SD/USB print
         self._printer_was_printing: bool = False   # previous poll's printing state
         self._print_active_since: Optional[float] = None  # when printing/motion first seen
+        self._high_progress_since: Optional[float] = None  # when progress first pinned near 100%
 
         # Layer-synced timelapse (driven by the printer Z poller)
         self._timelapse_layer_mode: bool = False
@@ -372,10 +394,21 @@ class Monitor:
         time the part may already be off the bed (empty-bed "final photo").
         """
         printing = bool(self.printer.status.printing)
+        progress = self.printer.status.progress
         if self._running and printing:
             self._seen_printer_printing = True
             if self._print_active_since is None:
                 self._print_active_since = time.time()
+
+        # Safety net for firmware that never reports "Not SD printing"/"Done
+        # printing" once the job truly ends (see STUCK_AT_COMPLETION_* above).
+        self._high_progress_since = _progress_stuck_since(
+            self._high_progress_since, printing, progress, time.time())
+        stuck = (
+            self._high_progress_since is not None
+            and (time.time() - self._high_progress_since) >= STUCK_AT_COMPLETION_SECONDS
+        )
+
         falling = self._printer_was_printing and not printing
         # Log every printing-state transition so a missed completion is
         # diagnosable from the console without reproducing under a debugger.
@@ -389,7 +422,7 @@ class Monitor:
                   f" (running={self._running} seen_printing={self._seen_printer_printing})")
         self._printer_was_printing = printing
 
-        if not (falling and self._running and self._seen_printer_printing):
+        if not ((falling or stuck) and self._running and self._seen_printer_printing):
             return
 
         # Grab the final frame NOW, while the finished part is still on the bed.
@@ -405,7 +438,12 @@ class Monitor:
             self.status = "Print Complete"
             self._running = False
         self._stop_event.set()   # wake the analysis loop so it exits promptly
-        print("\n  ✓ Print complete (reported by printer).")
+        if stuck and not falling:
+            print(f"\n  ✓ Print complete (progress pinned at {progress:.0%} for "
+                  f"{STUCK_AT_COMPLETION_SECONDS}s — printer never reported "
+                  "end-of-print, forcing completion).")
+        else:
+            print("\n  ✓ Print complete (reported by printer).")
 
         # Heavy I/O (email, timelapse compile, Telegram video) runs on its own
         # thread so this poll loop keeps polling temps without a long stall.
@@ -882,6 +920,7 @@ class Monitor:
         self._seen_printer_printing = False
         self._printer_was_printing = False
         self._print_active_since = None
+        self._high_progress_since = None
         self._pending_failure_type = None
         self._pending_failure_count = 0
         self._pending_failure_alerted = False
