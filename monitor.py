@@ -237,6 +237,10 @@ class Monitor:
         self._print_active_since: Optional[float] = None  # when printing/motion first seen
         self._high_progress_since: Optional[float] = None  # when progress first pinned near 100%
 
+        # M600 color/filament-change alert — latched per pause episode so a
+        # multi-color print's later M600s each re-alert once resumed between them.
+        self._color_change_alerted: bool = False
+
         # Layer-synced timelapse (driven by the printer Z poller)
         self._timelapse_layer_mode: bool = False
         self._last_layer_z: Optional[float] = None
@@ -342,6 +346,7 @@ class Monitor:
                 self._maybe_auto_start()        # begin monitoring on print start
                 self._maybe_capture_layer_frame()
                 self._check_printer_completion()  # falling-edge finish at 5 s cadence
+                self._check_color_change()      # M600 filament/color-change alert
             elif ticks % reconnect_ticks == 0:
                 self.printer.connect()          # quiet retry; logged on transition below
 
@@ -455,6 +460,43 @@ class Monitor:
         threading.Thread(
             target=self._send_completion, args=(frame,), daemon=True
         ).start()
+
+    def _check_color_change(self) -> None:
+        """Alert when the printer pauses mid-print for an M600 color/filament
+        change (see `PrinterController._note_pause_marker`). Runs unconditionally
+        in the 5 s poll loop — independent of whether a camera-monitoring
+        session is active — so the alert fires even if this app's AI analysis
+        was never started for the current print.
+        """
+        paused = bool(self.printer.status.filament_change_pause)
+        if paused and not self._color_change_alerted:
+            self._color_change_alerted = True
+            print("\n  [PRINTER] Paused for filament/color change (M600).")
+            if self._running:
+                with self._lock:
+                    self.status = "Paused – change filament (M600)"
+            self.events.append({
+                "t": time.time(), "type": "color_change", "conf": None,
+                "desc": "Printer paused for a filament/color change (M600)",
+                "detected": True,
+            })
+            try:
+                ops.printer_color_changes_total.inc()
+            except Exception:
+                pass
+            if self.push.enabled:
+                self.push.send(
+                    title="🎨 Time to change filament",
+                    message="The printer hit an M600 and is waiting — swap "
+                             "filament/color and resume when ready.",
+                    priority="high",
+                )
+        elif not paused and self._color_change_alerted:
+            self._color_change_alerted = False
+            print("\n  [PRINTER] Filament/color change resumed.")
+            if self._running:
+                with self._lock:
+                    self.status = "Monitoring…"
 
     def _warmup_gate(self):
         """Decide whether to skip analysis during warmup.
@@ -614,6 +656,9 @@ class Monitor:
                     near_completion = bool(
                         pr and pr.progress is not None and pr.progress >= COMPLETION_SUPPRESS_PCT
                     )
+                    # An M600 pause also parks the head and halts extrusion — expected
+                    # behavior, not a failure. Suppress flagging while waiting on it.
+                    color_change_pause = bool(pr and pr.filament_change_pause)
 
                     # ── Camera motion completion (fallback only) ──────────── #
                     # Used only when the printer can't tell us (no USB / not reporting
@@ -701,6 +746,8 @@ class Monitor:
                                 and result.failure_type not in ("no_printer", "none")
                                 # Don't flag a "gap" failure when the print is basically done
                                 and not near_completion
+                                # ...or when it's parked for an M600 color change
+                                and not color_change_pause
                             )
                             if is_failure:
                                 # Spaghetti is time-critical — alert on the first frame.
@@ -741,7 +788,9 @@ class Monitor:
                                 self._pending_failure_type = None
                                 self._pending_failure_count = 0
                                 self._pending_failure_alerted = False
-                                if near_completion:
+                                if color_change_pause:
+                                    self.status = "Paused – change filament (M600)"
+                                elif near_completion:
                                     self.status = "Finishing… (near complete)"
                                 elif result.failure_type == "no_printer":
                                     self.status = "Monitoring… (no printer in frame)"

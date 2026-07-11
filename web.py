@@ -257,6 +257,8 @@ def _printer_status_lines() -> list:
     def t(v, tgt):
         return "—" if v is None else f"{round(v)}°" + (f"/{round(tgt)}°" if tgt else "")
     lines = [f"Nozzle: {t(pr.nozzle_temp, pr.nozzle_target)}   Bed: {t(pr.bed_temp, pr.bed_target)}"]
+    if pr.filament_change_pause:
+        lines.append("🎨 Paused — change filament (M600)")
     if pr.printing and pr.progress is not None:
         d = pr.as_dict()
         extra = []
@@ -1053,6 +1055,8 @@ header{
 .pill-fail .dot{background:var(--red);animation:blink .8s ease-in-out infinite}
 .pill-done  {background:rgba(34,197,94,.12);color:var(--green)}
 .pill-done .dot{background:var(--green)}
+.pill-pause {background:rgba(251,191,36,.12);color:var(--amber)}
+.pill-pause .dot{background:var(--amber);animation:blink 1.2s ease-in-out infinite}
 
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
 
@@ -1634,15 +1638,21 @@ function render(d) {
     document.getElementById('temp-nozzle').textContent = fmt(p.nozzle_temp, p.nozzle_target);
     document.getElementById('temp-bed').textContent    = fmt(p.bed_temp, p.bed_target);
     const prog = document.getElementById('printer-progress');
-    if (p.printing && p.progress != null) {
+    if (p.filament_change_pause) {
+      prog.textContent = '🎨 Paused — change filament (M600)';
+      prog.style.color = 'var(--amber)';
+    } else if (p.printing && p.progress != null) {
       const parts = [(p.progress * 100).toFixed(1) + '%'];
       if (p.elapsed_str)   parts.push(p.elapsed_str + ' elapsed');
       if (p.remaining_str) parts.push('~' + p.remaining_str + ' left');
       prog.textContent = parts.join('  ·  ');
+      prog.style.color = 'var(--muted)';
     } else if (p.printing) {
       prog.textContent = 'Printing…';
+      prog.style.color = 'var(--muted)';
     } else {
       prog.textContent = p.port ? 'Idle · ' + p.port : 'Idle';
+      prog.style.color = 'var(--muted)';
     }
   } else {
     pb.style.display = 'none';
@@ -1665,6 +1675,7 @@ function pillClass(s) {
   const l = s.toLowerCase();
   if (l.includes('failure') || l.includes('detected')) return 'pill-fail';
   if (l.includes('complete'))                            return 'pill-done';
+  if (l.includes('paused') || l.includes('change filament')) return 'pill-pause';
   if (l.includes('monitor') || l.includes('analyz'))    return 'pill-run';
   return 'pill-idle';
 }

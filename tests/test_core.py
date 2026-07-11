@@ -6,7 +6,9 @@ Covers the pure-logic layer only — no camera, no printer serial, no network.
 """
 import json
 import sys
+import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -25,7 +27,7 @@ from ender3monitor.printer import (
     PrinterController,
 )
 from monitor import (
-    _frames_differ, _confirm_frames, _progress_stuck_since,
+    Monitor, _frames_differ, _confirm_frames, _progress_stuck_since,
     STUCK_AT_COMPLETION_PCT, STUCK_AT_COMPLETION_SECONDS,
 )
 
@@ -178,6 +180,32 @@ def test_watchdog_tick_force_closes_stalled_call():
     assert pc._serial is None
     assert pc.status.connected is False
     assert pc.connected is False
+
+
+# ── printer: M600 color/filament-change pause detection ─────────────────────
+
+def test_note_pause_marker_sets_and_clears_with_hysteresis():
+    pc = PrinterController(port="")
+    assert pc.status.filament_change_pause is False
+
+    pc._note_pause_marker("echo:busy: paused for user")
+    assert pc.status.filament_change_pause is True
+
+    # A single clean reply isn't proof the pause ended (busy ping is only
+    # sent every ~2s and could simply have landed outside this window).
+    pc._note_pause_marker("ok T:200.0 /200.0 B:60.0 /60.0")
+    assert pc.status.filament_change_pause is True
+
+    # A second clean reply in a row clears it.
+    pc._note_pause_marker("ok T:200.0 /200.0 B:60.0 /60.0")
+    assert pc.status.filament_change_pause is False
+
+
+def test_note_pause_marker_empty_reply_proves_nothing():
+    pc = PrinterController(port="")
+    pc.status.filament_change_pause = True
+    pc._note_pause_marker("")   # timed out entirely — not evidence of resume
+    assert pc.status.filament_change_pause is True
 
 
 @pytest.mark.parametrize("window, interval, expected", [
@@ -461,3 +489,71 @@ def test_first_layer_mode_toggle_in_schema():
     from ender3monitor.settings import SCHEMA
     assert SCHEMA["first_layer_mode"]["type"] == "bool"
     assert SCHEMA["first_layer_mode"]["default"] is True   # on by default (current behavior)
+
+
+# ── monitor: M600 color/filament-change alert ────────────────────────────────
+
+class _FakePush:
+    def __init__(self):
+        self.enabled = True
+        self.sent = []
+
+    def send(self, title, message, priority="default"):
+        self.sent.append((title, message, priority))
+
+
+class _FakePrinterStatus:
+    filament_change_pause = False
+
+
+class _FakePrinter:
+    def __init__(self):
+        self.status = _FakePrinterStatus()
+
+
+class _FakeMonitorForColorChange:
+    """Bare object exposing only what Monitor._check_color_change touches —
+    building a real Monitor needs a full Config/camera/analyzer stack."""
+    def __init__(self):
+        self.printer = _FakePrinter()
+        self.push = _FakePush()
+        self._color_change_alerted = False
+        self._running = True
+        self.status = "Monitoring…"
+        self._lock = threading.Lock()
+        self.events = deque(maxlen=50)
+
+
+def test_check_color_change_alerts_once_per_pause_episode():
+    m = _FakeMonitorForColorChange()
+
+    m.printer.status.filament_change_pause = True
+    Monitor._check_color_change(m)
+    assert m._color_change_alerted is True
+    assert len(m.push.sent) == 1
+    assert m.status == "Paused – change filament (M600)"
+    assert len(m.events) == 1 and m.events[0]["type"] == "color_change"
+
+    # Still paused on the next poll — must not re-alert.
+    Monitor._check_color_change(m)
+    assert len(m.push.sent) == 1
+
+    # Resumed — clears the latch and restores status.
+    m.printer.status.filament_change_pause = False
+    Monitor._check_color_change(m)
+    assert m._color_change_alerted is False
+    assert m.status == "Monitoring…"
+
+    # A later M600 in the same (multi-color) print alerts again.
+    m.printer.status.filament_change_pause = True
+    Monitor._check_color_change(m)
+    assert len(m.push.sent) == 2
+
+
+def test_check_color_change_skips_push_when_disabled():
+    m = _FakeMonitorForColorChange()
+    m.push.enabled = False
+    m.printer.status.filament_change_pause = True
+    Monitor._check_color_change(m)
+    assert m._color_change_alerted is True
+    assert m.push.sent == []
