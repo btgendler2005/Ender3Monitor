@@ -15,6 +15,7 @@ Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, f
 - **Frame pre-validation** — OpenCV checks brightness, contrast, and edge density before sending to AI; rejects dark, covered, or off-target frames without burning API calls
 - **Print completion detection** — uses the printer's own status over USB when available (stops exactly when the print finishes); falls back to camera stillness (4 consecutive still frames) when no printer is connected
 - **Printer control over USB** — live nozzle/bed temps, print progress and time remaining, auto-pause/cooldown on a confirmed failure, and manual pause/resume/cooldown/e-stop from the dashboard
+- **M600 color-change alerts** — detects when the printer pauses mid-print for an embedded filament/color change and pushes a notification, independent of whether AI monitoring is running; suppresses false failure flags while parked waiting for the swap
 - **Hands-off start** — auto-starts monitoring when the printer begins a print (USB), and gates warmup on real signals (waits until printing has started and heaters are at target) instead of a fixed timer; falls back to a timer without USB
 - **First-layer inspection** — analyzes more frequently with an adhesion/squish focus during the failure-prone first layer (uses USB Z height)
 - **Layer-synced timelapse** — captures one frame per layer (via USB Z) for a smooth, consistent timelapse; falls back to time-based without USB
@@ -335,6 +336,8 @@ Updated every poll while the printer is connected over USB (NaN when unknown), v
 | `e3m_printer_printing` | Gauge | `1` while a print is active |
 | `e3m_printer_elapsed_seconds` / `e3m_printer_remaining_seconds` | Gauge | Elapsed / estimated remaining print time |
 | `e3m_printer_lifetime_seconds` | Gauge | Lifetime print time from firmware EEPROM (M78) |
+| `e3m_printer_filament_change_pause` | Gauge | `1` while paused for a filament/color change (M600) |
+| `e3m_printer_color_changes_total` | Counter | M600 color/filament changes detected mid-print |
 
 ### Operational / SRE metrics
 

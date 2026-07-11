@@ -63,6 +63,10 @@ printer_printing = Gauge("e3m_printer_printing", "1 while a print is active")
 printer_elapsed_seconds = Gauge("e3m_printer_elapsed_seconds", "Elapsed print time (s)")
 printer_remaining_seconds = Gauge("e3m_printer_remaining_seconds", "Estimated remaining print time (s)")
 printer_lifetime_seconds = Gauge("e3m_printer_lifetime_seconds", "Lifetime print time from EEPROM (s)")
+printer_filament_change_pause = Gauge(
+    "e3m_printer_filament_change_pause", "1 while paused for a filament/color change (M600)")
+printer_color_changes_total = Counter(
+    "e3m_printer_color_changes_total", "M600 color/filament changes detected mid-print")
 
 _NAN = float("nan")
 
@@ -75,6 +79,7 @@ def update_printer(status) -> None:
 
     printer_connected.set(1 if status.connected else 0)
     printer_printing.set(1 if status.printing else 0)
+    printer_filament_change_pause.set(1 if status.filament_change_pause else 0)
     g(printer_nozzle_temp, status.nozzle_temp)
     g(printer_nozzle_target, status.nozzle_target)
     g(printer_bed_temp, status.bed_temp)

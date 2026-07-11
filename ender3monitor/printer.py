@@ -43,6 +43,14 @@ _M78_TOTAL_RE = re.compile(
     r"Total time:\s*(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?",
     re.IGNORECASE,
 )
+# Marlin has no dedicated "M600 happened" reply — but while it's blocked waiting
+# on the user (filament/color change, or any other M0/M1-style pause), its
+# default-on HOST_KEEPALIVE_FEATURE re-sends this line every ~2s so the host
+# doesn't think the connection died. Since gcode processing is fully stalled
+# during that wait, it also rides along as unsolicited text inside whatever
+# poll command's reply window happens to be open when it's sent (see `send()`).
+# Mid-print, this is effectively always an embedded M600 color change.
+_PAUSED_FOR_USER_RE = re.compile(r"paused for user", re.IGNORECASE)
 
 
 def _fmt_duration(seconds: Optional[int]) -> Optional[str]:
@@ -70,6 +78,7 @@ class PrinterStatus:
     remaining_seconds: Optional[int] = None # estimated, from elapsed + progress
     z_height: Optional[float] = None        # current nozzle Z (M114), for first-layer / layer-timelapse
     lifetime_print_seconds: Optional[int] = None  # firmware EEPROM total (M78)
+    filament_change_pause: bool = False     # printer is blocked waiting on the user (M600 etc.)
 
     last_error: Optional[str] = None
 
@@ -87,6 +96,7 @@ class PrinterStatus:
             "remaining_seconds": self.remaining_seconds,
             "z_height": self.z_height,
             "lifetime_print_seconds": self.lifetime_print_seconds,
+            "filament_change_pause": self.filament_change_pause,
             "elapsed_str": _fmt_duration(self.elapsed_seconds),
             "remaining_str": _fmt_duration(self.remaining_seconds),
             "lifetime_str": _fmt_duration(self.lifetime_print_seconds),
@@ -125,6 +135,10 @@ class PrinterController:
         self._lock = threading.Lock()
         self.status = PrinterStatus()
         self._refresh_count = 0   # paces the slow M78 statistics query
+        # Hysteresis for clearing filament_change_pause: the busy-keepalive line
+        # only arrives every ~2s, so a single reply window without it doesn't
+        # prove the pause ended — require a couple of clean replies in a row.
+        self._pause_clear_streak = 0
 
         # Stall watchdog: some USB-serial adapters wedge a blocking read past
         # its configured timeout (observed in the field — readline() never
@@ -273,7 +287,9 @@ class PrinterController:
                         lines.append(line)
                     if line.startswith("ok") or line.lower().startswith("ok"):
                         break
-            return "\n".join(lines)
+            resp = "\n".join(lines)
+            self._note_pause_marker(resp)
+            return resp
         except Exception as exc:
             self.status.last_error = f"Serial write failed: {exc}"
             self.status.connected = False
@@ -285,6 +301,24 @@ class PrinterController:
             return ""
         finally:
             self._call_started_at = None
+
+    def _note_pause_marker(self, resp: str) -> None:
+        """Latch/clear filament_change_pause from a raw serial reply.
+
+        Set the instant we see the busy-keepalive line; only clear after a
+        couple of marker-free, non-empty replies in a row, since a single quiet
+        window doesn't prove the printer stopped waiting (see the field note
+        above `_PAUSED_FOR_USER_RE`) — an empty (timed-out) reply proves nothing
+        either way and is ignored.
+        """
+        if _PAUSED_FOR_USER_RE.search(resp):
+            self.status.filament_change_pause = True
+            self._pause_clear_streak = 0
+        elif resp and self.status.filament_change_pause:
+            self._pause_clear_streak += 1
+            if self._pause_clear_streak >= 2:
+                self.status.filament_change_pause = False
+                self._pause_clear_streak = 0
 
     # ------------------------------------------------------------------ #
     # Status queries                                                       #
