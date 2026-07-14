@@ -13,6 +13,7 @@ import asyncio
 import base64
 import json
 import logging
+import multiprocessing as mp
 import os
 import secrets
 import signal
@@ -20,10 +21,12 @@ import threading
 import time
 import traceback
 from contextlib import asynccontextmanager
+from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from typing import Optional, Set
 
 import cv2
+import numpy as np
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response, JSONResponse, StreamingResponse, FileResponse
@@ -34,11 +37,16 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ender3monitor")
 
 from ender3monitor.camera import CameraManager
+from ender3monitor.camera_worker import capture_worker
 from ender3monitor.config import Config
 from ender3monitor.telegram_bot import TelegramBot
 from ender3monitor.settings import Settings
 from ender3monitor import ops_metrics as ops
 from monitor import Monitor, _FLIP_STR_TO_CODE
+
+# "spawn" (not "fork") gives the capture worker a genuinely fresh interpreter —
+# and, critically on macOS, a fresh AVFoundation session. See camera_worker.py.
+_MP_CTX = mp.get_context("spawn")
 
 # ── global state ──────────────────────────────────────────────────────────────
 
@@ -61,13 +69,21 @@ _STREAM_HEIGHT = int(os.getenv("STREAM_HEIGHT", "720"))
 class StreamCapture:
     """Single persistent camera owner.
 
-    One background thread keeps the camera open and continuously reads frames
-    into a shared buffer. The MJPEG stream serves this buffer at _STREAM_FPS for
-    a smooth live view, while the analysis loop and timelapse sample the latest
-    raw frame on their own (much slower) schedule. Because there is exactly one
-    handle on the camera, there is no contention — the prior design opened the
-    camera separately for the stream and for each analysis frame, which raced on
-    macOS USB drivers.
+    A supervisor thread keeps a capture *worker process* (see
+    ender3monitor/camera_worker.py) running and reads frames it writes into a
+    shared-memory buffer. The MJPEG stream serves the latest frame at
+    _STREAM_FPS for a smooth live view, while the analysis loop and timelapse
+    sample it on their own (much slower) schedule.
+
+    The camera runs in a child process (not opened directly here) so that a
+    USB camera dropping mid-session — e.g. a docking station getting unplugged
+    — can be recovered by killing and respawning that one process. On macOS,
+    OpenCV's AVFoundation backend gets left in a wedged state for the rest of
+    a process's life once a camera drops out from under it; recreating the
+    cv2.VideoCapture object in the *same* process (the old approach here)
+    doesn't reliably recover it, even after the camera is replugged — only a
+    fresh process does. A brand-new child process each time gets exactly that,
+    without restarting the printer connection, web server, or anything else.
     """
 
     def __init__(self, index: int, flip: Optional[int],
@@ -84,8 +100,16 @@ class StreamCapture:
         self._latest_jpeg: Optional[bytes] = None
         self._lock = threading.Lock()
         self._running = False
-        self._paused = False          # when True, release the camera (for scans)
+        self._paused = False          # when True, kill the worker (for scans)
         self._thread: Optional[threading.Thread] = None
+
+        # Worker-process state — touched only from the supervisor thread (_loop).
+        self._process: Optional[mp.process.BaseProcess] = None
+        self._shm: Optional[SharedMemory] = None
+        self._frame_ready = None
+        self._stop_worker = None
+        self._last_spawn_attempt = 0.0
+        self._RESPAWN_BACKOFF = 1.0   # seconds between respawn attempts
 
         # Demand tracking — with no MJPEG viewers and no recent snapshot
         # requests, the loop drops to ~2 fps reads and ~0.5 fps encodes instead
@@ -111,39 +135,66 @@ class StreamCapture:
         if self._thread:
             self._thread.join(timeout=2)
 
-    def _open(self):
-        cap = cv2.VideoCapture(self.index)
-        if not cap.isOpened():
-            cap.release()
-            return None
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return cap
+    # ── worker process management (supervisor-thread only) ──
+    def _spawn_worker(self) -> None:
+        self._last_spawn_attempt = time.time()
+        shm = SharedMemory(create=True, size=self.height * self.width * 3)
+        frame_ready = _MP_CTX.Event()
+        stop_worker = _MP_CTX.Event()
+        proc = _MP_CTX.Process(
+            target=capture_worker,
+            args=(self.index, self.width, self.height,
+                  shm.name, frame_ready, stop_worker),
+            daemon=True,
+        )
+        proc.start()
+        self._process, self._shm = proc, shm
+        self._frame_ready, self._stop_worker = frame_ready, stop_worker
+
+    def _teardown_worker(self) -> None:
+        if self._stop_worker is not None:
+            self._stop_worker.set()
+        if self._process is not None:
+            self._process.join(timeout=1.0)
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=1.0)
+        if self._shm is not None:
+            try:
+                self._shm.close()
+                self._shm.unlink()
+            except FileNotFoundError:
+                pass
+        self._process = self._shm = None
+        self._frame_ready = self._stop_worker = None
 
     def _loop(self) -> None:
-        cap = None
         last_encode = 0.0
         while self._running:
-            # Paused (or reindexing): drop the camera handle so a scan can use it.
+            # Paused (or reindexing): drop the worker so a scan can use the camera.
             if self._paused:
-                if cap is not None:
-                    cap.release()
-                    cap = None
+                if self._process is not None:
+                    self._teardown_worker()
                 time.sleep(0.1)
                 continue
-            if cap is None:
-                cap = self._open()
-                if cap is None:
-                    time.sleep(1.0)
+
+            if self._process is None or not self._process.is_alive():
+                if self._process is not None:
+                    ops.camera_frames_total.labels("fail").inc()
+                    self._teardown_worker()   # reap the dead worker, free its shm
+                if time.time() - self._last_spawn_attempt < self._RESPAWN_BACKOFF:
+                    time.sleep(0.05)
                     continue
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                ops.camera_frames_total.labels("fail").inc()
-                cap.release()
-                cap = None
-                time.sleep(0.3)
+                self._spawn_worker()
+                time.sleep(0.05)
                 continue
+
+            if not self._frame_ready.wait(timeout=0.5):
+                continue   # no new frame yet; loop back and re-check liveness
+            self._frame_ready.clear()
+
+            frame = np.ndarray((self.height, self.width, 3), dtype=np.uint8,
+                                buffer=self._shm.buf).copy()
             ops.camera_frames_total.labels("ok").inc()
             if self.flip is not None:
                 frame = cv2.flip(frame, self.flip)
@@ -162,16 +213,15 @@ class StreamCapture:
             if not active:
                 # Idle: don't spin the camera at full rate for nobody.
                 time.sleep(self._IDLE_READ_SLEEP)
-        if cap is not None:
-            cap.release()
+        self._teardown_worker()
 
     # ── controls ──
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
 
     def set_index(self, index: int) -> None:
-        """Switch to a different camera. Briefly pauses so the old handle is
-        released before the new one opens."""
+        """Switch to a different camera. Briefly pauses so the old worker is
+        torn down before the new one is spawned."""
         if index == self.index:
             return
         self.index = index
