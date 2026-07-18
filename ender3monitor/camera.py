@@ -111,14 +111,33 @@ class CameraManager:
 
     @staticmethod
     def list_available_cameras(max_check: int = 5) -> list[tuple[int, int, int]]:
-        """Return [(index, width, height), ...] for every readable camera."""
-        available = []
+        """Return [(index, width, height), ...] for every readable camera.
+
+        Runs the actual probing in a child process (ender3monitor.camera_worker
+        .scan_worker) rather than opening cv2.VideoCapture here directly — on
+        macOS, doing that from this call's background thread (it's invoked via
+        a thread-pool executor from the web UI) can leave AVFoundation unable
+        to open any camera at all for the rest of this process's life. See
+        StreamCapture in web.py, which has the same reasoning for the live
+        stream itself.
+        """
+        import multiprocessing as mp
+        from ender3monitor.camera_worker import scan_worker
+
+        ctx = mp.get_context("spawn")
+        result_queue = ctx.Queue()
+        proc = ctx.Process(target=scan_worker, args=(max_check, 1280, 720, result_queue),
+                            daemon=True)
         with _quiet():
-            for i in range(max_check):
-                frame = _snapshot(i)
-                if frame is not None:
-                    h, w = frame.shape[:2]
-                    available.append((i, w, h))
+            proc.start()
+            try:
+                available = result_queue.get(timeout=20.0)
+            except Exception:
+                available = []
+            proc.join(timeout=2.0)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1.0)
         return available
 
     @staticmethod

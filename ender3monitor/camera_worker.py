@@ -63,3 +63,33 @@ def capture_worker(index: int, width: int, height: int,
             cap.release()
     finally:
         shm.close()
+
+
+def scan_worker(max_check: int, width: int, height: int, result_queue) -> None:
+    """One-shot enumeration of readable camera indices, isolated in its own process.
+
+    Same rationale as capture_worker: opening cv2.VideoCapture from a
+    background thread of the long-lived app process (as the old in-process
+    scan did) can leave macOS's AVFoundation backend unable to open *any*
+    camera for the rest of that process's life. Running the whole scan on a
+    fresh process's main thread avoids that.
+    """
+    import cv2   # imported lazily — see capture_worker
+
+    results = []
+    for index in range(max_check):
+        cap = cv2.VideoCapture(index)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        try:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            cap.read()   # discard first frame — camera needs one read to finish initialising
+            ok, frame = cap.read()
+        finally:
+            cap.release()
+        if ok and frame is not None:
+            h, w = frame.shape[:2]
+            results.append((index, w, h))
+    result_queue.put(results)
