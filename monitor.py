@@ -23,7 +23,7 @@ from ender3monitor.analyzer import create_analyzer, AnalysisResult
 from ender3monitor.notifier import EmailNotifier
 from ender3monitor.metrics import MonitorMetrics
 from ender3monitor.timelapse import TimelapseManager
-from ender3monitor.printer import PrinterController
+from ender3monitor.printer import PrinterController, _fmt_duration
 from ender3monitor.push import PushNotifier
 from ender3monitor.maintenance import MaintenanceTracker
 from ender3monitor.settings import Settings
@@ -881,7 +881,6 @@ class Monitor:
 
     def _build_report_stats(self) -> str:
         """One-line-per-stat summary text for the completion report."""
-        from ender3monitor.printer import _fmt_duration
         avg = (self._conf_sum / self._conf_n) if self._conf_n else 0.0
         # Prefer the printer's job timer; fall back to wall-clock since print start.
         elapsed = self.printer.status.elapsed_seconds
