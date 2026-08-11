@@ -564,15 +564,32 @@ class IndexStore:
             self._prune()
         return idx
 
-    def scan_dir(self, directory: Path, recursive: bool = False) -> int:
-        """Index every .gcode in a directory. Returns how many were newly added."""
+    def scan_dir(self, directory: Path, recursive: bool = False,
+                 min_age_seconds: float = 0.0) -> int:
+        """Index every .gcode in a directory. Returns how many were newly added.
+
+        `min_age_seconds` skips files touched too recently to trust. Writing a
+        35 MB export to an SD card is not instant, and a file caught mid-write
+        indexes at a truncated size — which is exactly the fingerprint used to
+        find it later, so it would never match the finished file. Skipping it
+        costs one scan interval; the next pass picks it up complete.
+        """
         try:
             directory = Path(directory)
             if not directory.is_dir():
                 return 0
             it = directory.rglob("*") if recursive else directory.glob("*")
-            paths = [p for p in it
-                     if p.is_file() and p.suffix.lower() in (".gcode", ".gco", ".g")]
+            now = time.time()
+            paths = []
+            for p in it:
+                try:
+                    if not (p.is_file() and p.suffix.lower() in (".gcode", ".gco", ".g")):
+                        continue
+                    if min_age_seconds and (now - p.stat().st_mtime) < min_age_seconds:
+                        continue        # still being written — catch it next pass
+                    paths.append(p)
+                except Exception:
+                    continue
         except Exception:
             return 0
         added = 0
@@ -607,11 +624,13 @@ class VolumeWatcher:
                    "iSCPreboot", "Hardware", ".timemachine"}
 
     def __init__(self, store: IndexStore, extra_paths: Optional[List[Path]] = None,
-                 volume_root: Path = Path("/Volumes"), interval: float = 15.0) -> None:
+                 volume_root: Path = Path("/Volumes"), interval: float = 15.0,
+                 settle_seconds: float = 5.0) -> None:
         self.store = store
         self.extra_paths = [Path(p) for p in (extra_paths or [])]
         self.volume_root = Path(volume_root)
         self.interval = interval
+        self.settle_seconds = settle_seconds
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._known_volumes: set = set()
@@ -636,25 +655,29 @@ class VolumeWatcher:
             return []
 
     def scan_once(self, force: bool = False) -> int:
-        """Index newly-appeared volumes plus any configured folders.
+        """Index anything new on mounted volumes, plus any configured folders.
 
-        Returns the number of newly indexed files. `force` re-scans volumes we
-        have already seen this session (used for the manual "rescan" action).
+        Deliberately rescans volumes it has already seen. Skipping known mounts
+        looks like an obvious optimisation and is wrong for the workflow this
+        serves: the card is left mounted while files are exported to it one at a
+        time, so a "scan once per mount" watcher indexes whatever happened to be
+        on the card at startup and silently ignores every export after it.
+
+        Rescanning is nearly free — `IndexStore.add_file` skips files whose
+        (size, mtime) it has already seen, so a steady state costs one directory
+        listing and a stat per file.
         """
         added = 0
         current = set()
         for vol in self._candidate_volumes():
             current.add(str(vol))
-            if not force and str(vol) in self._known_volumes:
-                continue
-            n = self.store.scan_dir(vol)
+            n = self.store.scan_dir(vol, min_age_seconds=self.settle_seconds)
             if n:
                 print(f"  [GCODE] indexed {n} file(s) from {vol}")
             added += n
-        # Drop ejected volumes so re-inserting the same card rescans it.
         self._known_volumes = current
         for extra in self.extra_paths:
-            added += self.store.scan_dir(extra)
+            added += self.store.scan_dir(extra, min_age_seconds=self.settle_seconds)
         self.last_scan = time.time()
         self.last_added = added
         return added
