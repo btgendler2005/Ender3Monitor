@@ -15,7 +15,8 @@ Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, f
 - **Frame pre-validation** — OpenCV checks brightness, contrast, and edge density before sending to AI; rejects dark, covered, or off-target frames without burning API calls
 - **Print completion detection** — uses the printer's own status over USB when available (stops exactly when the print finishes); falls back to camera stillness (4 consecutive still frames) when no printer is connected
 - **Printer control over USB** — live nozzle/bed temps, print progress and time remaining, auto-pause/cooldown on a confirmed failure, and manual pause/resume/cooldown/e-stop from the dashboard
-- **M600 color-change alerts** — detects when the printer pauses mid-print for an embedded filament/color change and pushes a notification, independent of whether AI monitoring is running; suppresses false failure flags while parked waiting for the swap
+- **Slicer-aware status** — indexes your sliced G-code while the SD card is mounted, then follows the print through it: real layer numbers (`layer 340/1219`), the feature being printed right now, and an ETA from the slicer's own time curve instead of a byte-percentage guess. Also tells the AI when it's looking at a bridge or overhang, so expected sag stops reading as a failure. Falls back to the old behaviour whenever no file matches — see [Slicer-aware status](#slicer-aware-status)
+- **M600 color-change alerts** — detects when the printer pauses mid-print for an embedded filament/color change and pushes a notification, independent of whether AI monitoring is running; suppresses false failure flags while parked waiting for the swap. With a G-code index it also warns *ahead* of time ("color change in ~12 min")
 - **Hands-off start** — auto-starts monitoring when the printer begins a print (USB), and gates warmup on real signals (waits until printing has started and heaters are at target) instead of a fixed timer; falls back to a timer without USB
 - **First-layer inspection** — analyzes more frequently with an adhesion/squish focus during the failure-prone first layer (uses USB Z height)
 - **Layer-synced timelapse** — captures one frame per layer (via USB Z) for a smooth, consistent timelapse; falls back to time-based without USB
@@ -114,6 +115,56 @@ There are two layers:
 | `TIMELAPSE_MAX_SESSIONS` | `20` | Keep at most this many recent print folders (older pruned) |
 | `TIMELAPSE_RETENTION_DAYS` | `30` | Also delete timelapse folders/MP4s older than this |
 | `TIMELAPSE_DELETE_FRAMES_AFTER_COMPILE` | `false` | Drop a session's JPEGs once compiled to MP4 |
+| `GCODE_VOLUME_ROOT` | `/Volumes` | Where removable media mounts; volumes appearing here are indexed. Blank = off |
+| `GCODE_WATCH_PATHS` | — | Extra folders of `.gcode` to index, comma-separated |
+| `GCODE_INDEX_DIR` | `gcode_index` | Where per-file indexes are cached |
+
+---
+
+## Slicer-aware status
+
+By default the monitor knows a byte percentage and a Z height, and nothing about
+*what* is being printed. This closes that gap without changing how you print.
+
+**The problem.** Prints run from the SD card, so the host never sees the G-code.
+`M27` returns `SD printing byte 5231227/11973483` — and bytes are not time. On a
+real 13h dragon-wing print, byte-percentage runs up to 9 points ahead of actual
+time progress, worth **~75 minutes of ETA error** at the midpoint.
+
+**How it works.** The file passes through this machine once, at export time,
+while the SD card is mounted. The monitor indexes it then and keeps only the
+index — about 30 KB standing in for a 118 MB lithophane. Hours later, the total
+byte count in that `M27` reply identifies which file you picked on the printer's
+LCD, with no upload and nothing to configure per print.
+
+You get:
+
+- **Real layer numbers** — `layer 340/1219`, read from `;LAYER_CHANGE` markers
+- **A proper ETA** — from the slicer's own `M73` curve, or a built-in move-timing
+  model, continuously rescaled against elapsed time
+- **The active feature** — `Outer wall`, `Bridge`, `Sparse infill`
+- **Color changes ahead of time** — "color change in ~12 min" from embedded `M600`
+- **Fewer false alarms** — the AI is told when it's looking at a bridge or
+  overhang, where sagging is expected rather than a failure
+
+**Setup.** Nothing, if you export to the SD card. Turn it on or off with
+**Slicer-aware status** in the ⚙ settings panel. If you export to a folder on
+disk first, point `GCODE_WATCH_PATHS` at it.
+
+**For the best ETA**, uncheck **Disable set remaining print time** in Orca —
+*Printer Settings → Basic information → Advanced* (requires Advanced mode). Orca
+then emits `M73` lines carrying its own acceleration-aware estimate, which beats
+the built-in model. Verify with `grep -c "^M73" yourfile.gcode`. Note this is a
+**printer** setting, so save the printer preset afterwards.
+
+> Enabling Orca's **Verbose G-code** does *not* help and is not needed. It only
+> appends prose to individual moves; every marker used here is present in a
+> stock export, and comments never reach the host over USB anyway.
+
+**When it can't match a file** — indexed on another machine, or the monitor
+wasn't running at export — everything falls back to the byte-percentage status
+that predates this. The match is also cross-checked against the live Z height
+and dropped if they disagree, so a wrong file degrades rather than misreports.
 
 ---
 
@@ -394,6 +445,7 @@ Ender3Monitor/
 │   ├── analyzer.py         # AI analysis — pre-checks + Anthropic/Ollama backends, /ask
 │   ├── camera.py           # Camera detection and snapshot capture
 │   ├── config.py           # Configuration loaded from .env
+│   ├── gcode_index.py      # Slicer-aware status — index sliced G-code, follow it live
 │   ├── printer.py          # USB serial G-code control (temps, Z, progress, pause/cooldown)
 │   ├── push.py             # ntfy / Discord / Telegram notifications + media
 │   ├── telegram_bot.py     # Interactive Telegram command bot (/status, /ask, …)

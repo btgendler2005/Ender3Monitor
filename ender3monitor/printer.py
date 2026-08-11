@@ -80,6 +80,19 @@ class PrinterStatus:
     lifetime_print_seconds: Optional[int] = None  # firmware EEPROM total (M78)
     filament_change_pause: bool = False     # printer is blocked waiting on the user (M600 etc.)
 
+    # ── Slicer-aware fields ──
+    # Populated by the monitor from a matching G-code index (see gcode_index.py)
+    # and left as None whenever no index matches, so every consumer degrades to
+    # the byte-percentage behaviour rather than showing a confident wrong answer.
+    file_size: Optional[int] = None         # M27's total — the file's fingerprint
+    file_position: Optional[int] = None     # M27's byte offset into that file
+    job_name: Optional[str] = None          # filename the index was built from
+    layer: Optional[int] = None             # current layer (1-based)
+    total_layers: Optional[int] = None
+    feature: Optional[str] = None           # active ;TYPE: e.g. "Outer wall"
+    remaining_source: str = "bytes"         # "slicer" | "layers" | "bytes"
+    next_color_change_seconds: Optional[int] = None  # until the next embedded M600
+
     last_error: Optional[str] = None
 
     def as_dict(self) -> dict:
@@ -97,10 +110,30 @@ class PrinterStatus:
             "z_height": self.z_height,
             "lifetime_print_seconds": self.lifetime_print_seconds,
             "filament_change_pause": self.filament_change_pause,
+            "file_size": self.file_size,
+            "file_position": self.file_position,
+            "job_name": self.job_name,
+            "layer": self.layer,
+            "total_layers": self.total_layers,
+            "feature": self.feature,
+            "remaining_source": self.remaining_source,
+            "next_color_change_seconds": self.next_color_change_seconds,
+            "layer_str": (f"{self.layer}/{self.total_layers}"
+                          if self.layer and self.total_layers else None),
             "elapsed_str": _fmt_duration(self.elapsed_seconds),
             "remaining_str": _fmt_duration(self.remaining_seconds),
             "lifetime_str": _fmt_duration(self.lifetime_print_seconds),
+            "next_color_change_str": _fmt_duration(self.next_color_change_seconds),
         }
+
+    def clear_gcode_context(self) -> None:
+        """Drop everything derived from a G-code index (no match, or job ended)."""
+        self.job_name = None
+        self.layer = None
+        self.total_layers = None
+        self.feature = None
+        self.remaining_source = "bytes"
+        self.next_color_change_seconds = None
 
 
 def autodetect_port() -> Optional[str]:
@@ -348,10 +381,17 @@ class PrinterController:
         if m:
             done, total = int(m.group(1)), int(m.group(2))
             self.status.progress = (done / total) if total > 0 else None
+            # The byte offset and the file's total size are the only handles the
+            # host gets on *which* file is running and where in it we are — the
+            # G-code index keys off exactly these (see gcode_index.py).
+            self.status.file_position = done
+            self.status.file_size = total or None
             # A "byte N/N" reading alongside "Done printing file" means finished.
             self.status.printing = "Done printing" not in resp
         elif "Not SD printing" in resp or "Done printing" in resp:
             self.status.printing = False
+            self.status.file_position = None
+            self.status.file_size = None
 
     def query_print_time(self) -> None:
         """Update elapsed time via M31 and estimate remaining from progress."""

@@ -19,7 +19,7 @@ FrameProvider = Callable[[], Optional[np.ndarray]]
 
 from ender3monitor.config import Config
 from ender3monitor.camera import CameraManager
-from ender3monitor.analyzer import create_analyzer, AnalysisResult
+from ender3monitor.analyzer import build_context_note, create_analyzer, AnalysisResult
 from ender3monitor.notifier import EmailNotifier
 from ender3monitor.metrics import MonitorMetrics
 from ender3monitor.timelapse import TimelapseManager
@@ -27,6 +27,9 @@ from ender3monitor.printer import PrinterController, _fmt_duration
 from ender3monitor.push import PushNotifier
 from ender3monitor.maintenance import MaintenanceTracker
 from ender3monitor.settings import Settings
+from ender3monitor.gcode_index import (
+    BRIDGING_FEATURES, GcodeIndex, IndexStore, VolumeWatcher,
+)
 from ender3monitor import ops_metrics as ops
 
 # Camera-flip string (settings/UI) ↔ cv2.flip code (capture).
@@ -86,6 +89,17 @@ STARTUP_GRACE_SECONDS = 300         # ~5 min warm-up window (converted to frames
 # Near the end of a print the head parks away from the model, leaving a gap
 # that looks like stopped-extrusion. Suppress failure flagging past this %.
 COMPLETION_SUPPRESS_PCT = 0.97
+
+# G-code index: how far a live ETA may be rescaled by observed elapsed time.
+# Clamped because a wild ratio means a bad assumption somewhere (a paused
+# print, a stalled M31) and an uncorrected estimate beats a wrong correction.
+ETA_CALIBRATION_MIN = 0.5
+ETA_CALIBRATION_MAX = 2.0
+# Don't calibrate off a barely-started print — early ratios are mostly noise.
+ETA_CALIBRATION_MIN_SECONDS = 120
+# Consecutive Z disagreements before an index is dropped as the wrong file.
+# One is not proof: the SD read pointer leads the nozzle by the planner queue.
+GCODE_Z_MISMATCH_LIMIT = 3
 
 # Some firmware/boards never send "Not SD printing" or "Done printing" once a
 # print actually finishes — M27 just keeps echoing the final "byte N/N" line
@@ -185,6 +199,15 @@ class Monitor:
             delete_frames_after_compile=self.settings.get("timelapse_delete_frames_after_compile"),
         )
 
+        # Slicer-aware status. The index store outlives the G-code it describes:
+        # files are indexed while the SD card is mounted, then matched at print
+        # time by the byte size M27 reports. See ender3monitor/gcode_index.py.
+        self._gcode_store: Optional[IndexStore] = None
+        self._gcode_watcher: Optional[VolumeWatcher] = None
+        self._gcode_index: Optional[GcodeIndex] = None   # index for the running print
+        self._gcode_z_mismatches: int = 0
+        self._init_gcode_index()
+
         # Optional printer USB control + push notifications
         self.printer = PrinterController(config.printer_port, config.printer_baud)
         self.push = PushNotifier(
@@ -263,6 +286,140 @@ class Monitor:
     # ------------------------------------------------------------------ #
     # Printer USB connection + polling                                     #
     # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    # G-code index (slicer-aware status)                                   #
+    # ------------------------------------------------------------------ #
+
+    def _init_gcode_index(self) -> None:
+        """Set up the index store and start watching for SD cards.
+
+        Entirely optional: any failure here leaves both handles None and every
+        consumer falls back to the byte-percentage status that predates this.
+        """
+        try:
+            from pathlib import Path
+            cache_dir = Path(self.config.gcode_index_dir)
+            if not cache_dir.is_absolute():
+                cache_dir = Path(__file__).resolve().parent / cache_dir
+            self._gcode_store = IndexStore(cache_dir)
+            extra = [Path(p.strip()).expanduser()
+                     for p in self.config.gcode_watch_paths.split(",") if p.strip()]
+            root = self.config.gcode_volume_root
+            if root or extra:
+                self._gcode_watcher = VolumeWatcher(
+                    self._gcode_store, extra_paths=extra,
+                    volume_root=Path(root) if root else Path("/nonexistent"),
+                )
+                self._gcode_watcher.start()
+            if self._gcode_store.count:
+                print(f"  G-code index: {self._gcode_store.count} file(s) known.")
+        except Exception as exc:
+            print(f"  [GCODE] disabled ({exc})")
+            self._gcode_store = None
+            self._gcode_watcher = None
+
+    def _raw_remaining(self, idx: GcodeIndex, pos: Optional[int]) -> tuple:
+        """Uncalibrated remaining seconds at a byte offset, plus its source.
+
+        Prefers the slicer's own M73 table (acceleration-aware, emitted when the
+        printer profile's "Disable set remaining print time" is off) and falls
+        back to the index's built-in move-timing model.
+        """
+        r = idx.remaining_seconds_at_offset(pos)
+        if r is not None:
+            return r, "slicer"
+        r = idx.modelled_remaining_seconds(pos)
+        if r is not None:
+            return r, "model"
+        return None, "bytes"
+
+    def _update_gcode_context(self) -> None:
+        """Enrich printer status with layer / feature / ETA from the index.
+
+        Runs each printer poll, right after refresh_status(), so it overwrites
+        the linear byte-percentage ETA that query_print_time() just computed.
+        Every path that can't produce a trustworthy answer clears the derived
+        fields instead of guessing — the fallback is the old behaviour, never a
+        confident wrong number.
+        """
+        st = self.printer.status
+        if self._gcode_store is None or not self.settings.get("gcode_index_enabled"):
+            return
+        if not st.printing:
+            if st.job_name is not None:
+                st.clear_gcode_context()
+            self._gcode_index = None
+            self._gcode_z_mismatches = 0
+            return
+
+        idx = self._gcode_store.match(st.file_size)
+        if idx is None:
+            if st.job_name is not None:
+                st.clear_gcode_context()
+            self._gcode_index = None
+            return
+
+        # Confirm the size match against Z before trusting it. Skipped while
+        # parked for a filament change, where the head sits at an arbitrary
+        # height that has nothing to do with the file position.
+        if not st.filament_change_pause:
+            if idx.confirm_z(st.file_position, st.z_height):
+                self._gcode_z_mismatches = 0
+            else:
+                self._gcode_z_mismatches += 1
+                if self._gcode_z_mismatches >= GCODE_Z_MISMATCH_LIMIT:
+                    if st.job_name is not None:
+                        print("  [GCODE] Z disagrees with the matched file — "
+                              "falling back to byte progress.")
+                        st.clear_gcode_context()
+                    self._gcode_index = None
+                    return
+
+        self._gcode_index = idx
+        st.job_name = idx.source_name
+        st.total_layers = idx.total_layers or None
+        # Z is what the nozzle is *actually* doing; the SD read pointer runs
+        # ahead of it by the planner queue depth, so prefer Z for the layer.
+        st.layer = idx.layer_at_z(st.z_height) or idx.layer_at_offset(st.file_position)
+        st.feature = idx.feature_at_offset(st.file_position)
+
+        remaining, source = self._raw_remaining(idx, st.file_position)
+        if remaining is None:
+            st.remaining_source = "bytes"
+            return
+
+        # Calibrate the estimate's scale against how long this print has
+        # actually taken so far: the index supplies the shape, the live clock
+        # supplies the scale. Guarded so a stalled M31 can't distort it.
+        scale = 1.0
+        total = idx.estimated_seconds
+        elapsed = st.elapsed_seconds
+        if total and elapsed and elapsed >= ETA_CALIBRATION_MIN_SECONDS:
+            predicted_elapsed = total - remaining
+            if predicted_elapsed >= ETA_CALIBRATION_MIN_SECONDS:
+                scale = min(ETA_CALIBRATION_MAX,
+                            max(ETA_CALIBRATION_MIN, elapsed / predicted_elapsed))
+        st.remaining_seconds = int(max(0.0, remaining * scale))
+        st.remaining_source = source
+
+        # Time until the next embedded color change, from the same clock.
+        st.next_color_change_seconds = None
+        nxt = idx.next_color_change(st.file_position)
+        if nxt is not None:
+            at_change, _ = self._raw_remaining(idx, nxt)
+            if at_change is not None:
+                st.next_color_change_seconds = int(
+                    max(0.0, (remaining - at_change) * scale))
+
+    def _gcode_context_note(self) -> Optional[str]:
+        """Prompt text telling the vision model what feature is being printed."""
+        if not self.settings.get("gcode_context_to_ai"):
+            return None
+        st = self.printer.status
+        if not st.printing:
+            return None
+        return build_context_note(st.feature, st.layer, st.total_layers)
 
     def _init_printer(self) -> None:
         """Connect to the printer (if configured) and start the poller.
@@ -343,6 +500,7 @@ class Monitor:
         while not self._printer_poll_stop.is_set():
             if self.printer.connected:
                 self.printer.refresh_status()   # temps + print state + time + Z
+                self._update_gcode_context()    # layer/feature/ETA from the sliced file
                 self._maybe_auto_start()        # begin monitoring on print start
                 self._maybe_capture_layer_frame()
                 self._check_printer_completion()  # falling-edge finish at 5 s cadence
@@ -569,6 +727,8 @@ class Monitor:
         self._printer_poll_stop.set()
         if self._printer_poll_thread and self._printer_poll_thread.is_alive():
             self._printer_poll_thread.join(timeout=2)
+        if self._gcode_watcher is not None:
+            self._gcode_watcher.stop()
         self.printer.stop_watchdog()
         self.printer.disconnect()
 
@@ -704,7 +864,9 @@ class Monitor:
                                        else "Analyzing frame…")
                     _t0 = time.perf_counter()
                     try:
-                        result = self.analyzer.analyze_frame(frame, first_layer=first_layer)
+                        result = self.analyzer.analyze_frame(
+                            frame, first_layer=first_layer,
+                            context_note=self._gcode_context_note())
                         ops.analysis_duration_seconds.labels(
                             self.config.analyzer_backend).observe(time.perf_counter() - _t0)
                     except Exception as exc:

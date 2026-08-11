@@ -36,3 +36,6 @@ maintenance.json
 # Runtime settings (app-owned)
 settings.json
 settings.json.tmp
+
+# G-code indexes (app-owned, rebuilt from the sliced files)
+gcode_index/
