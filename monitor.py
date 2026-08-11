@@ -97,6 +97,17 @@ ETA_CALIBRATION_MIN = 0.5
 ETA_CALIBRATION_MAX = 2.0
 # Don't calibrate off a barely-started print — early ratios are mostly noise.
 ETA_CALIBRATION_MIN_SECONDS = 120
+# Fraction of the print that must be done before the correction is applied in
+# full. Below it the correction is damped proportionally.
+#
+# Early on, elapsed and the slicer's predicted-elapsed differ by a roughly fixed
+# amount — M73 counts move time, while M31's clock starts at print start and so
+# includes the start-gcode heat-up and the deliberately slow first layer. Nine
+# minutes in on a real print that offset was 1.3 min against a 7.7 min
+# denominator: a 17% "correction" that, multiplied across 248 remaining minutes,
+# added 43 minutes to a 4h16m estimate. Ramping instead of thresholding avoids a
+# visible jump in the ETA at the moment a hard floor would be crossed.
+ETA_CALIBRATION_FULL_WEIGHT_FRACTION = 0.15
 # Consecutive Z disagreements before an index is dropped as the wrong file.
 # One is not proof: the SD read pointer leads the nozzle by the planner queue.
 GCODE_Z_MISMATCH_LIMIT = 3
@@ -121,6 +132,34 @@ def _progress_stuck_since(current_since: Optional[float], printing: bool,
     if printing and progress is not None and progress >= STUCK_AT_COMPLETION_PCT:
         return current_since if current_since is not None else now
     return None
+
+
+def _eta_scale(total: Optional[float], remaining: Optional[float],
+               elapsed: Optional[int]) -> float:
+    """How much to stretch a slicer/model ETA to match this printer's real pace.
+
+    The estimate supplies the shape of the print; the live clock supplies the
+    scale. Returns 1.0 (no correction) whenever the inputs can't support a
+    trustworthy ratio.
+
+    The correction is ramped in over the first
+    ETA_CALIBRATION_FULL_WEIGHT_FRACTION of the print rather than applied at
+    full strength immediately: early on, elapsed exceeds the estimate's
+    predicted-elapsed by a roughly fixed startup cost (heat-up, slow first
+    layer), and dividing that by a small denominator produces a large bogus
+    correction that then multiplies across the whole remaining time.
+    """
+    if not total or not elapsed or not remaining:
+        return 1.0
+    if elapsed < ETA_CALIBRATION_MIN_SECONDS:
+        return 1.0
+    predicted_elapsed = total - remaining
+    if predicted_elapsed < ETA_CALIBRATION_MIN_SECONDS:
+        return 1.0
+    raw_scale = elapsed / predicted_elapsed
+    weight = min(1.0, (predicted_elapsed / total) / ETA_CALIBRATION_FULL_WEIGHT_FRACTION)
+    scale = 1.0 + (raw_scale - 1.0) * weight
+    return min(ETA_CALIBRATION_MAX, max(ETA_CALIBRATION_MIN, scale))
 
 
 def _frames_differ(f1: np.ndarray, f2: np.ndarray, threshold: float = MOTION_THRESHOLD) -> bool:
@@ -392,14 +431,7 @@ class Monitor:
         # Calibrate the estimate's scale against how long this print has
         # actually taken so far: the index supplies the shape, the live clock
         # supplies the scale. Guarded so a stalled M31 can't distort it.
-        scale = 1.0
-        total = idx.estimated_seconds
-        elapsed = st.elapsed_seconds
-        if total and elapsed and elapsed >= ETA_CALIBRATION_MIN_SECONDS:
-            predicted_elapsed = total - remaining
-            if predicted_elapsed >= ETA_CALIBRATION_MIN_SECONDS:
-                scale = min(ETA_CALIBRATION_MAX,
-                            max(ETA_CALIBRATION_MIN, elapsed / predicted_elapsed))
+        scale = _eta_scale(idx.estimated_seconds, remaining, st.elapsed_seconds)
         st.remaining_seconds = int(max(0.0, remaining * scale))
         st.remaining_source = source
 

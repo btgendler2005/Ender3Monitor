@@ -32,6 +32,7 @@ from ender3monitor.printer import (
 )
 from monitor import (
     Monitor, _frames_differ, _confirm_frames, _progress_stuck_since,
+    _eta_scale, ETA_CALIBRATION_MAX, ETA_CALIBRATION_MIN,
     STUCK_AT_COMPLETION_PCT, STUCK_AT_COMPLETION_SECONDS,
 )
 
@@ -768,3 +769,40 @@ def test_build_context_note_flags_bridging_as_expected():
     plain = build_context_note("Outer wall", 19, 27)
     assert "layer 19 of 27" in plain and "expected for this feature" not in plain
     assert build_context_note(None, None, None) is None
+
+
+def test_eta_scale_damps_early_startup_bias():
+    """Elapsed carries a fixed startup cost the slicer's clock doesn't.
+
+    M73 counts move time; M31 starts at print start and includes heat-up and
+    the slow first layer. Dividing that fixed offset by a small denominator
+    yields a big bogus correction that multiplies across the whole remaining
+    time — observed live as 4h50m shown for a 4h16m print at layer 2 of 90.
+    """
+    total = 256 * 60
+    # 3% in, on pace apart from ~1.3 min of startup: correction must stay small.
+    remaining = total * 0.97
+    elapsed = int(total * 0.03 + 80)
+    assert _eta_scale(total, remaining, elapsed) < 1.05
+
+    # Half way and genuinely 30% slow: the correction must get through in full.
+    remaining = total * 0.5
+    elapsed = int(total * 0.5 * 1.3)
+    assert _eta_scale(total, remaining, elapsed) == pytest.approx(1.3, abs=0.02)
+
+
+def test_eta_scale_is_inert_without_usable_inputs():
+    assert _eta_scale(None, 100, 100) == 1.0
+    assert _eta_scale(1000, None, 100) == 1.0
+    assert _eta_scale(1000, 900, None) == 1.0
+    assert _eta_scale(1000, 900, 0) == 1.0
+    # Too early to mean anything.
+    assert _eta_scale(10000, 9990, 60) == 1.0
+
+
+def test_eta_scale_stays_clamped():
+    total = 10000
+    # A stalled print can't stretch the estimate without bound.
+    assert _eta_scale(total, total * 0.5, 10**7) == ETA_CALIBRATION_MAX
+    assert _eta_scale(total, total * 0.5, 1) == 1.0          # below the floor
+    assert _eta_scale(total, total * 0.5, int(total * 0.05)) >= ETA_CALIBRATION_MIN
