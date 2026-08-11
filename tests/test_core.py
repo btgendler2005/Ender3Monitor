@@ -700,23 +700,63 @@ def test_index_store_ignores_unparseable_files(tmp_path):
     assert store.count == 0
 
 
-def test_volume_watcher_indexes_new_volumes_once(tmp_path):
+def test_volume_watcher_indexes_new_volumes(tmp_path):
     """Cards are matched by content, not label — NONAME and PRINTER both work."""
     volumes = tmp_path / "Volumes"
     card = volumes / "NONAME"
     card.mkdir(parents=True)
     _write_gcode(card, layers=6, name="a.gcode")
     store = IndexStore(tmp_path / "cache")
-    w = VolumeWatcher(store, volume_root=volumes)
+    w = VolumeWatcher(store, volume_root=volumes, settle_seconds=0)
 
     assert w.scan_once() == 1
     assert store.count == 1
-    assert w.scan_once() == 0            # already seen — no rework
+    assert w.scan_once() == 0            # nothing new — no duplicate work
 
     # Eject and re-insert under the other label: same content, still known.
-    renamed = volumes / "PRINTER"
-    card.rename(renamed)
+    card.rename(volumes / "PRINTER")
     assert w.scan_once() == 0
+    assert store.count == 1
+
+
+def test_volume_watcher_picks_up_files_added_to_a_mounted_card(tmp_path):
+    """The real workflow: the card stays mounted while files are exported to it.
+
+    A watcher that scans each volume only once indexes whatever happened to be
+    on the card at startup and silently misses every later export.
+    """
+    volumes = tmp_path / "Volumes"
+    card = volumes / "PRINTER"
+    card.mkdir(parents=True)
+    _write_gcode(card, layers=6, name="first.gcode")
+    store = IndexStore(tmp_path / "cache")
+    w = VolumeWatcher(store, volume_root=volumes, settle_seconds=0)
+
+    assert w.scan_once() == 1
+
+    # Export a second file to the still-mounted card.
+    second = _write_gcode(card, layers=9, name="second.gcode")
+    assert w.scan_once() == 1
+    assert store.count == 2
+    assert store.match(second.stat().st_size).total_layers == 9
+
+
+def test_volume_watcher_skips_files_still_being_written(tmp_path):
+    """A file caught mid-write indexes at a truncated size — the wrong fingerprint."""
+    volumes = tmp_path / "Volumes"
+    card = volumes / "PRINTER"
+    card.mkdir(parents=True)
+    _write_gcode(card, layers=6, name="inflight.gcode")
+    store = IndexStore(tmp_path / "cache")
+
+    # Freshly written: too new to trust.
+    w = VolumeWatcher(store, volume_root=volumes, settle_seconds=3600)
+    assert w.scan_once() == 0
+    assert store.count == 0
+
+    # Once it has settled, the next pass takes it.
+    w.settle_seconds = 0
+    assert w.scan_once() == 1
     assert store.count == 1
 
 
