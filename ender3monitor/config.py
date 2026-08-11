@@ -79,6 +79,14 @@ class Config:
     auto_pause_on_failure: bool
     auto_pause_action: str       # "pause" | "cooldown" | "estop"
 
+    # G-code indexing — layer/feature/ETA from the sliced file (see gcode_index.py).
+    # Paths live here rather than in settings.json because the settings API is a
+    # non-secret allowlist of *tunables*; filesystem paths that drive reads stay
+    # in .env, like timelapse_dir.
+    gcode_index_dir: str         # where compact per-file indexes are cached
+    gcode_watch_paths: str       # extra folders to index, comma-separated
+    gcode_volume_root: str       # where removable media mounts ("" disables)
+
     # Web dashboard login (optional but recommended — gates ALL web routes,
     # including printer controls/e-stop). Empty = no auth (open on the LAN).
     web_username: str
@@ -136,6 +144,9 @@ class Config:
             auto_pause_on_failure=os.getenv("AUTO_PAUSE_ON_FAILURE", "false").strip().lower()
                 in ("1", "true", "yes", "on"),
             auto_pause_action=os.getenv("AUTO_PAUSE_ACTION", "pause").strip().lower(),
+            gcode_index_dir=os.getenv("GCODE_INDEX_DIR", "gcode_index").strip(),
+            gcode_watch_paths=os.getenv("GCODE_WATCH_PATHS", "").strip(),
+            gcode_volume_root=os.getenv("GCODE_VOLUME_ROOT", "/Volumes").strip(),
             web_username=os.getenv("WEB_USERNAME", "").strip(),
             web_password=os.getenv("WEB_PASSWORD", "").strip(),
             ntfy_topic=os.getenv("NTFY_TOPIC", "").strip(),

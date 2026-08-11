@@ -18,6 +18,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ender3monitor.analyzer import (
     _downscale, _normalize_type, _parse_response, _precheck_frame,
+    build_context_note,
+)
+from ender3monitor.gcode_index import (
+    GcodeIndex, IndexStore, VolumeWatcher, parse_gcode,
 )
 from ender3monitor.config import _parse_flip
 from ender3monitor.maintenance import MaintenanceTracker
@@ -557,3 +561,170 @@ def test_check_color_change_skips_push_when_disabled():
     Monitor._check_color_change(m)
     assert m._color_change_alerted is True
     assert m.push.sent == []
+
+
+# --------------------------------------------------------------------------- #
+# G-code index — slicer-aware status                                            #
+# --------------------------------------------------------------------------- #
+
+def _write_gcode(tmp_path, *, layers=10, m73=False, m600_at=None, name="t.gcode"):
+    """A miniature Orca-shaped file. Markers match a stock export (gcode_comments=0)."""
+    out = ["; HEADER_BLOCK_START",
+           f"; total layer number: {layers}",
+           ";TIME:600",
+           ";Filament used:1.5m",
+           "; layer_height = 0.2",
+           "; filament_type = PLA;PLA",
+           "; HEADER_BLOCK_END"]
+    for i in range(layers):
+        if m73:
+            # Orca's mask is "M73 P%s R%s\n" (GCodeProcessor.cpp).
+            out.append(f"M73 P{i * 10} R{layers - i}")
+        out += [";LAYER_CHANGE", f";Z:{(i + 1) * 0.2:.2f}", ";TYPE:Outer wall",
+                "G1 F1800 X10 Y10 E1", ";TYPE:Sparse infill", "G1 X20 Y20 E2"]
+        if m600_at is not None and i == m600_at:
+            out.append("M600")
+    p = tmp_path / name
+    p.write_text("\n".join(out) + "\n")
+    return p
+
+
+def test_gcode_index_parses_stock_orca_markers(tmp_path):
+    idx = parse_gcode(_write_gcode(tmp_path, layers=10))
+    assert idx is not None
+    assert idx.total_layers == 10
+    assert len(idx.layer_offsets) == len(idx.layer_z) == 10
+    assert idx.layer_z[0] == pytest.approx(0.2)
+    assert idx.layer_height == pytest.approx(0.2)
+    assert idx.estimated_seconds == pytest.approx(600)
+    assert idx.filament_type == "PLA"
+    # Consecutive identical ;TYPE: runs are collapsed, distinct ones are kept.
+    assert set(idx.feature_names) == {"Outer wall", "Sparse infill"}
+
+
+def test_gcode_index_layer_lookup_prefers_z_over_byte_offset():
+    """Z is what the nozzle is doing; the SD read pointer leads it."""
+    idx = GcodeIndex(layer_offsets=[0, 100, 200, 300],
+                     layer_z=[0.2, 0.4, 0.6, 0.8], layer_height=0.2)
+    assert idx.layer_at_z(0.4) == 2
+    assert idx.layer_at_z(0.79) == 4
+    assert idx.layer_at_offset(250) == 3
+    # A Z nowhere near any layer means this isn't the running file.
+    assert idx.layer_at_z(60.0) is None
+    assert idx.layer_at_z(None) is None
+
+
+def test_gcode_index_feature_at_offset():
+    idx = GcodeIndex(feature_offsets=[0, 50, 90],
+                     feature_names=["Outer wall", "Bridge", "Sparse infill"])
+    assert idx.feature_at_offset(10) == "Outer wall"
+    assert idx.feature_at_offset(50) == "Bridge"
+    assert idx.feature_at_offset(89) == "Bridge"
+    assert idx.feature_at_offset(1000) == "Sparse infill"
+    assert idx.feature_at_offset(None) is None
+
+
+def test_gcode_index_m73_interpolates_between_stamps(tmp_path):
+    idx = parse_gcode(_write_gcode(tmp_path, layers=10, m73=True))
+    assert idx.has_m73
+    a, b = idx.m73_offsets[2], idx.m73_offsets[3]
+    ra = idx.remaining_seconds_at_offset(a)
+    rb = idx.remaining_seconds_at_offset(b)
+    mid = idx.remaining_seconds_at_offset((a + b) // 2)
+    assert rb < mid < ra          # strictly decreasing, genuinely interpolated
+
+
+def test_gcode_index_discards_non_monotonic_m73(tmp_path):
+    """A rising 'remaining' means we misparsed — drop it instead of interpolating junk."""
+    p = tmp_path / "bad.gcode"
+    p.write_text(";LAYER_CHANGE\n;Z:0.2\nM73 P0 R5\nM73 P50 R99\n")
+    idx = parse_gcode(p)
+    assert idx is not None and not idx.has_m73
+
+
+def test_gcode_index_falls_back_to_time_model_without_m73(tmp_path):
+    """No M73 → the built-in move-timing model still yields a decreasing ETA."""
+    idx = parse_gcode(_write_gcode(tmp_path, layers=10, m73=False))
+    assert not idx.has_m73
+    assert idx.remaining_seconds_at_offset(idx.size_bytes // 2) is None
+    early = idx.modelled_remaining_seconds(idx.layer_offsets[1])
+    late = idx.modelled_remaining_seconds(idx.layer_offsets[8])
+    assert early is not None and late is not None and late < early
+    assert idx.layer_time_frac[0] == 0.0
+    assert all(idx.layer_time_frac[i] <= idx.layer_time_frac[i + 1]
+               for i in range(len(idx.layer_time_frac) - 1))
+
+
+def test_gcode_index_next_color_change(tmp_path):
+    idx = parse_gcode(_write_gcode(tmp_path, layers=10, m600_at=4))
+    assert len(idx.m600_offsets) == 1
+    off = idx.m600_offsets[0]
+    assert idx.next_color_change(0) == off
+    assert idx.next_color_change(off + 1) is None
+    assert idx.layer_at_offset(off) == 5
+
+
+def test_gcode_index_confirm_z_rejects_the_wrong_file():
+    """Byte size is a fingerprint, not a proof — Z is the second opinion."""
+    idx = GcodeIndex(layer_offsets=[0, 100, 200, 300],
+                     layer_z=[0.2, 0.4, 0.6, 0.8], layer_height=0.2)
+    assert idx.confirm_z(250, 0.6) is True       # right file
+    assert idx.confirm_z(250, 60.0) is False     # nozzle nowhere near — wrong file
+    assert idx.confirm_z(250, None) is True      # no evidence → don't reject
+    assert idx.confirm_z(None, 0.6) is True
+    # Tolerant of the planner-queue lead: the read pointer runs ahead of the nozzle.
+    assert idx.confirm_z(300, 0.4) is True
+
+
+def test_index_store_matches_by_size_and_survives_the_file(tmp_path):
+    """The index outlives the G-code — that is the whole point."""
+    src = _write_gcode(tmp_path, layers=8, name="job.gcode")
+    size = src.stat().st_size
+    store = IndexStore(tmp_path / "cache")
+    assert store.add_file(src) is not None
+    assert store.match(size).source_name == "job.gcode"
+    assert store.match(size + 1) is None
+    assert store.match(None) is None
+
+    src.unlink()                      # the file goes to the SD card and is gone
+    reloaded = IndexStore(tmp_path / "cache")
+    assert reloaded.match(size) is not None
+    assert reloaded.match(size).total_layers == 8
+
+
+def test_index_store_ignores_unparseable_files(tmp_path):
+    junk = tmp_path / "notgcode.gcode"
+    junk.write_text("this is not g-code\n")
+    store = IndexStore(tmp_path / "cache")
+    assert store.add_file(junk) is None
+    assert store.count == 0
+
+
+def test_volume_watcher_indexes_new_volumes_once(tmp_path):
+    """Cards are matched by content, not label — NONAME and PRINTER both work."""
+    volumes = tmp_path / "Volumes"
+    card = volumes / "NONAME"
+    card.mkdir(parents=True)
+    _write_gcode(card, layers=6, name="a.gcode")
+    store = IndexStore(tmp_path / "cache")
+    w = VolumeWatcher(store, volume_root=volumes)
+
+    assert w.scan_once() == 1
+    assert store.count == 1
+    assert w.scan_once() == 0            # already seen — no rework
+
+    # Eject and re-insert under the other label: same content, still known.
+    renamed = volumes / "PRINTER"
+    card.rename(renamed)
+    assert w.scan_once() == 0
+    assert store.count == 1
+
+
+def test_build_context_note_flags_bridging_as_expected():
+    note = build_context_note("Bridge", 19, 27)
+    assert note is not None and "expected" in note.lower()
+    assert build_context_note("Overhang wall", 5, 10) is not None
+    # Ordinary features get neutral positional context, not the sag exemption.
+    plain = build_context_note("Outer wall", 19, 27)
+    assert "layer 19 of 27" in plain and "expected for this feature" not in plain
+    assert build_context_note(None, None, None) is None

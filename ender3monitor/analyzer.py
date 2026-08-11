@@ -6,6 +6,8 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Optional
 
+from ender3monitor.gcode_index import BRIDGING_FEATURES
+
 # Anthropic model — claude-sonnet-4-6 is the current ID
 # (formerly advertised as claude-sonnet-4-20250514, which is deprecated)
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
@@ -44,6 +46,50 @@ HARD RULES to avoid false alarms:
 
 "confidence" is how certain you are of the chosen failure_type. For "none", use 0.0–0.3.
 Only choose a non-"none" failure_type when your confidence is >= 0.85."""
+
+
+# Appended when the G-code index says the printer is laying down a feature that
+# is *supposed* to look bad. Bridges and overhangs droop by design — without
+# this the model sees textbook "stopped extrusion" or sagging and flags a
+# failure on a print that is going exactly to plan.
+_BRIDGING_NOTE = (
+    "CONTEXT FROM THE SLICED FILE: the printer is currently printing {feature}. "
+    "Filament spanning open air sags, droops, and looks stringy here — that is "
+    "expected for this feature, not a failure. Do NOT report spaghetti, stopped "
+    "extrusion, or detachment for droop over a gap unless the print is clearly "
+    "coming apart. Judge it against what a normal bridge/overhang looks like."
+)
+
+# Neutral positional context for every other feature. Cheap to include and it
+# stops the model inventing a phase ("looks like it's finishing up") from a
+# single frame.
+_FEATURE_NOTE = (
+    "CONTEXT FROM THE SLICED FILE: currently printing {feature}"
+    "{layer_part}. Use this to judge whether what you see is expected."
+)
+
+
+def build_context_note(feature: Optional[str], layer: Optional[int],
+                       total_layers: Optional[int]) -> Optional[str]:
+    """Prompt text describing what the printer is laying down right now.
+
+    Sourced from the G-code index (see gcode_index.py), which knows the active
+    `;TYPE:` at the printer's current file offset. Returns None when nothing is
+    known, so the prompt is unchanged from before this existed.
+    """
+    if not feature and not layer:
+        return None
+    layer_part = ""
+    if layer and total_layers:
+        layer_part = f", on layer {layer} of {total_layers}"
+    elif layer:
+        layer_part = f", on layer {layer}"
+    if feature and feature.strip().lower() in BRIDGING_FEATURES:
+        return _BRIDGING_NOTE.format(feature=feature)
+    if not feature:
+        return f"CONTEXT FROM THE SLICED FILE: printing layer {layer}" + (
+            f" of {total_layers}." if total_layers else ".")
+    return _FEATURE_NOTE.format(feature=feature, layer_part=layer_part)
 
 
 # Appended to the prompt during the first layer, where most failures originate.
@@ -257,7 +303,8 @@ class AnthropicAnalyzer:
             },
         }
 
-    def analyze_frame(self, frame: np.ndarray, first_layer: bool = False) -> AnalysisResult:
+    def analyze_frame(self, frame: np.ndarray, first_layer: bool = False,
+                      context_note: Optional[str] = None) -> AnalysisResult:
         early = _precheck_frame(frame, backend=f"anthropic/{self._model}")
         if early:
             self._prev_frame = frame.copy()
@@ -285,6 +332,8 @@ class AnthropicAnalyzer:
             content.append(self._image_block(frame))
         if first_layer:
             content.append({"type": "text", "text": _FIRST_LAYER_NOTE})
+        if context_note:
+            content.append({"type": "text", "text": context_note})
         content.append({"type": "text",
                         "text": "Respond with the JSON object only."})
 
@@ -372,7 +421,8 @@ class OllamaAnalyzer:
             import os
             os.environ.setdefault("OLLAMA_HOST", host)
 
-    def analyze_frame(self, frame: np.ndarray, first_layer: bool = False) -> AnalysisResult:
+    def analyze_frame(self, frame: np.ndarray, first_layer: bool = False,
+                      context_note: Optional[str] = None) -> AnalysisResult:
         early = _precheck_frame(frame, backend=f"ollama/{self._model}")
         if early:
             return early
@@ -384,6 +434,8 @@ class OllamaAnalyzer:
         prompt = f"{SYSTEM_PROMPT}\n\nAnalyze this 3D printer image for failures."
         if first_layer:
             prompt += f"\n\n{_FIRST_LAYER_NOTE}"
+        if context_note:
+            prompt += f"\n\n{context_note}"
         prompt += "\n\nRespond with the JSON object only."
 
         response = self._ollama.chat(

@@ -117,6 +117,19 @@ SCHEMA: Dict[str, dict] = {
         "bool", True, "Timelapse", "Caption: date",
         help="Include the finish date in the burned-in caption."),
 
+    # ── G-code index ──
+    # Only the toggle is exposed here; the folders it reads are .env paths, so
+    # the settings API never gains the ability to point a file reader anywhere.
+    "gcode_index_enabled": _field(
+        "bool", True, "G-code", "Slicer-aware status",
+        help="Index sliced G-code when the SD card is mounted, then report real "
+             "layer numbers, the active feature, and the slicer's own ETA. "
+             "Falls back to byte-percentage when no file matches."),
+    "gcode_context_to_ai": _field(
+        "bool", True, "G-code", "Send feature to AI",
+        help="Tell the vision model what the printer is currently laying down "
+             "(bridging, overhangs) so expected sag isn't flagged as a failure."),
+
     # ── Maintenance ──
     "maintenance_reminder_hours": _field(
         "int", 250, "Maintenance", "Upkeep reminder (h)", min=1, max=100000,

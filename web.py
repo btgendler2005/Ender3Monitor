@@ -312,9 +312,14 @@ def _printer_status_lines() -> list:
     if pr.printing and pr.progress is not None:
         d = pr.as_dict()
         extra = []
+        if d.get("layer_str"):     extra.append("layer " + d['layer_str'])
         if d.get("elapsed_str"):   extra.append(d['elapsed_str'] + " elapsed")
         if d.get("remaining_str"): extra.append("~" + d['remaining_str'] + " left")
         lines.append(f"Progress: {pr.progress*100:.1f}%   " + "   ".join(extra))
+        if d.get("feature"):
+            lines.append(f"Printing: {d['feature']}")
+        if d.get("next_color_change_str"):
+            lines.append(f"🎨 Color change in ~{d['next_color_change_str']}")
     elif pr.printing:
         lines.append("Printing…")
     return lines
@@ -1693,10 +1698,23 @@ function render(d) {
       prog.style.color = 'var(--amber)';
     } else if (p.printing && p.progress != null) {
       const parts = [(p.progress * 100).toFixed(1) + '%'];
+      // Layer/feature come from the sliced file; absent when no index matched,
+      // in which case this reads exactly as it did before the G-code index.
+      if (p.layer_str) parts.push('layer ' + p.layer_str);
       if (p.elapsed_str)   parts.push(p.elapsed_str + ' elapsed');
-      if (p.remaining_str) parts.push('~' + p.remaining_str + ' left');
+      if (p.remaining_str) {
+        // Say where the estimate came from — a slicer/model ETA is worth more
+        // trust than the byte-percentage projection, and hiding the difference
+        // would make the better number indistinguishable from the worse one.
+        const src = {slicer: ' (slicer)', model: ' (modelled)'}[p.remaining_source] || '';
+        parts.push('~' + p.remaining_str + ' left' + src);
+      }
+      if (p.feature) parts.push(p.feature);
       prog.textContent = parts.join('  ·  ');
       prog.style.color = 'var(--muted)';
+      if (p.next_color_change_str) {
+        prog.textContent += '   🎨 color change in ~' + p.next_color_change_str;
+      }
     } else if (p.printing) {
       prog.textContent = 'Printing…';
       prog.style.color = 'var(--muted)';
