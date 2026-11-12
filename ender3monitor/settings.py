@@ -130,6 +130,17 @@ SCHEMA: Dict[str, dict] = {
         help="Tell the vision model what the printer is currently laying down "
              "(bridging, overhangs) so expected sag isn't flagged as a failure."),
 
+    # ── Notifications ──
+    # Master switches only: credentials stay in .env. Off = muted, not unconfigured.
+    "email_notifications": _field(
+        "bool", True, "Notifications", "Email alerts",
+        help="Send failure and completion emails. Off = skip email "
+             "(e.g. when you only want Telegram)."),
+    "telegram_notifications": _field(
+        "bool", True, "Notifications", "Telegram alerts",
+        help="Send alerts, reports, photos and videos to Telegram. Off = mute "
+             "outgoing notifications; bot commands still work."),
+
     # ── Maintenance ──
     "maintenance_reminder_hours": _field(
         "int", 250, "Maintenance", "Upkeep reminder (h)", min=1, max=100000,

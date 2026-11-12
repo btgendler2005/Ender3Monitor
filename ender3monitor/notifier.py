@@ -27,11 +27,12 @@ class EmailNotifier:
         self.password = password
         self.sender = sender
         self.recipient = recipient
+        self.muted = False   # runtime toggle (settings: email_notifications)
 
     @property
     def enabled(self) -> bool:
-        """True only when SMTP is fully configured — callers skip silently otherwise."""
-        return bool(self.username and self.password and self.recipient)
+        """True only when SMTP is fully configured and not muted — callers skip silently otherwise."""
+        return bool(self.username and self.password and self.recipient) and not self.muted
 
     def send_alert(self, result: AnalysisResult, frame: np.ndarray) -> None:
         if not self.enabled:
