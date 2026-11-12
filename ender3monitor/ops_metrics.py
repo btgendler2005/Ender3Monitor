@@ -67,6 +67,14 @@ printer_filament_change_pause = Gauge(
     "e3m_printer_filament_change_pause", "1 while paused for a filament/color change (M600)")
 printer_color_changes_total = Counter(
     "e3m_printer_color_changes_total", "M600 color/filament changes detected mid-print")
+printer_filament_present = Gauge(
+    "e3m_printer_filament_present",
+    "1 when the runout sensor reports filament loaded, 0 when it reports none "
+    "(NaN when the firmware has no sensor or polarity is not calibrated yet)")
+printer_filament_runout = Gauge(
+    "e3m_printer_filament_runout", "1 while a filament runout is believed to be in progress")
+printer_filament_runouts_total = Counter(
+    "e3m_printer_filament_runouts_total", "Filament runouts detected mid-print")
 
 _NAN = float("nan")
 
@@ -80,6 +88,10 @@ def update_printer(status) -> None:
     printer_connected.set(1 if status.connected else 0)
     printer_printing.set(1 if status.printing else 0)
     printer_filament_change_pause.set(1 if status.filament_change_pause else 0)
+    printer_filament_runout.set(1 if status.filament_runout else 0)
+    # Tri-state on purpose: "no sensor" must not graph as "filament loaded".
+    printer_filament_present.set(
+        _NAN if status.filament_present is None else (1 if status.filament_present else 0))
     g(printer_nozzle_temp, status.nozzle_temp)
     g(printer_nozzle_target, status.nozzle_target)
     g(printer_bed_temp, status.bed_temp)

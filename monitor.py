@@ -52,6 +52,13 @@ FIRST_LAYER_FALLBACK_SECONDS = 300
 # Heaters are "at temp" within this many degrees of target (signal-based warmup).
 WARMUP_TEMP_TOLERANCE = 5.0
 
+# Classifying an unplanned pause as a filament runout (see _classify_runout):
+# how far from the reported SD byte offset a planned M600 may sit and still be
+# taken as the explanation for the pause. See GcodeIndex.color_change_near for
+# why the window is asymmetric.
+RUNOUT_M600_BEHIND_BYTES = 32768
+RUNOUT_M600_AHEAD_BYTES = 4096
+
 # Print-complete detection: stop after this many consecutive still frames
 NO_MOTION_LIMIT = 4         # 4 × 30 s = 2 minutes
 MOTION_THRESHOLD = 5.0      # mean absolute pixel difference (0–255) to count as "changed"
@@ -263,6 +270,11 @@ class Monitor:
         # M600 color/filament-change alert — latched per pause episode so a
         # multi-color print's later M600s each re-alert once resumed between them.
         self._color_change_alerted: bool = False
+
+        # Filament runout — same per-episode latch, plus a flag marking the
+        # current pause as a runout so the M600 alert stands down for it.
+        self._runout_alerted: bool = False
+        self._pause_is_runout: bool = False
 
         # Layer-synced timelapse (driven by the printer Z poller)
         self._timelapse_layer_mode: bool = False
@@ -504,6 +516,8 @@ class Monitor:
                 self._maybe_auto_start()        # begin monitoring on print start
                 self._maybe_capture_layer_frame()
                 self._check_printer_completion()  # falling-edge finish at 5 s cadence
+                self._check_filament_runout()   # filament runout alert (before M600:
+                                                # it decides which the pause is)
                 self._check_color_change()      # M600 filament/color-change alert
             elif ticks % reconnect_ticks == 0:
                 self.printer.connect()          # quiet retry; logged on transition below
@@ -619,6 +633,137 @@ class Monitor:
             target=self._send_completion, args=(frame,), daemon=True
         ).start()
 
+    def _classify_runout(self) -> tuple:
+        """Decide whether the filament has run out. Returns (runout, source).
+
+        Three signals, strongest first:
+
+          1. **The sensor itself**, read over M119 and polarity-calibrated by
+             `PrinterController`. Unambiguous, and the only one that can catch a
+             runout the firmware chose not to announce. Stays None (never a
+             runout) on firmware that reports no sensor.
+          2. **An explicit announcement** from the firmware — a host action or
+             prompt. Only the host-handled configurations emit one.
+          3. **An unplanned "paused for user" pause.** This is the fallback that
+             carries stock firmware, where a runout is handled by running
+             `FILAMENT_RUNOUT_SCRIPT` ("M600" by default) and is therefore
+             *byte-for-byte identical over serial* to an embedded color change —
+             both simply block waiting on the user. The sliced file breaks the
+             tie: if the G-code index says no M600 sits near the current byte
+             offset, nothing in the print asked for this pause, so the filament
+             ran out. With no index matched there is no way to tell the two
+             apart, so the pause stays a color change rather than a guessed
+             runout — a wrong "your filament ran out" on every multi-color
+             print would be worse than leaving this case as it was.
+        """
+        st = self.printer.status
+        if not self.settings.get("filament_runout_alert"):
+            return False, None
+        if st.filament_present is False and (st.printing or st.filament_change_pause):
+            return True, "sensor"
+        # Once detected, a runout lasts until the print is actually moving
+        # again. While the printer is still blocked waiting on the user nothing
+        # has been fixed, and the signal that revealed it may well have gone
+        # quiet by now — a blocked printer stops answering M119 at all. Without
+        # this, a sensor-detected runout on a print with no G-code index would
+        # clear itself one poll later and send a false all-clear.
+        if self._runout_alerted and st.filament_change_pause:
+            return True, st.runout_source or "unplanned-pause"
+        if st.runout_marker_seen:
+            return True, "firmware"
+        if st.filament_change_pause and self._gcode_index is not None:
+            if not self._gcode_index.color_change_near(
+                    st.file_position,
+                    behind=RUNOUT_M600_BEHIND_BYTES,
+                    ahead=RUNOUT_M600_AHEAD_BYTES):
+                return True, "unplanned-pause"
+        return False, None
+
+    def _runout_message(self, source: Optional[str]) -> str:
+        """Body text for the runout notification, including where it came from.
+
+        Says which signal fired, because the three are not equally certain: the
+        sensor and the firmware are direct observations, while an unexplained
+        pause is an inference and worth flagging as one.
+        """
+        lead = {
+            "sensor": "The runout sensor reports no filament.",
+            "firmware": "The printer reported a filament runout.",
+            "unplanned-pause": (
+                "The printer paused mid-print and nothing in the sliced file "
+                "asked for it — the filament has most likely run out."),
+        }.get(source or "", "The printer appears to be out of filament.")
+
+        st = self.printer.status
+        where = []
+        d = st.as_dict()
+        if d.get("layer_str"):
+            where.append(f"layer {d['layer_str']}")
+        elif st.progress is not None:
+            where.append(f"{st.progress * 100:.0f}% in")
+        if d.get("remaining_str"):
+            where.append(f"~{d['remaining_str']} of printing left")
+        tail = (" Stopped at " + ", ".join(where) + ".") if where else ""
+
+        return (f"{lead}{tail} Load a new spool and resume the print — "
+                "the heaters are still on, so don't leave it parked too long.")
+
+    def _check_filament_runout(self) -> None:
+        """Alert once per episode when the filament runs out mid-print.
+
+        Runs in the 5 s poll loop, independent of whether a camera-monitoring
+        session is active — like the M600 alert, so a runout still reaches the
+        phone on a print this app never started analyzing. Also records the
+        verdict on `PrinterStatus` so the dashboard, Telegram and Prometheus
+        all describe the pause the same way.
+        """
+        runout, source = self._classify_runout()
+        st = self.printer.status
+        st.filament_runout = runout
+        st.runout_source = source
+        # Claim the pause so _check_color_change doesn't also call it an M600.
+        self._pause_is_runout = runout
+
+        if runout and not self._runout_alerted:
+            self._runout_alerted = True
+            print(f"\n  [PRINTER] Filament runout detected ({source}).")
+            if self._running:
+                with self._lock:
+                    self.status = "Paused – filament runout"
+            self.events.append({
+                "t": time.time(), "type": "filament_runout", "conf": None,
+                "desc": f"Filament runout detected ({source})",
+                "detected": True,
+            })
+            try:
+                ops.printer_filament_runouts_total.inc()
+            except Exception:
+                pass
+            if self.push.enabled:
+                self.push.send(
+                    title="🧵 Filament ran out",
+                    message=self._runout_message(source),
+                    priority="high",
+                )
+        elif not runout and self._runout_alerted:
+            self._runout_alerted = False
+            self.printer.clear_runout_marker()
+            # A runout state also ends when the job does — if you gave up and
+            # cancelled the print, nothing was reloaded and nothing resumed, so
+            # only send the all-clear when the print is genuinely running again.
+            resumed = bool(st.printing and not st.filament_change_pause)
+            print("\n  [PRINTER] Filament runout cleared"
+                  + (" — printing again." if resumed else " (print ended)."))
+            if self._running:
+                with self._lock:
+                    self.status = "Monitoring…"
+            if self.push.enabled and resumed:
+                self.push.send(
+                    title="🧵 Filament reloaded",
+                    message="Filament is back and the print is moving again.",
+                    priority="default",
+                )
+
     def _check_color_change(self) -> None:
         """Alert when the printer pauses mid-print for an M600 color/filament
         change (see `PrinterController._note_pause_marker`). Runs unconditionally
@@ -626,6 +771,12 @@ class Monitor:
         session is active — so the alert fires even if this app's AI analysis
         was never started for the current print.
         """
+        if self._pause_is_runout:
+            # This pause is a filament runout — _check_filament_runout owns it
+            # and has already alerted. Drop our own latch so a genuine M600
+            # later in the same print still fires.
+            self._color_change_alerted = False
+            return
         paused = bool(self.printer.status.filament_change_pause)
         if paused and not self._color_change_alerted:
             self._color_change_alerted = True
@@ -819,6 +970,11 @@ class Monitor:
                     # An M600 pause also parks the head and halts extrusion — expected
                     # behavior, not a failure. Suppress flagging while waiting on it.
                     color_change_pause = bool(pr and pr.filament_change_pause)
+                    # A runout looks the same to the camera (parked head, or a
+                    # nozzle printing air). The poll loop has already sent a
+                    # precise alert for it, so don't also raise a vaguer
+                    # "stopped extrusion" failure for the same physical event.
+                    runout_pause = bool(pr and pr.filament_runout)
 
                     # ── Camera motion completion (fallback only) ──────────── #
                     # Used only when the printer can't tell us (no USB / not reporting
@@ -909,7 +1065,8 @@ class Monitor:
                                 # Don't flag a "gap" failure when the print is basically done
                                 and not near_completion
                                 # ...or when it's parked for an M600 color change
-                                and not color_change_pause
+                                # or waiting out a filament runout
+                                and not (color_change_pause or runout_pause)
                             )
                             if is_failure:
                                 # Spaghetti is time-critical — alert on the first frame.
@@ -950,7 +1107,9 @@ class Monitor:
                                 self._pending_failure_type = None
                                 self._pending_failure_count = 0
                                 self._pending_failure_alerted = False
-                                if color_change_pause:
+                                if runout_pause:
+                                    self.status = "Paused – filament runout"
+                                elif color_change_pause:
                                     self.status = "Paused – change filament (M600)"
                                 elif near_completion:
                                     self.status = "Finishing… (near complete)"

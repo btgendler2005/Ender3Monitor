@@ -52,6 +52,40 @@ _M78_TOTAL_RE = re.compile(
 # Mid-print, this is effectively always an embedded M600 color change.
 _PAUSED_FOR_USER_RE = re.compile(r"paused for user", re.IGNORECASE)
 
+# Explicit filament-runout announcements. There is no single universal line:
+# with Marlin's default FILAMENT_RUNOUT_SCRIPT ("M600") the firmware handles a
+# runout entirely by itself and says nothing specific about it — over serial it
+# is indistinguishable from an embedded color change (both just block waiting on
+# the user, see above). Only the host-handled configurations announce the event:
+# M412 H1 opens a host prompt, and ACTION_ON_FILAMENT_RUNOUT emits a host action.
+# Matched here when present because it is instant and unambiguous; when absent
+# the monitor falls back to classifying the pause (see Monitor._classify_runout).
+#
+# Deliberately narrow: the bare phrase "filament runout" also appears in
+# Marlin's own *settings* reports (M412/M503 print "; Filament runout ON"), so
+# matching that alone would turn a settings dump into a runout alert.
+_RUNOUT_MARKER_RE = re.compile(
+    r"action:\s*out_of_filament"
+    r"|action:\s*(?:pause\s+)?filament_runout"
+    r"|prompt_begin\s+FilamentRunout"
+    r"|filament\s*runout\s*(?:detected|triggered)"
+    r"|runout\s*detected",
+    re.IGNORECASE,
+)
+# M119 (endstop report) includes a line for the filament sensor when the
+# firmware has one configured:   filament: open   /   Filament 1: TRIGGERED
+_FILAMENT_SENSOR_RE = re.compile(
+    r"^\s*filament[^:\n]*:\s*(open|triggered)\b", re.IGNORECASE | re.MULTILINE)
+# Something that marks a reply as a real endstop report rather than whatever
+# else landed in the read window. Needed to tell "this firmware reports no
+# filament sensor" apart from "we never got the report" (see below).
+_ENDSTOP_REPORT_RE = re.compile(
+    r"_(?:min|max)\s*:|Reporting endstop status", re.IGNORECASE)
+
+# How many consecutive identical sensor readings are needed before we trust one
+# as the "filament present" baseline (see _learn_sensor_polarity).
+SENSOR_CALIBRATION_POLLS = 3
+
 
 def _fmt_duration(seconds: Optional[int]) -> Optional[str]:
     if seconds is None:
@@ -79,6 +113,19 @@ class PrinterStatus:
     z_height: Optional[float] = None        # current nozzle Z (M114), for first-layer / layer-timelapse
     lifetime_print_seconds: Optional[int] = None  # firmware EEPROM total (M78)
     filament_change_pause: bool = False     # printer is blocked waiting on the user (M600 etc.)
+
+    # ── Filament runout ──
+    # `filament_present` is the runout sensor read over M119 and normalised for
+    # polarity (see _learn_sensor_polarity); None means "no sensor, or not yet
+    # calibrated", and is never treated as a runout. `runout_marker_seen` is
+    # latched when the firmware announces a runout itself. The last two are
+    # written by the monitor once it has classified the event, and live here so
+    # the UI, Telegram and Prometheus all read runout state from one place.
+    filament_present: Optional[bool] = None
+    filament_sensor_reported: bool = False  # firmware's M119 reports a filament line
+    runout_marker_seen: bool = False        # firmware announced a runout over serial
+    filament_runout: bool = False           # a runout is believed to be in progress
+    runout_source: Optional[str] = None     # "sensor" | "firmware" | "unplanned-pause"
 
     # ── Slicer-aware fields ──
     # Populated by the monitor from a matching G-code index (see gcode_index.py)
@@ -110,6 +157,10 @@ class PrinterStatus:
             "z_height": self.z_height,
             "lifetime_print_seconds": self.lifetime_print_seconds,
             "filament_change_pause": self.filament_change_pause,
+            "filament_present": self.filament_present,
+            "filament_sensor_reported": self.filament_sensor_reported,
+            "filament_runout": self.filament_runout,
+            "runout_source": self.runout_source,
             "file_size": self.file_size,
             "file_position": self.file_position,
             "job_name": self.job_name,
@@ -172,6 +223,10 @@ class PrinterController:
         # only arrives every ~2s, so a single reply window without it doesn't
         # prove the pause ended — require a couple of clean replies in a row.
         self._pause_clear_streak = 0
+        # Runout-sensor polarity calibration (see _learn_sensor_polarity).
+        self._sensor_present_state: Optional[bool] = None
+        self._sensor_calibration_value: Optional[bool] = None
+        self._sensor_calibration_streak = 0
 
         # Stall watchdog: some USB-serial adapters wedge a blocking read past
         # its configured timeout (observed in the field — readline() never
@@ -322,6 +377,7 @@ class PrinterController:
                         break
             resp = "\n".join(lines)
             self._note_pause_marker(resp)
+            self._note_runout_marker(resp)
             return resp
         except Exception as exc:
             self.status.last_error = f"Serial write failed: {exc}"
@@ -352,6 +408,23 @@ class PrinterController:
             if self._pause_clear_streak >= 2:
                 self.status.filament_change_pause = False
                 self._pause_clear_streak = 0
+                # The pause is over, so whatever announced it is history too.
+                self.status.runout_marker_seen = False
+
+    def _note_runout_marker(self, resp: str) -> None:
+        """Latch a firmware runout announcement from a raw serial reply.
+
+        Only latches — clearing is deliberate, because the announcement arrives
+        once while the condition persists. It is cleared when the pause it
+        caused ends (above), when the print ends, or by the monitor when it
+        closes out the runout episode.
+        """
+        if _RUNOUT_MARKER_RE.search(resp):
+            self.status.runout_marker_seen = True
+
+    def clear_runout_marker(self) -> None:
+        """Forget a latched firmware runout announcement (episode over)."""
+        self.status.runout_marker_seen = False
 
     # ------------------------------------------------------------------ #
     # Status queries                                                       #
@@ -392,6 +465,8 @@ class PrinterController:
             self.status.printing = False
             self.status.file_position = None
             self.status.file_size = None
+            # No job, no runout — don't carry an announcement into the next print.
+            self.status.runout_marker_seen = False
 
     def query_print_time(self) -> None:
         """Update elapsed time via M31 and estimate remaining from progress."""
@@ -415,6 +490,63 @@ class PrinterController:
         m = _POS_RE.search(resp)
         if m:
             self.status.z_height = float(m.group(1))
+
+    def query_filament_sensor(self) -> None:
+        """Read the filament runout sensor via M119 (endstop states).
+
+        Marlin reports the runout switch alongside the endstops when one is
+        configured. Firmware without a sensor simply omits the line, which
+        leaves `filament_present` at None — unknown, never "ran out".
+        """
+        resp = self.send("M119")
+        m = _FILAMENT_SENSOR_RE.search(resp)
+        if not m:
+            # Only an identifiable endstop report proves there is no sensor.
+            # Anything else means the report never arrived — while the printer
+            # is blocked waiting on the user, gcode processing stalls and the
+            # read window fills with busy-keepalive lines instead (see
+            # _PAUSED_FOR_USER_RE). Blanking the reading on that would erase a
+            # just-detected runout at the one moment it matters.
+            if _ENDSTOP_REPORT_RE.search(resp):
+                self.status.filament_sensor_reported = False
+                self.status.filament_present = None
+            return
+        self.status.filament_sensor_reported = True
+        raw = m.group(1).lower() == "triggered"
+        self._learn_sensor_polarity(raw)
+        self.status.filament_present = (
+            None if self._sensor_present_state is None
+            else raw == self._sensor_present_state
+        )
+
+    def _learn_sensor_polarity(self, raw: bool) -> None:
+        """Learn which raw M119 state means "filament is present".
+
+        Nominally Marlin prints TRIGGERED when filament is threaded, but the
+        meaning is a build-time choice (FIL_RUNOUT_STATE, exposed by firmware
+        builders as separate HIGH/LOW options) and the switch can be wired
+        either way, so a hard-coded polarity is wrong on a real fraction of
+        machines — and wrong here means either silence on a real runout or an
+        alert on every healthy print. So calibrate instead: while a print is
+        genuinely running and not blocked waiting on the user, filament is by
+        definition loaded, so whatever the sensor reads then is the "present"
+        state. A stable run of identical readings is required so one glitch
+        can't set the baseline backwards.
+        """
+        if self._sensor_present_state is not None:
+            return
+        if not self.status.printing or self.status.filament_change_pause:
+            # Idle or parked mid-swap — tells us nothing about the loaded state.
+            self._sensor_calibration_value = None
+            self._sensor_calibration_streak = 0
+            return
+        if raw == self._sensor_calibration_value:
+            self._sensor_calibration_streak += 1
+        else:
+            self._sensor_calibration_value = raw
+            self._sensor_calibration_streak = 1
+        if self._sensor_calibration_streak >= SENSOR_CALIBRATION_POLLS:
+            self._sensor_present_state = raw
 
     def query_statistics(self) -> None:
         """Read the firmware's lifetime total print time via M78 (EEPROM stats).
@@ -442,6 +574,14 @@ class PrinterController:
         self.query_progress()
         self.query_print_time()
         self.query_position()
+        # Every poll while a job is live (runout latency is what matters here);
+        # occasionally when idle, just to learn whether a sensor exists at all.
+        # Skipped entirely while blocked waiting on the user: the reply would
+        # not reach us anyway (see query_filament_sensor), and filament is
+        # legitimately out of the sensor during a color-change swap.
+        if not self.status.filament_change_pause:
+            if self.status.printing or self._refresh_count % 12 == 0:
+                self.query_filament_sensor()
         if self._refresh_count % 12 == 0:   # ~every 60 s at a 5 s poll
             self.query_statistics()
         self._refresh_count += 1

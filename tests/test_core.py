@@ -27,8 +27,8 @@ from ender3monitor.config import _parse_flip
 from ender3monitor.maintenance import MaintenanceTracker
 from ender3monitor.settings import SCHEMA, Settings, _coerce
 from ender3monitor.printer import (
-    _M78_TOTAL_RE, _POS_RE, _PRINTTIME_RE, _SD_RE, _TEMP_RE, _fmt_duration,
-    PrinterController,
+    _M78_TOTAL_RE, _POS_RE, _PRINTTIME_RE, _RUNOUT_MARKER_RE, _SD_RE, _TEMP_RE,
+    _fmt_duration, PrinterController, PrinterStatus, SENSOR_CALIBRATION_POLLS,
 )
 from monitor import (
     Monitor, _frames_differ, _confirm_frames, _progress_stuck_since,
@@ -522,6 +522,7 @@ class _FakeMonitorForColorChange:
         self.printer = _FakePrinter()
         self.push = _FakePush()
         self._color_change_alerted = False
+        self._pause_is_runout = False   # set by _check_filament_runout
         self._running = True
         self.status = "Monitoring…"
         self._lock = threading.Lock()
@@ -768,3 +769,451 @@ def test_build_context_note_flags_bridging_as_expected():
     plain = build_context_note("Outer wall", 19, 27)
     assert "layer 19 of 27" in plain and "expected for this feature" not in plain
     assert build_context_note(None, None, None) is None
+
+
+# ── printer: filament runout sensor + firmware announcements ────────────────
+
+def test_runout_marker_regex_matches_firmware_announcements():
+    for line in (
+        "//action:out_of_filament",
+        "//action:out_of_filament T0",
+        "//action:prompt_begin FilamentRunout T0",
+        "//action:filament_runout",
+        "//action:pause filament_runout T0",
+        "echo:Filament runout detected",
+    ):
+        assert _RUNOUT_MARKER_RE.search(line), line
+
+
+def test_runout_marker_regex_ignores_settings_reports_and_plain_pauses():
+    """M412/M503 echo the runout *setting* back, and an M600 pause is just a
+    pause — neither is a runout event, and matching either would alert on a
+    healthy print."""
+    for line in (
+        "echo:  M412 S1 D7.00 ; Filament runout ON",
+        "echo:; Filament runout",
+        "echo:busy: paused for user",
+        "ok T:200.00 /200.00 B:60.00 /60.00",
+    ):
+        assert not _RUNOUT_MARKER_RE.search(line), line
+
+
+def test_note_runout_marker_latches_then_clears_with_the_pause():
+    pc = PrinterController(port="")
+    assert pc.status.runout_marker_seen is False
+
+    pc._note_runout_marker("//action:out_of_filament")
+    assert pc.status.runout_marker_seen is True
+
+    # The announcement arrives once while the condition persists, so a later
+    # quiet reply must not retract it.
+    pc._note_runout_marker("ok T:200.0 /200.0 B:60.0 /60.0")
+    assert pc.status.runout_marker_seen is True
+
+    # It clears once the pause it caused is over (same hysteresis as the pause).
+    pc.status.filament_change_pause = True
+    pc._note_pause_marker("ok")
+    pc._note_pause_marker("ok")
+    assert pc.status.filament_change_pause is False
+    assert pc.status.runout_marker_seen is False
+
+
+def _sensor_pc(replies):
+    """A controller whose send() hands back canned M119 replies in order."""
+    pc = PrinterController(port="")
+    it = iter(replies)
+    pc.send = lambda gcode, read_timeout=3.0: next(it)
+    return pc
+
+
+@pytest.mark.parametrize("present_word, absent_word", [
+    ("TRIGGERED", "open"),   # stock Marlin: filament holds the switch closed
+    ("open", "TRIGGERED"),   # inverted FIL_RUNOUT_STATE / reversed wiring
+])
+def test_filament_sensor_polarity_is_learned_not_assumed(present_word, absent_word):
+    """Both wirings must converge on the same answer. The meaning of TRIGGERED
+    is a build-time choice, so a hard-coded polarity would mean either silence
+    on a real runout or an alert on every healthy print, depending on machine."""
+    pc = _sensor_pc([f"filament: {present_word}\nok"] * SENSOR_CALIBRATION_POLLS
+                    + [f"filament: {absent_word}\nok"])
+    pc.status.printing = True
+
+    for _ in range(SENSOR_CALIBRATION_POLLS):
+        pc.query_filament_sensor()
+    assert pc.status.filament_sensor_reported is True
+    assert pc.status.filament_present is True
+
+    pc.query_filament_sensor()
+    assert pc.status.filament_present is False
+
+
+def test_filament_sensor_stays_unknown_until_calibrated():
+    pc = _sensor_pc(["filament: open\nok"])
+    pc.status.printing = True
+    pc.query_filament_sensor()
+    # One reading is not a baseline, and "unknown" must not pass for "loaded".
+    assert pc.status.filament_present is None
+
+
+def test_filament_sensor_does_not_calibrate_while_idle_or_paused():
+    """Filament is deliberately out of the sensor during a color change, and
+    undefined when idle, so neither may teach us what "present" looks like."""
+    pc = _sensor_pc(["filament: open\nok"] * (SENSOR_CALIBRATION_POLLS * 2))
+    for _ in range(SENSOR_CALIBRATION_POLLS):
+        pc.query_filament_sensor()                  # idle
+    pc.status.printing = True
+    pc.status.filament_change_pause = True
+    for _ in range(SENSOR_CALIBRATION_POLLS):
+        pc.query_filament_sensor()                  # parked mid-swap
+    assert pc._sensor_present_state is None
+    assert pc.status.filament_present is None
+
+
+def test_firmware_with_no_sensor_reports_unknown_not_runout():
+    pc = _sensor_pc(["x_min: open\ny_min: open\nz_min: TRIGGERED\nok"])
+    pc.status.printing = True
+    pc.query_filament_sensor()
+    assert pc.status.filament_sensor_reported is False
+    assert pc.status.filament_present is None
+
+
+# ── gcode index: telling a planned M600 from an unexplained pause ────────────
+
+def test_color_change_near_window():
+    idx = GcodeIndex(size_bytes=1_000_000, source_name="x")
+    idx.m600_offsets = [500_000]
+    assert idx.color_change_near(500_000) is True
+    assert idx.color_change_near(520_000) is True    # SD pointer ran past it
+    assert idx.color_change_near(498_000) is True    # small forward slack
+    assert idx.color_change_near(600_000) is False
+    assert idx.color_change_near(480_000) is False
+    assert idx.color_change_near(None) is False
+    # A file with no color changes can never explain a pause.
+    assert GcodeIndex(size_bytes=1, source_name="y").color_change_near(10) is False
+
+
+# ── monitor: filament runout alert ──────────────────────────────────────────
+
+class _FakeSettings:
+    def __init__(self, **vals):
+        self._vals = {"filament_runout_alert": True}
+        self._vals.update(vals)
+
+    def get(self, key):
+        return self._vals[key]
+
+
+class _FakeIndex:
+    """Stands in for a matched G-code index — only the M600 lookup matters."""
+    def __init__(self, near):
+        self._near = near
+
+    def color_change_near(self, pos, behind=0, ahead=0):
+        return self._near
+
+
+class _RunoutPrinter:
+    def __init__(self):
+        self.status = PrinterStatus()
+
+    def clear_runout_marker(self):
+        self.status.runout_marker_seen = False
+
+
+class _FakeMonitorForRunout:
+    """Bare object exposing only what the runout path touches — building a real
+    Monitor needs a full Config/camera/analyzer stack."""
+    def __init__(self, index=None, **settings):
+        self.printer = _RunoutPrinter()
+        self.push = _FakePush()
+        self.settings = _FakeSettings(**settings)
+        self._gcode_index = index
+        self._runout_alerted = False
+        self._pause_is_runout = False
+        self._color_change_alerted = False
+        self._running = True
+        self.status = "Monitoring…"
+        self._lock = threading.Lock()
+        self.events = deque(maxlen=50)
+
+    # Real implementations, so these tests exercise the shipped logic.
+    _classify_runout = Monitor._classify_runout
+    _runout_message = Monitor._runout_message
+
+
+def test_runout_sensor_alerts_once_per_episode_and_clears():
+    m = _FakeMonitorForRunout()
+    m.printer.status.printing = True
+    m.printer.status.filament_present = False
+
+    Monitor._check_filament_runout(m)
+    assert m.printer.status.filament_runout is True
+    assert m.printer.status.runout_source == "sensor"
+    assert m.status == "Paused – filament runout"
+    assert len(m.events) == 1 and m.events[0]["type"] == "filament_runout"
+    assert len(m.push.sent) == 1
+    title, _message, priority = m.push.sent[0]
+    assert "ran out" in title and priority == "high"
+
+    # Still out on the next poll — one alert per episode, not one every 5 s.
+    Monitor._check_filament_runout(m)
+    assert len(m.push.sent) == 1
+
+    # Reloaded — the latch clears and an all-clear goes out.
+    m.printer.status.filament_present = True
+    Monitor._check_filament_runout(m)
+    assert m._runout_alerted is False
+    assert m.printer.status.filament_runout is False
+    assert m.status == "Monitoring…"
+    assert len(m.push.sent) == 2
+
+    # A second runout later in the same print alerts again.
+    m.printer.status.filament_present = False
+    Monitor._check_filament_runout(m)
+    assert len(m.push.sent) == 3
+
+
+def test_runout_message_names_the_signal_and_where_it_stopped():
+    m = _FakeMonitorForRunout()
+    st = m.printer.status
+    st.printing = True
+    st.filament_present = False
+    st.layer, st.total_layers = 340, 1219
+    st.remaining_seconds = 7800
+
+    Monitor._check_filament_runout(m)
+    body = m.push.sent[0][1]
+    assert "runout sensor" in body
+    assert "layer 340/1219" in body
+    assert "2h 10m" in body
+
+
+def test_sensor_reading_while_idle_is_not_a_runout():
+    # An empty sensor on an idle printer is just a printer with no filament in it.
+    m = _FakeMonitorForRunout()
+    m.printer.status.filament_present = False
+    Monitor._check_filament_runout(m)
+    assert m.printer.status.filament_runout is False
+    assert m.push.sent == []
+
+
+def test_unexplained_pause_is_a_runout_but_a_planned_m600_is_not():
+    """Stock firmware answers a runout by running M600, so the pause itself says
+    nothing — only the sliced file can separate the two."""
+    planned = _FakeMonitorForRunout(index=_FakeIndex(near=True))
+    planned.printer.status.printing = True
+    planned.printer.status.filament_change_pause = True
+    planned.printer.status.file_position = 500_000
+    Monitor._check_filament_runout(planned)
+    assert planned.printer.status.filament_runout is False
+    assert planned.push.sent == []
+
+    unplanned = _FakeMonitorForRunout(index=_FakeIndex(near=False))
+    unplanned.printer.status.printing = True
+    unplanned.printer.status.filament_change_pause = True
+    unplanned.printer.status.file_position = 500_000
+    Monitor._check_filament_runout(unplanned)
+    assert unplanned.printer.status.filament_runout is True
+    assert unplanned.printer.status.runout_source == "unplanned-pause"
+    assert len(unplanned.push.sent) == 1
+
+
+def test_pause_without_a_matched_index_stays_a_color_change():
+    """With no index there is no way to tell a runout from an M600, and a wrong
+    "your filament ran out" on every multi-color print is the worse error."""
+    m = _FakeMonitorForRunout(index=None)
+    m.printer.status.printing = True
+    m.printer.status.filament_change_pause = True
+    Monitor._check_filament_runout(m)
+    assert m.printer.status.filament_runout is False
+    assert m.push.sent == []
+
+
+def test_firmware_announcement_is_a_runout_even_without_an_index():
+    m = _FakeMonitorForRunout(index=None)
+    m.printer.status.printing = True
+    m.printer.status.runout_marker_seen = True
+    Monitor._check_filament_runout(m)
+    assert m.printer.status.runout_source == "firmware"
+    assert len(m.push.sent) == 1
+
+
+def test_runout_alert_can_be_switched_off():
+    m = _FakeMonitorForRunout(filament_runout_alert=False)
+    m.printer.status.printing = True
+    m.printer.status.filament_present = False
+    Monitor._check_filament_runout(m)
+    assert m.printer.status.filament_runout is False
+    assert m.push.sent == []
+
+
+def test_runout_pause_stands_down_the_m600_alert():
+    """One pause, one notification — and with the wording that sends you to the
+    printer expecting the right job."""
+    m = _FakeMonitorForRunout(index=_FakeIndex(near=False))
+    m.printer.status.printing = True
+    m.printer.status.filament_change_pause = True
+    m.printer.status.file_position = 500_000
+
+    Monitor._check_filament_runout(m)
+    Monitor._check_color_change(m)        # same poll, runs straight after
+
+    assert len(m.push.sent) == 1
+    assert "ran out" in m.push.sent[0][0]
+    assert m._color_change_alerted is False
+    assert [e["type"] for e in m.events] == ["filament_runout"]
+
+
+def test_m600_alert_still_fires_for_a_planned_color_change():
+    m = _FakeMonitorForRunout(index=_FakeIndex(near=True))
+    m.printer.status.printing = True
+    m.printer.status.filament_change_pause = True
+    m.printer.status.file_position = 500_000
+
+    Monitor._check_filament_runout(m)
+    Monitor._check_color_change(m)
+
+    assert len(m.push.sent) == 1
+    assert "change filament" in m.push.sent[0][0]
+    assert [e["type"] for e in m.events] == ["color_change"]
+
+
+# ── runout: the two ways this can go quietly wrong ──────────────────────────
+
+def test_stalled_poll_does_not_blank_a_known_sensor_reading():
+    """While the printer is blocked waiting on the user, gcode processing stalls
+    and the read window fills with busy-keepalive lines instead of the endstop
+    report we asked for. That is not evidence the sensor went away — and
+    blanking the reading on it would erase a just-detected runout at the one
+    moment it matters."""
+    pc = _sensor_pc(["filament: TRIGGERED\nok"] * SENSOR_CALIBRATION_POLLS
+                    + ["filament: open\nok",
+                       "echo:busy: paused for user\necho:busy: paused for user"])
+    pc.status.printing = True
+    for _ in range(SENSOR_CALIBRATION_POLLS):
+        pc.query_filament_sensor()
+    pc.query_filament_sensor()
+    assert pc.status.filament_present is False
+
+    pc.query_filament_sensor()          # stalled reply — no report inside it
+    assert pc.status.filament_present is False
+    assert pc.status.filament_sensor_reported is True
+
+
+def test_runout_stays_latched_while_the_printer_is_still_parked():
+    """No all-clear until the print is moving again. On firmware with no matched
+    index the signal that revealed the runout goes quiet the moment the printer
+    blocks, so re-deciding from scratch each poll would retract the alert."""
+    m = _FakeMonitorForRunout(index=None)
+    m.printer.status.printing = True
+    m.printer.status.filament_present = False
+    Monitor._check_filament_runout(m)
+    assert len(m.push.sent) == 1
+
+    # The printer has now blocked waiting on the user and stopped answering.
+    m.printer.status.filament_change_pause = True
+    m.printer.status.filament_present = None
+    Monitor._check_filament_runout(m)
+    assert m.printer.status.filament_runout is True
+    assert len(m.push.sent) == 1                 # no false "reloaded"
+
+    # ...and the M600 alert must not claim the same pause either.
+    Monitor._check_color_change(m)
+    assert len(m.push.sent) == 1
+
+    # Resumed — now the all-clear is real.
+    m.printer.status.filament_change_pause = False
+    Monitor._check_filament_runout(m)
+    assert m.printer.status.filament_runout is False
+    assert len(m.push.sent) == 2
+
+
+class _FakeSerial:
+    """Minimal stand-in for a Marlin USB port: answers the poll commands this
+    app sends, and lets a test flip the runout switch mid-print."""
+
+    def __init__(self):
+        self.filament = True
+        self.printing = True
+        self._out = deque()
+
+    # ── the pyserial surface PrinterController actually uses ──
+    def reset_input_buffer(self):
+        self._out.clear()
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+    def readline(self):
+        return self._out.popleft() if self._out else b""
+
+    def write(self, raw):
+        cmd = raw.decode().strip()
+        if cmd == "M105":
+            self._reply("ok T:210.0 /210.0 B:60.0 /60.0")
+        elif cmd == "M27":
+            self._reply("SD printing byte 500000/1000000" if self.printing
+                        else "Not SD printing", ok=True)
+        elif cmd == "M31":
+            self._reply("echo:Print time: 1h 0m 0s", ok=True)
+        elif cmd == "M114":
+            self._reply("X:0.00 Y:0.00 Z:10.00 E:0.00", ok=True)
+        elif cmd == "M119":
+            # This machine reads TRIGGERED when filament is threaded.
+            self._reply("Reporting endstop status\nx_min: open\ny_min: open\n"
+                        f"filament: {'TRIGGERED' if self.filament else 'open'}", ok=True)
+        else:
+            self._reply("ok")
+
+    def _reply(self, text, ok=False):
+        for line in text.split("\n"):
+            self._out.append((line + "\n").encode())
+        if ok:
+            self._out.append(b"ok\n")
+
+
+def test_end_to_end_runout_from_serial_to_notification():
+    """The whole path against stock-firmware-shaped output and no G-code index:
+    poll, learn the polarity, flip the switch, classify, notify."""
+    m = _FakeMonitorForRunout(index=None)
+    pc = PrinterController(port="")
+    pc._serial = _FakeSerial()
+    pc.status.connected = True
+    m.printer = pc
+
+    for _ in range(SENSOR_CALIBRATION_POLLS):
+        pc.refresh_status()
+        Monitor._check_filament_runout(m)
+    assert pc.status.printing is True
+    assert pc.status.filament_present is True
+    assert m.push.sent == []                     # a healthy print stays quiet
+
+    pc._serial.filament = False                  # the spool runs out
+    pc.refresh_status()
+    Monitor._check_filament_runout(m)
+
+    assert pc.status.filament_runout is True
+    assert pc.status.runout_source == "sensor"
+    assert len(m.push.sent) == 1
+    assert "ran out" in m.push.sent[0][0]
+    assert m.push.sent[0][2] == "high"
+
+
+def test_no_all_clear_when_the_print_was_cancelled_instead_of_reloaded():
+    """Giving up and cancelling also ends the runout state — but claiming the
+    print "is moving again" then would be plainly false."""
+    m = _FakeMonitorForRunout(index=None)
+    m.printer.status.printing = True
+    m.printer.status.filament_present = False
+    Monitor._check_filament_runout(m)
+    assert len(m.push.sent) == 1
+
+    # Print cancelled at the LCD: job gone, nothing resumed.
+    m.printer.status.printing = False
+    Monitor._check_filament_runout(m)
+    assert m.printer.status.filament_runout is False
+    assert m._runout_alerted is False
+    assert len(m.push.sent) == 1           # no bogus "moving again"

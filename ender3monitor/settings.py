@@ -73,6 +73,11 @@ SCHEMA: Dict[str, dict] = {
         "enum", "pause", "Automation", "Failure action",
         choices=["pause", "cooldown", "estop"],
         help="pause = M25; cooldown = pause + heaters off; estop = M112."),
+    "filament_runout_alert": _field(
+        "bool", True, "Automation", "Filament runout alert",
+        help="Push an alert when the filament runs out mid-print. Reads the "
+             "runout sensor over USB, and treats a pause the sliced file never "
+             "asked for as a runout too."),
 
     # ── Timelapse ──
     "timelapse_mode": _field(

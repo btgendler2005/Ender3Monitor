@@ -307,7 +307,9 @@ def _printer_status_lines() -> list:
     def t(v, tgt):
         return "—" if v is None else f"{round(v)}°" + (f"/{round(tgt)}°" if tgt else "")
     lines = [f"Nozzle: {t(pr.nozzle_temp, pr.nozzle_target)}   Bed: {t(pr.bed_temp, pr.bed_target)}"]
-    if pr.filament_change_pause:
+    if pr.filament_runout:
+        lines.append("🧵 Paused — filament runout")
+    elif pr.filament_change_pause:
         lines.append("🎨 Paused — change filament (M600)")
     if pr.printing and pr.progress is not None:
         d = pr.as_dict()
@@ -1693,7 +1695,13 @@ function render(d) {
     document.getElementById('temp-nozzle').textContent = fmt(p.nozzle_temp, p.nozzle_target);
     document.getElementById('temp-bed').textContent    = fmt(p.bed_temp, p.bed_target);
     const prog = document.getElementById('printer-progress');
-    if (p.filament_change_pause) {
+    if (p.filament_runout) {
+      // Shown ahead of the M600 line: a runout also parks the printer waiting
+      // on the user, and calling that a color change would send you to the
+      // printer expecting the wrong job.
+      prog.textContent = '🧵 Paused — filament runout';
+      prog.style.color = 'var(--red)';
+    } else if (p.filament_change_pause) {
       prog.textContent = '🎨 Paused — change filament (M600)';
       prog.style.color = 'var(--amber)';
     } else if (p.printing && p.progress != null) {
