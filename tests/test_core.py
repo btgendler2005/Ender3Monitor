@@ -768,3 +768,16 @@ def test_build_context_note_flags_bridging_as_expected():
     plain = build_context_note("Outer wall", 19, 27)
     assert "layer 19 of 27" in plain and "expected for this feature" not in plain
     assert build_context_note(None, None, None) is None
+
+
+def test_notification_toggles_mute_channels():
+    from ender3monitor.notifier import EmailNotifier
+    from ender3monitor.push import PushNotifier
+    e = EmailNotifier("h", 587, "u", "p", "s", "r")
+    assert e.enabled
+    e.muted = True
+    assert not e.enabled
+    p = PushNotifier(telegram_bot_token="t", telegram_chat_id="c")
+    assert p.channels() == ["telegram"] and p.enabled
+    p.telegram_muted = True
+    assert p.channels() == [] and not p.enabled

@@ -216,6 +216,8 @@ class Monitor:
             telegram_bot_token=config.telegram_bot_token,
             telegram_chat_id=config.telegram_chat_id,
         )
+        self.notifier.muted = not self.settings.get("email_notifications")
+        self.push.telegram_muted = not self.settings.get("telegram_notifications")
         self.maintenance = MaintenanceTracker(
             reminder_hours=self.settings.get("maintenance_reminder_hours"))
 
@@ -455,6 +457,10 @@ class Monitor:
         """
         if key == "auto_start_on_print":
             self.auto_start_enabled = bool(value)
+        elif key == "email_notifications":
+            self.notifier.muted = not bool(value)
+        elif key == "telegram_notifications":
+            self.push.telegram_muted = not bool(value)
         elif key == "maintenance_reminder_hours":
             self.maintenance.reminder_hours = max(1, int(value))
         elif key == "timelapse_max_sessions":
