@@ -19,8 +19,9 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass
-from typing import Optional
+from collections import deque
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 try:
     import serial  # pyserial
@@ -86,6 +87,11 @@ _ENDSTOP_REPORT_RE = re.compile(
 # as the "filament present" baseline (see _learn_sensor_polarity).
 SENSOR_CALIBRATION_POLLS = 3
 
+# Temperature history kept for the dashboard chart: ~30 minutes at the 5 s
+# poll cadence. Bounded both by sample count and by age (see temp_history()).
+TEMP_HISTORY_SECONDS = 30 * 60
+TEMP_HISTORY_MAX_SAMPLES = 360
+
 
 def _fmt_duration(seconds: Optional[int]) -> Optional[str]:
     if seconds is None:
@@ -106,6 +112,7 @@ class PrinterStatus:
     nozzle_target: Optional[float] = None
     bed_temp: Optional[float] = None
     bed_target: Optional[float] = None
+    temps_at: Optional[float] = None        # unix time of the last good M105 reading
     printing: bool = False                  # an SD/USB print is currently active
     progress: Optional[float] = None        # 0..1, SD prints only
     elapsed_seconds: Optional[int] = None   # print job timer (M31)
@@ -113,6 +120,10 @@ class PrinterStatus:
     z_height: Optional[float] = None        # current nozzle Z (M114), for first-layer / layer-timelapse
     lifetime_print_seconds: Optional[int] = None  # firmware EEPROM total (M78)
     filament_change_pause: bool = False     # printer is blocked waiting on the user (M600 etc.)
+    # Latched by our own pause()/cooldown() and cleared by resume() or the job
+    # ending, so the UI can offer one Pause/Resume toggle. A pause made on the
+    # printer's own LCD is not visible over serial and is not reflected here.
+    paused: bool = False
 
     # ── Filament runout ──
     # `filament_present` is the runout sensor read over M119 and normalised for
@@ -139,6 +150,8 @@ class PrinterStatus:
     feature: Optional[str] = None           # active ;TYPE: e.g. "Outer wall"
     remaining_source: str = "bytes"         # "slicer" | "layers" | "bytes"
     next_color_change_seconds: Optional[int] = None  # until the next embedded M600
+    # Where the file's embedded M600s fall, as 0..1 fractions of total layers.
+    color_change_marks: List[float] = field(default_factory=list)
 
     last_error: Optional[str] = None
 
@@ -150,6 +163,7 @@ class PrinterStatus:
             "nozzle_target": self.nozzle_target,
             "bed_temp": self.bed_temp,
             "bed_target": self.bed_target,
+            "temps_at": self.temps_at,
             "printing": self.printing,
             "progress": self.progress,
             "elapsed_seconds": self.elapsed_seconds,
@@ -157,6 +171,7 @@ class PrinterStatus:
             "z_height": self.z_height,
             "lifetime_print_seconds": self.lifetime_print_seconds,
             "filament_change_pause": self.filament_change_pause,
+            "paused": self.paused,
             "filament_present": self.filament_present,
             "filament_sensor_reported": self.filament_sensor_reported,
             "filament_runout": self.filament_runout,
@@ -169,6 +184,7 @@ class PrinterStatus:
             "feature": self.feature,
             "remaining_source": self.remaining_source,
             "next_color_change_seconds": self.next_color_change_seconds,
+            "color_change_marks": list(self.color_change_marks),
             "layer_str": (f"{self.layer}/{self.total_layers}"
                           if self.layer and self.total_layers else None),
             "elapsed_str": _fmt_duration(self.elapsed_seconds),
@@ -185,6 +201,7 @@ class PrinterStatus:
         self.feature = None
         self.remaining_source = "bytes"
         self.next_color_change_seconds = None
+        self.color_change_marks = []
 
 
 def autodetect_port() -> Optional[str]:
@@ -219,6 +236,11 @@ class PrinterController:
         self._lock = threading.Lock()
         self.status = PrinterStatus()
         self._refresh_count = 0   # paces the slow M78 statistics query
+        # Rolling temperature history for the dashboard chart. Written by the
+        # poll thread, read by web requests — hence its own small lock (never
+        # the serial lock, which can be held for seconds during a slow reply).
+        self._temp_history: deque = deque(maxlen=TEMP_HISTORY_MAX_SAMPLES)
+        self._temp_history_lock = threading.Lock()
         # Hysteresis for clearing filament_change_pause: the busy-keepalive line
         # only arrives every ~2s, so a single reply window without it doesn't
         # prove the pause ended — require a couple of clean replies in a row.
@@ -439,6 +461,29 @@ class PrinterController:
             self.status.nozzle_target = float(m.group(2))
             self.status.bed_temp = float(m.group(3))
             self.status.bed_target = float(m.group(4))
+            self._record_temps()
+
+    def _record_temps(self, now: Optional[float] = None) -> None:
+        """Append the current reading to the bounded temperature history."""
+        st = self.status
+        if st.nozzle_temp is None or st.bed_temp is None:
+            return
+        ts = round(time.time() if now is None else now, 1)
+        st.temps_at = ts
+        with self._temp_history_lock:
+            self._temp_history.append(
+                [ts, st.nozzle_temp, st.nozzle_target, st.bed_temp, st.bed_target])
+
+    def temp_history(self, now: Optional[float] = None) -> List[list]:
+        """Recent samples as [unix_ts, nozzle, nozzle_target, bed, bed_target].
+
+        Oldest first, limited to the last TEMP_HISTORY_SECONDS so a long
+        disconnect doesn't leave stale readings in the window. Returns copies,
+        so callers can't mutate the buffer.
+        """
+        cutoff = (time.time() if now is None else now) - TEMP_HISTORY_SECONDS
+        with self._temp_history_lock:
+            return [list(row) for row in self._temp_history if row[0] >= cutoff]
 
     def query_progress(self) -> None:
         """Update SD-print state + percent via M27 (meaningful for SD/USB prints).
@@ -463,6 +508,7 @@ class PrinterController:
             self.status.printing = "Done printing" not in resp
         elif "Not SD printing" in resp or "Done printing" in resp:
             self.status.printing = False
+            self.status.paused = False
             self.status.file_position = None
             self.status.file_size = None
             # No job, no runout — don't carry an announcement into the next print.
@@ -593,10 +639,12 @@ class PrinterController:
     def pause(self) -> None:
         """Pause an SD print (M25)."""
         self.send("M25")
+        self.status.paused = True
 
     def resume(self) -> None:
         """Resume a paused SD print (M24)."""
         self.send("M24")
+        self.status.paused = False
 
     def cooldown(self) -> None:
         """Pause, then turn off hotend and bed heaters and the part fan."""
@@ -604,6 +652,7 @@ class PrinterController:
         self.send("M104 S0")    # hotend off
         self.send("M140 S0")    # bed off
         self.send("M107")       # part fan off
+        self.status.paused = True
 
     def emergency_stop(self) -> None:
         """Hard halt (M112). The printer must be power-cycled/reset afterwards."""

@@ -463,6 +463,15 @@ def _tg_maintenance(args):
     return "\n".join(lines)
 
 
+def _tg_history(args):
+    """/history → the last 5 recorded prints (date, name, outcome, duration, cost)."""
+    store = getattr(_monitor, "history", None)
+    if store is None:
+        return "Not ready."
+    from ender3monitor.history import format_recent
+    return format_recent(store, limit=5)
+
+
 def _tg_autostart(args):
     if _monitor is None:
         return "Not ready."
@@ -549,6 +558,19 @@ def _tg_timelapse(args):
     return _read_mp4_as_video_reply(mp4, "Timelapse")
 
 
+def _tg_failure_callback(data: str) -> str:
+    """Inline-button press under a failure alert → resolve the pending review."""
+    from monitor import parse_failure_review_callback
+    parsed = parse_failure_review_callback(data)
+    if parsed is None or _monitor is None:
+        return "Unknown button."
+    action, review_id = parsed
+    ops.telegram_commands_total.labels(f"failure_{action}").inc()
+    res = _monitor.resolve_failure_review(action, review_id)
+    icon = {"resume": "▶️", "keep_paused": "⏸", "false_alarm": "🚫"}[action]
+    return f"{icon} {res['message']}" if res["ok"] else res["message"]
+
+
 def _build_telegram_handlers():
     handlers = {
         "status":   (_tg_status,   "current status + temps + progress"),
@@ -561,6 +583,7 @@ def _build_telegram_handlers():
         "go":       (_tg_go,       "start monitoring"),
         "stop":     (_tg_stop,     "stop monitoring"),
         "maintenance": (_tg_maintenance, "print hours + upkeep status"),
+        "history":  (_tg_history,  "last 5 prints: outcome, duration, AI cost"),
         "autostart": (_tg_autostart, "auto-start on print: /autostart on|off"),
         "timelapse": (_tg_timelapse, "compile + send the timelapse so far; "
                                      "/timelapse list or /timelapse <n> for older ones"),
@@ -616,8 +639,10 @@ async def lifespan(app: FastAPI):
     # Interactive Telegram bot (optional)
     if _config.telegram_bot_token:
         allowed = _parse_allowed_chats(_config.telegram_allowed_chats)
-        _telegram = TelegramBot(_config.telegram_bot_token, allowed, _build_telegram_handlers())
+        _telegram = TelegramBot(_config.telegram_bot_token, allowed, _build_telegram_handlers(),
+                                callback_handler=_tg_failure_callback)
         _telegram.start()
+        _monitor.telegram_review_buttons = True   # failure alerts get reply buttons
         log.info("Telegram bot started (authorized chats: %s)",
                  allowed if allowed else "none yet — DM the bot to get your chat ID")
 
@@ -669,12 +694,21 @@ def _check_basic_auth(header: str) -> bool:
 # CancelledError traceback. Pure-ASGI middleware passes cancellation straight
 # through and shuts down cleanly.
 
+_ICON_SIZES = (180, 192, 512)
+_PUBLIC_PATHS = {"/manifest.webmanifest"} | {f"/icon-{n}.png" for n in _ICON_SIZES}
+
+
 class _AuthMiddleware:
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or not _auth_enabled():
+            await self.app(scope, receive, send)
+            return
+        # Home-screen install assets: the OS fetches these without the page's
+        # Basic credentials, and they reveal nothing about the printer.
+        if scope.get("path") in _PUBLIC_PATHS:
             await self.app(scope, receive, send)
             return
         if _check_basic_auth(Headers(scope=scope).get("authorization", "")):
@@ -776,6 +810,21 @@ async def _push_loop() -> None:
             await _send_all(msg)
 
 
+def _failure_review_state() -> Optional[dict]:
+    """The pending failure review for the UI — everything but the JPEG bytes."""
+    fr = _monitor.failure_review
+    if fr is None:
+        return None
+    return {
+        "id": fr["id"],
+        "failure_type": fr["failure_type"],
+        "confidence": fr["confidence"],
+        "description": fr["description"],
+        "timestamp": fr["timestamp"],
+        "image_url": (f"/api/failure/snapshot?t={fr['id']}" if fr.get("jpeg") else None),
+    }
+
+
 def _state() -> dict:
     if _monitor is None:
         return {"status": "starting", "is_running": False}
@@ -797,6 +846,9 @@ def _state() -> dict:
         "threshold": _monitor.settings.get("confidence_threshold"),
         "cost_usd": round(_monitor.session_cost_usd, 4),
         "events": list(_monitor.events),
+        "failure_review": _failure_review_state(),
+        "false_alarm_count": _monitor.false_alarm_count,
+        "confidence_history": list(_monitor.confidence_history),
     }
 
 
@@ -989,6 +1041,38 @@ async def api_printer(body: PrinterActionBody):
     return {"message": msg}
 
 
+class FailureResolveBody(BaseModel):
+    action: str   # resume | keep_paused | false_alarm
+
+
+@app.get("/api/failure/snapshot")
+async def api_failure_snapshot():
+    """The frame that triggered the pending failure review."""
+    fr = _monitor.failure_review if _monitor is not None else None
+    if fr is None or not fr.get("jpeg"):
+        return JSONResponse({"error": "no failure snapshot"}, 404)
+    return Response(fr["jpeg"], media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/failure/resolve")
+async def api_failure_resolve(body: FailureResolveBody):
+    """Answer the pending failure review: resume, keep paused, or false alarm."""
+    if _monitor is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    from monitor import FAILURE_REVIEW_ACTIONS
+    action = (body.action or "").lower()
+    if action not in FAILURE_REVIEW_ACTIONS:
+        return JSONResponse({"error": f"unknown action '{action}'"}, 400)
+
+    loop = asyncio.get_running_loop()
+    res = await loop.run_in_executor(None, _monitor.resolve_failure_review, action)
+    await _broadcast()
+    if not res["ok"]:
+        return JSONResponse({"error": res["message"]}, 409)
+    return {"message": res["message"]}
+
+
 def _timelapse_dir() -> Path:
     return Path(_config.timelapse_dir).resolve() if _config else Path("timelapse_frames").resolve()
 
@@ -1015,9 +1099,96 @@ async def download_timelapse(name: Optional[str] = None):
     return FileResponse(str(candidate), media_type="video/mp4", filename=candidate.name)
 
 
+# ── Print history ─────────────────────────────────────────────────────────────
+
+def _history_store():
+    return getattr(_monitor, "history", None) if _monitor is not None else None
+
+
+def _history_thumb_file(store, rec: Optional[dict]) -> Optional[Path]:
+    """Resolved thumbnail path for a record, or None. Path-traversal safe —
+    only .jpg files directly inside the history dir are served."""
+    p = store.thumb_path_for(rec)
+    if p is None:
+        return None
+    base = store.dir.resolve()
+    candidate = (base / Path(p).name).resolve()
+    if candidate.parent != base or candidate.suffix != ".jpg" or not candidate.is_file():
+        return None
+    return candidate
+
+
+def _history_public(store, rec: dict) -> dict:
+    """A record as the UI sees it, plus what is actually still on disk."""
+    out = dict(rec)
+    out["has_thumbnail"] = _history_thumb_file(store, rec) is not None
+    tl = rec.get("timelapse")
+    tl_ok = False
+    if tl and isinstance(tl, str):
+        base = _timelapse_dir()
+        cand = (base / Path(tl).name).resolve()
+        tl_ok = cand.parent == base and cand.suffix == ".mp4" and cand.is_file()
+    out["timelapse_available"] = tl_ok
+    return out
+
+
+@app.get("/api/history")
+async def api_history():
+    """All recorded prints, newest first, without their event logs."""
+    store = _history_store()
+    if store is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    return {"prints": [_history_public(store, r) for r in store.list()]}
+
+
+@app.get("/api/history/{record_id}")
+async def api_history_get(record_id: str):
+    store = _history_store()
+    if store is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    rec = store.get(record_id)
+    if rec is None:
+        return JSONResponse({"error": "Print not found."}, 404)
+    return _history_public(store, rec)
+
+
+@app.get("/api/history/{record_id}/thumb")
+async def api_history_thumb(record_id: str):
+    store = _history_store()
+    if store is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    # The file is looked up via the stored record, never built from the URL.
+    path = _history_thumb_file(store, store.get(record_id))
+    if path is None:
+        return JSONResponse({"error": "No thumbnail."}, 404)
+    return FileResponse(str(path), media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.delete("/api/history/{record_id}")
+async def api_history_delete(record_id: str):
+    store = _history_store()
+    if store is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    if not store.delete(record_id):
+        return JSONResponse({"error": "Print not found."}, 404)
+    return {"deleted": record_id}
+
+
 @app.get("/api/status")
 async def api_status():
     return _state()
+
+
+@app.get("/api/temps")
+async def api_temps():
+    """Temperature history for the dashboard chart (kept out of the websocket
+    state so pushes stay small). Rows: [unix_ts, nozzle, nozzle_target, bed,
+    bed_target], oldest first."""
+    from ender3monitor.printer import TEMP_HISTORY_SECONDS
+    samples = _monitor.printer.temp_history() if _monitor is not None else []
+    return {"window_seconds": TEMP_HISTORY_SECONDS, "now": time.time(),
+            "samples": samples}
 
 
 @app.post("/api/events/clear")
@@ -1168,6 +1339,56 @@ async def stream():
     )
 
 
+# ── Home-screen install (manifest + icons) ───────────────────────────────────
+
+@app.get("/manifest.webmanifest")
+async def manifest():
+    """Lets a phone add the dashboard to its home screen as a full-screen app."""
+    return JSONResponse({
+        "name": "Ender3Monitor",
+        "short_name": "Ender3",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#070b14",
+        "theme_color": "#0d1120",
+        "icons": [{"src": f"/icon-{n}.png", "sizes": f"{n}x{n}", "type": "image/png"}
+                  for n in _ICON_SIZES if n != 180],
+    }, media_type="application/manifest+json",
+       headers={"Cache-Control": "public, max-age=86400"})
+
+
+_icon_cache: dict = {}
+
+
+def _icon_png(size: int) -> bytes:
+    """Draw the app icon (a printer gantry over a bed) once per size."""
+    if size not in _icon_cache:
+        n = 512
+        img = np.full((n, n, 3), (32, 17, 13), np.uint8)          # --surf, BGR
+        blue = (247, 142, 79)                                      # --blue, BGR
+        aa = cv2.LINE_AA
+        cv2.line(img, (136, 372), (136, 132), blue, 30, aa)       # left upright
+        cv2.line(img, (376, 372), (376, 132), blue, 30, aa)       # right upright
+        cv2.line(img, (136, 132), (376, 132), blue, 30, aa)       # top beam
+        cv2.line(img, (104, 392), (408, 392), blue, 34, aa)       # bed
+        cv2.rectangle(img, (220, 190), (292, 246), blue, -1, aa)  # print head
+        cv2.fillConvexPoly(img, np.array([[232, 246], [280, 246], [256, 290]]), blue, aa)
+        cv2.rectangle(img, (212, 330), (300, 368), (240, 228, 221), -1, aa)  # part
+        if size != n:
+            img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".png", img)
+        _icon_cache[size] = buf.tobytes() if ok else b""
+    return _icon_cache[size]
+
+
+@app.get("/icon-{size}.png")
+async def icon(size: int):
+    if size not in _ICON_SIZES:
+        return Response(status_code=404)
+    return Response(_icon_png(size), media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 # ── HTML / CSS / JS  (single-file, no build step) ────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
@@ -1195,7 +1416,15 @@ _HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0d1120">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Ender3">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<link rel="icon" type="image/png" href="/icon-192.png">
 <title>Ender3Monitor</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -1291,7 +1520,7 @@ header{
 }
 
 /* ── Camera ── */
-.cam-card{grid-row:1/3;display:flex;flex-direction:column;gap:14px}
+.cam-card{display:flex;flex-direction:column;gap:14px}
 #cam{
   width:100%;aspect-ratio:16/9;
   border-radius:8px;object-fit:cover;
@@ -1338,19 +1567,6 @@ header{
 .print-pills .pct .num{color:var(--blue)}
 .stat-chip{font-size:11px;color:var(--muted);background:var(--surf3);border-radius:999px;padding:4px 10px}
 
-/* ── Printer controls ── */
-.printer-controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
-.pbtn{
-  padding:9px 10px;border-radius:8px;
-  border:1px solid var(--border);background:var(--surf3);color:var(--text);
-  font-size:12.5px;font-weight:600;cursor:pointer;transition:all .15s;
-  justify-content:center;
-}
-.pbtn:hover{border-color:rgba(255,255,255,.16);background:#1d2336}
-.pbtn:active{transform:scale(.97)}
-.pbtn-stop{background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.3);color:var(--red)}
-.pbtn-stop:hover{background:rgba(248,113,113,.2)}
-
 /* ── Description ── */
 .desc-card{}
 #description{
@@ -1372,16 +1588,8 @@ header{
 #cam-select:disabled{opacity:.4;cursor:not-allowed}
 .btn-scan{background:var(--surf3);border-color:var(--border);color:var(--muted);padding:8px 12px}
 .btn-scan:hover{color:var(--text)}
-.autostart-toggle{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);
-  cursor:pointer;padding:0 6px;user-select:none}
-.autostart-toggle input{width:15px;height:15px;accent-color:var(--blue);cursor:pointer}
 
-/* ── Controls ── */
-.controls{
-  display:flex;gap:10px;flex-wrap:wrap;
-  padding:0 28px 4px;
-  max-width:1180px;width:100%;margin:0 auto;
-}
+/* ── Buttons ── */
 button{
   display:flex;align-items:center;gap:7px;
   padding:9px 18px;border-radius:9px;
@@ -1456,6 +1664,72 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
   overflow:hidden;
 }
 .ev-conf{color:var(--muted);font-family:monospace;text-align:right;padding-top:2px}
+
+/* ── Charts ── */
+.charts-card{grid-column:1/-1;min-width:0}
+.ch-legend{display:flex;flex-wrap:wrap;gap:6px 18px;margin-bottom:10px;font-size:12px;color:var(--muted)}
+.ch-key{display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
+.ch-key b{color:var(--text);font-weight:700;font-variant-numeric:tabular-nums}
+.ch-key b span{color:var(--muted);font-weight:500}
+.ch-swatch{width:14px;height:0;border-top:2px solid var(--muted);border-radius:2px;flex:none}
+.ch-swatch.dash{border-top-style:dashed}
+.ch-svg{display:block;width:100%;height:170px;overflow:visible}
+.ch-grid{stroke:var(--border);stroke-width:1;shape-rendering:crispEdges}
+.ch-axis{fill:var(--muted);font-size:10.5px;font-family:inherit;font-variant-numeric:tabular-nums}
+.ch-empty{fill:var(--muted);font-size:12px;font-style:italic}
+.ch-line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.ch-target{fill:none;stroke-width:1.25;stroke-dasharray:4 4;opacity:.7}
+.ch-nozzle{stroke:var(--amber)}
+.ch-bed{stroke:var(--blue)}
+.ch-dot{stroke:var(--surf);stroke-width:2}
+.ch-dot.ch-nozzle{fill:var(--amber)}
+.ch-dot.ch-bed{fill:var(--blue)}
+.ch-layer{margin-top:16px;padding-top:14px;border-top:1px solid var(--border)}
+.ch-layer-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;
+               font-size:12px;color:var(--muted);margin-bottom:7px}
+.ch-layer-head b{color:var(--text);font-weight:700;font-variant-numeric:tabular-nums}
+.ch-bar{position:relative;height:8px;background:var(--surf3);border-radius:4px}
+.ch-bar-fill{height:100%;width:0;background:var(--blue);border-radius:4px;transition:width .7s cubic-bezier(.4,0,.2,1)}
+.ch-tick{position:absolute;top:-3px;bottom:-3px;width:2px;margin-left:-1px;border-radius:1px;
+         background:var(--amber);box-shadow:0 0 0 1px var(--surf)}
+.ch-tick.done{background:var(--muted)}
+.ch-layer-note{font-size:10.5px;color:var(--muted);margin-top:7px}
+
+/* ── Failure review ── */
+.fr-card{display:none;grid-column:1/-1;border-color:rgba(248,113,113,.35)}
+.fr-card.show{display:block}
+.fr-card .card-label{color:var(--red)}
+.fr-body{display:flex;gap:18px;align-items:flex-start}
+.fr-img{
+  flex:0 0 300px;width:300px;max-width:100%;aspect-ratio:16/9;
+  object-fit:cover;border-radius:8px;background:var(--surf3);display:block;
+}
+.fr-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:10px}
+.fr-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.fr-type{font-size:20px;font-weight:700;color:var(--red);overflow-wrap:anywhere}
+.fr-conf{font-size:13px;font-weight:600;color:var(--amber)}
+.fr-time{font-size:11.5px;color:var(--muted)}
+.fr-desc{font-size:13px;line-height:1.55;overflow-wrap:anywhere}
+.fr-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:4px}
+.fr-actions button{justify-content:center;padding:11px 20px;font-size:14px;font-weight:600}
+.fr-resume{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.3);color:var(--green)}
+.fr-resume:hover{background:rgba(34,197,94,.2)}
+.fr-keep{background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.3);color:var(--amber)}
+.fr-keep:hover{background:rgba(251,191,36,.18)}
+.fr-false{background:var(--surf3);color:var(--blue)}
+.fr-actions button:disabled{opacity:.5;cursor:default}
+.fr-note{font-size:11.5px;color:var(--muted)}
+.conf-spark{margin-top:10px}
+.conf-spark svg{display:block;width:100%;height:36px;background:var(--surf3);border-radius:6px}
+.conf-spark-meta{display:flex;justify-content:space-between;gap:8px;margin-top:5px;
+                 font-size:10.5px;color:var(--muted)}
+@media (max-width:760px){
+  .fr-body{flex-direction:column;gap:12px}
+  .fr-img{flex:none;width:100%}
+  .fr-actions{flex-wrap:nowrap;gap:8px}
+  .fr-actions button{flex:1 1 0;min-width:0;padding:15px 4px;font-size:13.5px}
+}
+/* ── /Failure review ── */
 
 /* ── Toast ── */
 #toast{
@@ -1541,14 +1815,111 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
 .tgl input:checked + .track .knob{transform:translateX(18px);background:var(--blue)}
 .set-info-row{font-size:11.5px;color:var(--muted);padding:6px 0;display:flex;justify-content:space-between}
 
+/* ── Status headline ── */
+.headline{max-width:1180px;width:100%;margin:0 auto;padding:20px 28px 0}
+.hl-main{font-size:26px;font-weight:800;letter-spacing:-.5px;line-height:1.2;overflow-wrap:anywhere}
+.hl-sub{font-size:13.5px;color:#8291b3;margin-top:5px;display:flex;flex-wrap:wrap;gap:2px 0}
+.hl-sub span:not(:last-child)::after{content:'·';margin:0 7px;color:var(--muted)}
+.hl-sub .warn{color:var(--amber)}
+.hl-bar{height:4px;background:var(--surf3);border-radius:2px;overflow:hidden;margin-top:12px;display:none}
+.hl-bar div{height:100%;width:0;background:var(--blue);border-radius:2px;transition:width .7s}
+.headline.t-idle .hl-main{color:#8291b3}
+.headline.t-warn .hl-main{color:var(--amber)}
+.headline.t-warn .hl-bar div{background:var(--amber)}
+.headline.t-fail .hl-main{color:var(--red)}
+.headline.t-fail .hl-bar div{background:var(--red)}
+.headline.t-done .hl-main{color:var(--green)}
+.headline.t-done .hl-bar div{background:var(--green)}
+
+/* ── Details (collapsed secondary stats) ── */
+.details{border-top:1px solid var(--border);padding-top:14px}
+.details summary{
+  font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
+  color:var(--muted);cursor:pointer;list-style:none;
+  display:flex;justify-content:space-between;align-items:center;
+}
+.details summary::-webkit-details-marker{display:none}
+.details summary::after{content:'+';font-size:15px;line-height:1;font-weight:500}
+.details[open] summary::after{content:'–'}
+.details[open] summary{margin-bottom:12px}
+.details-meta{font-size:11px;color:var(--muted);margin-top:10px;display:flex;flex-direction:column;gap:4px}
+
+/* ── Sticky action bar ── */
+body{padding-bottom:calc(84px + env(safe-area-inset-bottom))}
+#toast{bottom:calc(96px + env(safe-area-inset-bottom));opacity:0;transition:transform .25s,opacity .25s}
+#toast.show{opacity:1}
+.actionbar{
+  position:fixed;left:0;right:0;bottom:0;z-index:50;
+  background:rgba(13,17,32,.94);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  border-top:1px solid var(--border);
+  padding:8px max(12px,env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left));
+}
+.ab-inner{display:flex;gap:6px;max-width:560px;margin:0 auto}
+.ab-btn{
+  flex:1 1 0;min-width:0;min-height:54px;
+  flex-direction:column;justify-content:center;gap:3px;
+  padding:7px 4px;border-radius:11px;
+  background:var(--surf3);font-size:10.5px;font-weight:600;
+  position:relative;overflow:hidden;
+  touch-action:manipulation;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;
+}
+.ab-btn svg{width:18px;height:18px;flex:0 0 auto}
+.ab-btn:hover{background:#1d2336}
+.ab-monitor{flex-grow:1.25;color:var(--blue);background:rgba(79,142,247,.12);border-color:rgba(79,142,247,.3)}
+.ab-monitor:hover{background:rgba(79,142,247,.2)}
+.ab-monitor.on{color:var(--text);background:var(--surf3);border-color:var(--border)}
+.ab-monitor.on:hover{background:#1d2336}
+.ab-pause.resume{color:var(--green);background:rgba(34,197,94,.1);border-color:rgba(34,197,94,.3)}
+.ab-estop{color:var(--red);background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.3)}
+.ab-estop:hover{background:rgba(248,113,113,.16)}
+.ab-estop:active{transform:none}
+.ab-estop > *{position:relative}
+.ab-estop .hold-fill{
+  position:absolute;inset:0;background:rgba(248,113,113,.5);
+  transform:scaleX(0);transform-origin:left;pointer-events:none;
+}
+.ab-estop.holding .hold-fill{transform:scaleX(1);transition:transform 1.5s linear}
+.ab-printer{display:none}
+.actionbar.has-printer .ab-printer{display:flex}
+.ab-more{flex:0 0 50px}
+
+/* ── More sheet ── */
+.sheet-overlay{
+  position:fixed;inset:0;z-index:150;background:rgba(0,0,0,.55);
+  display:none;align-items:flex-end;justify-content:center;
+}
+.sheet-overlay.show{display:flex}
+.sheet{
+  background:var(--surf);border:1px solid var(--border);border-bottom:none;
+  border-radius:16px 16px 0 0;width:100%;max-width:560px;
+  padding:10px 18px calc(20px + env(safe-area-inset-bottom));
+  display:flex;flex-direction:column;gap:16px;max-height:85vh;overflow-y:auto;
+  box-shadow:var(--shadow);
+}
+.sheet-grip{width:36px;height:4px;border-radius:2px;background:var(--surf3);margin:0 auto}
+.sheet-label{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
+  color:var(--muted);margin-bottom:8px}
+.sheet-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.sheet-row .set-help{margin-top:2px}
+.sheet-wide{width:100%;justify-content:center;padding:13px 18px;font-size:14px}
+.sheet a{color:var(--blue);text-decoration:none;overflow-wrap:anywhere}
+
 /* ── Mobile / narrow screens ── */
 @media (max-width:760px){
+  .headline{padding:14px 16px 0}
+  .hl-main{font-size:22px}
+  /* Camera runs edge to edge: it is the thing you came to look at */
+  .card.cam-card{padding:0;overflow:hidden;gap:0}
+  .cam-card #cam{border-radius:0}
+  .cam-card #description{margin:14px 16px 16px}
   .modal-overlay{padding:0}
   .modal{max-width:none;border-radius:0;min-height:100vh;max-height:100vh}
   .set-control input[type=number],.set-control select{width:108px}
   header{padding:12px 16px}
   .logo{font-size:15px}
-  .pill{padding:5px 10px;font-size:10px}
+  /* The headline below already says the status in words; keep just the dot */
+  .pill{padding:7px}
+  #pill-text{display:none}
 
   /* Stack the two-column layout into one; camera no longer spans rows */
   .page{
@@ -1557,15 +1928,7 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
     gap:14px;
     padding:14px 14px;
   }
-  .cam-card{grid-row:auto}
   .card{padding:16px}
-
-  /* Controls: full-width camera picker, big tappable buttons */
-  .controls{padding:0 14px 4px;gap:8px}
-  .cam-select-row{flex:1 0 100%;min-width:0}
-  #cam-select{min-width:0}
-  .controls > button{flex:1 1 40%;justify-content:center;padding:12px 14px;font-size:14px}
-  .btn-scan{flex:0 0 auto}
 
   .log-section{padding:0 14px 22px}
 
@@ -1610,6 +1973,14 @@ button.busy { cursor: progress; opacity: .6; }
       <div class="dot"></div>
       <span id="pill-text">Idle</span>
     </div>
+    <a class="icon-btn" id="history-btn" href="/history" title="Print history" style="text-decoration:none">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/>
+        <path d="M3 3v5h5"/>
+        <path d="M12 7v5l3 2"/>
+      </svg>
+    </a>
     <button class="icon-btn" id="settings-btn" title="Settings" onclick="openSettings()">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1642,19 +2013,44 @@ button.busy { cursor: progress; opacity: .6; }
   </div>
 </div>
 
+<!-- Status headline: is it OK, and when is it done -->
+<div class="headline t-idle" id="headline" aria-live="polite">
+  <div class="hl-main" id="hl-main">Connecting…</div>
+  <div class="hl-sub" id="hl-sub"></div>
+  <div class="hl-bar" id="hl-bar"><div id="hl-bar-fill"></div></div>
+</div>
+
 <div class="page">
 
-  <!-- Camera -->
-  <div class="card cam-card">
-    <div class="card-label">Camera Feed</div>
-    <img id="cam" src="/stream" alt="Camera preview">
-    <div class="cam-meta">
-      <span id="cam-label">—</span>
-      <span id="stream-link" style="font-size:11px;color:var(--muted)">
-        📱 <a id="stream-url" href="/stream" target="_blank"
-             style="color:var(--muted);text-decoration:none">/stream</a>
-      </span>
+  <!-- Failure review -->
+  <div class="card fr-card" id="fr-card">
+    <div class="card-label">Failure detected — review</div>
+    <div class="fr-body">
+      <img class="fr-img" id="fr-img" alt="Flagged frame">
+      <div class="fr-info">
+        <div class="fr-head">
+          <span class="fr-type" id="fr-type">—</span>
+          <span class="fr-conf" id="fr-conf"></span>
+          <span class="fr-time" id="fr-time"></span>
+        </div>
+        <div class="fr-desc" id="fr-desc"></div>
+        <div class="fr-actions">
+          <button class="fr-resume" onclick="resolveFailure('resume')">Resume</button>
+          <button class="fr-keep" onclick="resolveFailure('keep_paused')">Keep paused</button>
+          <button class="fr-false" onclick="resolveFailure('false_alarm')">False alarm</button>
+        </div>
+        <div class="fr-note">False alarm only dismisses this alert — it does not resume the print.</div>
+      </div>
     </div>
+  </div>
+  <!-- /Failure review -->
+
+  <!-- Camera, with the AI's latest observation as its caption -->
+  <div class="card cam-card">
+    <img id="cam" src="/stream" alt="Live camera view of the printer">
+    <p id="description" style="color:var(--muted);font-style:italic">
+      Waiting for first analysis…
+    </p>
   </div>
 
   <!-- Stats -->
@@ -1668,6 +2064,23 @@ button.busy { cursor: progress; opacity: .6; }
       <div class="conf-track">
         <div class="conf-fill" id="conf-fill" style="width:0;background:var(--green)"></div>
       </div>
+      <!-- Confidence sparkline -->
+      <div class="conf-spark" id="conf-spark">
+        <svg viewBox="0 0 100 36" preserveAspectRatio="none" role="img"
+             aria-label="Confidence over this print, with the alert threshold">
+          <line id="spark-thresh" x1="0" x2="100" y1="18" y2="18" stroke="var(--red)"
+                stroke-width="1" stroke-dasharray="4 3" opacity=".7"
+                vector-effect="non-scaling-stroke"/>
+          <polyline id="spark-line" fill="none" stroke="var(--blue)" stroke-width="1.5"
+                    stroke-linejoin="round" stroke-linecap="round"
+                    vector-effect="non-scaling-stroke" points=""/>
+        </svg>
+        <div class="conf-spark-meta">
+          <span id="spark-span">no analyses yet</span>
+          <span id="spark-false"></span>
+        </div>
+      </div>
+      <!-- /Confidence sparkline -->
     </div>
 
     <div class="type-row">
@@ -1675,24 +2088,9 @@ button.busy { cursor: progress; opacity: .6; }
       <div class="type-val type-ok" id="type-val">none</div>
     </div>
 
-    <div class="counts">
-      <div class="count-box">
-        <div class="lbl">Frames</div>
-        <div class="num" id="frames">0</div>
-      </div>
-      <div class="count-box">
-        <div class="lbl">Failures</div>
-        <div class="num" id="failures" style="color:var(--text)">0</div>
-      </div>
-    </div>
-
-    <div class="cost-line" id="cost-box" title="Estimated AI API cost for this print">
-      Est. AI cost · this print <span id="cost">$0.00</span>
-    </div>
-
     <!-- Printer (USB) — hidden until a printer is connected -->
     <div id="printer-block" style="display:none">
-      <div class="card-label" style="margin-top:18px">Printer</div>
+      <div class="card-label">Printer</div>
       <div class="counts">
         <div class="count-box">
           <div class="lbl">Nozzle</div>
@@ -1710,59 +2108,115 @@ button.busy { cursor: progress; opacity: .6; }
         <div id="pp-chips" style="grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px"></div>
       </div>
       <div style="font-size:11px;color:var(--muted);margin-top:8px" id="printer-progress"></div>
-      <div class="printer-controls">
-        <button class="pbtn" onclick="doPrinter('pause', this)">Pause</button>
-        <button class="pbtn" onclick="doPrinter('resume', this)">Resume</button>
-        <button class="pbtn" onclick="doPrinter('cooldown', this)">Cooldown</button>
-        <button class="pbtn pbtn-stop" onclick="doPrinter('estop', this)">E‑Stop</button>
-      </div>
     </div>
 
-    <div style="font-size:11px;color:var(--muted);border-top:1px solid var(--border);
-                padding-top:14px" id="backend-row"></div>
+    <details class="details" id="details">
+      <summary>Details</summary>
+      <div class="counts">
+        <div class="count-box">
+          <div class="lbl">Frames</div>
+          <div class="num" id="frames">0</div>
+        </div>
+        <div class="count-box">
+          <div class="lbl">Failures</div>
+          <div class="num" id="failures" style="color:var(--text)">0</div>
+        </div>
+      </div>
+      <div class="cost-line" id="cost-box" title="Estimated AI API cost for this print">
+        Est. AI cost · this print <span id="cost">$0.00</span>
+      </div>
+      <div class="details-meta">
+        <span id="backend-row"></span>
+        <span id="cam-label"></span>
+      </div>
+    </details>
   </div>
 
-  <!-- Description -->
-  <div class="card desc-card">
-    <div class="card-label">AI Observation</div>
-    <p id="description" style="color:var(--muted);font-style:italic">
-      Waiting for first analysis…
-    </p>
+  <!-- Charts -->
+  <div class="card charts-card" id="charts-card" style="display:none">
+    <div class="card-label">Temperatures</div>
+    <div class="ch-legend" id="ch-legend"></div>
+    <svg class="ch-svg" id="ch-temps" viewBox="0 0 600 170" role="img"
+         aria-label="Nozzle and bed temperature over the last 30 minutes"></svg>
+    <div class="ch-layer" id="ch-layer" style="display:none">
+      <div class="ch-layer-head"><span id="ch-layer-label">Print progress</span><b id="ch-layer-pct"></b></div>
+      <div class="ch-bar" id="ch-bar"><div class="ch-bar-fill" id="ch-bar-fill"></div></div>
+      <div class="ch-layer-note" id="ch-layer-note"></div>
+    </div>
   </div>
+  <!-- /Charts -->
 
 </div>
 
-<!-- Controls -->
-<div class="controls">
-  <div class="cam-select-row">
-    <select id="cam-select" title="Select camera" onchange="previewCamera()">
-      <option value="">Scanning cameras…</option>
-    </select>
-    <button class="btn-scan" onclick="scanCameras(true)" title="Rescan all cameras">
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <polyline points="23 4 23 10 17 10"/>
-        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-      </svg>
+<!-- Sticky action bar: the controls you reach for mid-print -->
+<nav class="actionbar" id="actionbar" aria-label="Print controls">
+  <div class="ab-inner">
+    <button class="ab-btn ab-monitor" id="btn-monitor" onclick="toggleMonitor()">
+      <svg id="mon-icon" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20"/></svg>
+      <span id="mon-label">Start AI</span>
+    </button>
+    <button class="ab-btn ab-printer ab-pause" id="btn-pause" onclick="togglePause()">
+      <svg id="pause-icon" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+      <span id="pause-label">Pause</span>
+    </button>
+    <button class="ab-btn ab-printer" id="btn-cooldown" onclick="doCooldown()"
+            title="Pause the print and turn the heaters off">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2v20M4.9 6l14.2 12M19.1 6L4.9 18"/></svg>
+      <span>Cooldown</span>
+    </button>
+    <button class="ab-btn ab-printer ab-estop" id="btn-estop"
+            title="Hold to emergency stop" aria-label="Emergency stop — press and hold">
+      <span class="hold-fill"></span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="8 2 16 2 22 8 22 16 16 22 8 22 2 16 2 8"/><path d="M12 8v5M12 16.5v.01"/></svg>
+      <span>E‑Stop</span>
+    </button>
+    <button class="ab-btn ab-more" id="btn-more" onclick="openMore()" aria-label="More controls">
+      <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+      <span>More</span>
     </button>
   </div>
-  <button class="btn-start" id="btn-start" onclick="doStart()">
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21"/></svg>
-    Start
-  </button>
-  <button class="btn-stop" id="btn-stop" onclick="doStop()" disabled>
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
-    Stop
-  </button>
-  <button onclick="doTimelapse()" id="btn-timelapse">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/>
-    </svg>
-    Download Timelapse
-  </button>
-  <label class="autostart-toggle" title="Automatically start monitoring when the printer begins a print">
-    <input type="checkbox" id="autostart-cb" onchange="toggleAutoStart()">
-    <span>Auto-start</span>
-  </label>
+</nav>
+
+<!-- More sheet: the rarely-needed controls -->
+<div id="more-overlay" class="sheet-overlay" onclick="if(event.target===this)closeMore()">
+  <div class="sheet" role="dialog" aria-label="More controls">
+    <div class="sheet-grip"></div>
+    <div>
+      <div class="sheet-label">Camera</div>
+      <div class="cam-select-row">
+        <select id="cam-select" title="Select camera" onchange="previewCamera()">
+          <option value="">Scanning cameras…</option>
+        </select>
+        <button class="btn-scan" onclick="scanCameras(true)" title="Rescan all cameras">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="23 4 23 10 17 10"/>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div class="sheet-row">
+      <div>
+        <div>Auto-start</div>
+        <div class="set-help">Start AI monitoring when the printer begins a print</div>
+      </div>
+      <label class="tgl">
+        <input type="checkbox" id="autostart-cb" onchange="toggleAutoStart()">
+        <span class="track"><span class="knob"></span></span>
+      </label>
+    </div>
+    <button class="sheet-wide" onclick="doTimelapse()" id="btn-timelapse">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/>
+      </svg>
+      Download Timelapse
+    </button>
+    <div>
+      <div class="sheet-label">Live stream link</div>
+      <a id="stream-url" href="/stream" target="_blank">/stream</a>
+    </div>
+    <button class="sheet-wide" onclick="closeMore()">Close</button>
+  </div>
 </div>
 
 <!-- Event log -->
@@ -1779,7 +2233,7 @@ button.busy { cursor: progress; opacity: .6; }
 <div id="toast"></div>
 
 <script>
-let ws, lastFrames = -1, camList = [], lastEventsKey = null, wsWasDown = false;
+let ws, lastFrames = -1, camList = [], lastState = {}, lastEventsKey = null, wsWasDown = false;
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
 function connect() {
@@ -1835,6 +2289,9 @@ async function busy(id, fn) {
 
 // ── Render state ───────────────────────────────────────────────────────────
 function render(d) {
+  lastState = d;
+  renderHeadline(d);
+
   // Pill
   const pill = document.getElementById('pill');
   const s = d.status || '';
@@ -1944,13 +2401,142 @@ function render(d) {
     document.getElementById('cam-label').textContent = `Camera ${d.camera_index}`;
   }
 
-  // Buttons
-  document.getElementById('btn-start').disabled = !!d.is_running;
-  document.getElementById('btn-stop').disabled  = !d.is_running;
+  // Action bar
+  renderActionBar(d);
 
   // Event log — rendered from the server-side history so it survives reloads.
   if (Array.isArray(d.events)) renderEvents(d.events);
+  renderCharts(d);
+  renderFailureReview(d); renderSparkline(d);
 }
+
+// ── Status headline ────────────────────────────────────────────────────────
+// One line that answers "is it OK, and when is it done" — worst news first.
+function renderHeadline(d) {
+  const p = d.printer || {};
+  const s = d.status || '';
+  const pctStr = p.progress != null ? Math.round(p.progress * 100) + '%' : '';
+  let tone = 'idle', main, sub = [], bar = false;
+
+  if (p.connected && p.filament_runout) {
+    tone = 'fail'; main = 'Paused — filament runout';
+  } else if (p.connected && p.filament_change_pause) {
+    tone = 'warn'; main = 'Paused — change filament';
+  } else if (d.is_running && d.failure_detected) {
+    tone = 'fail';
+    main = 'Possible failure: ' + String(d.failure_type || 'unknown').replace(/_/g, ' ');
+  } else if (/error/i.test(s)) {
+    tone = 'warn'; main = s;
+  } else if (p.connected && p.printing && p.paused) {
+    tone = 'warn'; main = 'Paused' + (pctStr ? ' · ' + pctStr : '');
+  } else if (p.connected && p.printing) {
+    tone = 'run'; main = 'Printing' + (pctStr ? ' · ' + pctStr : '');
+  } else if (/complete/i.test(s)) {
+    tone = 'done'; main = 'Print complete';
+  } else if (d.is_running) {
+    tone = 'run'; main = s || 'Monitoring…';
+  } else {
+    main = s === 'starting' ? 'Starting…' : p.connected ? 'Printer idle' : 'Idle';
+  }
+
+  if (p.connected && p.printing) {
+    bar = p.progress != null;
+    if (p.remaining_str) sub.push(['~' + p.remaining_str + ' left']);
+    if (p.layer_str) sub.push(['layer ' + p.layer_str]);
+    if (p.feature && tone === 'run') sub.push([p.feature]);
+    if (p.next_color_change_str) sub.push(['color change in ~' + p.next_color_change_str]);
+    // A print running with nobody watching is the thing worth shouting about.
+    if (!d.is_running) sub.push(['AI monitoring off', 'warn']);
+  } else if (d.is_running && tone !== 'run') {
+    sub.push([s]);
+  } else if (!d.is_running && tone === 'idle' && s !== 'starting') {
+    sub.push(['AI monitoring off']);
+  }
+
+  document.getElementById('headline').className = 'headline t-' + tone;
+  document.getElementById('hl-main').textContent = main;
+  const subEl = document.getElementById('hl-sub');
+  subEl.innerHTML = '';
+  sub.forEach(([text, cls]) => {
+    const el = document.createElement('span');
+    el.textContent = text; if (cls) el.className = cls;
+    subEl.appendChild(el);
+  });
+  document.getElementById('hl-bar').style.display = bar ? 'block' : 'none';
+  if (bar) document.getElementById('hl-bar-fill').style.width = (p.progress * 100) + '%';
+  document.title = (tone === 'fail' ? '⚠ ' : '') +
+    (p.connected && p.printing && pctStr ? pctStr + ' · ' : '') + 'Ender3Monitor';
+}
+
+// ── Action bar ─────────────────────────────────────────────────────────────
+const ICON_PLAY  = '<polygon points="6 4 20 12 6 20"/>';
+const ICON_STOP  = '<rect x="5" y="5" width="14" height="14" rx="2"/>';
+const ICON_PAUSE = '<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>';
+
+function renderActionBar(d) {
+  const p = d.printer || {};
+  document.getElementById('actionbar').classList.toggle('has-printer', !!p.connected);
+
+  const mon = document.getElementById('btn-monitor');
+  mon.classList.toggle('on', !!d.is_running);
+  document.getElementById('mon-label').textContent = d.is_running ? 'Stop AI' : 'Start AI';
+  document.getElementById('mon-icon').innerHTML = d.is_running ? ICON_STOP : ICON_PLAY;
+
+  const pb = document.getElementById('btn-pause');
+  pb.classList.toggle('resume', !!p.paused);
+  document.getElementById('pause-label').textContent = p.paused ? 'Resume' : 'Pause';
+  document.getElementById('pause-icon').innerHTML = p.paused ? ICON_PLAY : ICON_PAUSE;
+}
+
+function toggleMonitor() {
+  if (!lastState.is_running) return doStart();
+  const p = lastState.printer || {};
+  if (p.connected && p.printing &&
+      !confirm('Stop AI monitoring? The print keeps running, unwatched.')) return;
+  doStop();
+}
+
+function togglePause() {
+  doPrinter((lastState.printer || {}).paused ? 'resume' : 'pause');
+}
+
+function doCooldown() {
+  if (confirm('Pause the print and turn the heaters off?')) doPrinter('cooldown');
+}
+
+// E-Stop: press and hold, so a stray thumb can't brick a 10-hour print.
+(function() {
+  const btn = document.getElementById('btn-estop');
+  const HOLD_MS = 1500;
+  let timer = null;
+  const start = () => {
+    if (timer) return;
+    btn.classList.add('holding');
+    timer = setTimeout(() => {
+      timer = null;
+      btn.classList.remove('holding');
+      if (navigator.vibrate) navigator.vibrate(200);
+      doPrinter('estop');
+    }, HOLD_MS);
+  };
+  const cancel = () => {
+    if (!timer) return;
+    clearTimeout(timer); timer = null;
+    btn.classList.remove('holding');
+    toast('Hold for 1.5 s to emergency stop');
+  };
+  btn.addEventListener('pointerdown', e => { e.preventDefault(); start(); });
+  ['pointerup', 'pointerleave', 'pointercancel', 'blur'].forEach(ev =>
+    btn.addEventListener(ev, cancel));
+  btn.addEventListener('contextmenu', e => e.preventDefault());
+  const isKey = e => e.key === ' ' || e.key === 'Enter';
+  btn.addEventListener('keydown', e => { if (isKey(e)) { e.preventDefault(); start(); } });
+  btn.addEventListener('keyup',   e => { if (isKey(e)) cancel(); });
+})();
+
+// ── More sheet ─────────────────────────────────────────────────────────────
+function openMore()  { document.getElementById('more-overlay').classList.add('show'); }
+function closeMore() { document.getElementById('more-overlay').classList.remove('show'); }
 
 function pillClass(s) {
   const l = s.toLowerCase();
@@ -2020,11 +2606,11 @@ async function previewCamera() {
 async function doStart() {
   const cam = selectedCam();
   const body = cam !== null ? { camera_index: cam } : {};
-  const data = await busy('btn-start', () => api('start', body));
+  const data = await busy('btn-monitor', () => api('start', body));
   if (data) render(data);   // after busy() so render sets the final disabled state
 }
 async function doStop() {
-  const data = await busy('btn-stop', () => api('stop'));
+  const data = await busy('btn-monitor', () => api('stop'));
   if (data) render(data);
 }
 async function doTimelapse() {
@@ -2057,10 +2643,6 @@ async function toggleAutoStart() {
 
 // Manual printer control over USB
 async function doPrinter(action, btn) {
-  if (action === 'estop' &&
-      !confirm('Emergency stop halts the printer immediately and requires a power-cycle to recover. Continue?')) {
-    return;
-  }
   await busy(btn, async () => {
     try {
       const res = await fetch('/api/printer', {
@@ -2147,6 +2729,230 @@ async function clearLog() {
     a.textContent = url;
   }
 })();
+
+// ── Charts (temperature history + layer progress) ──────────────────────────
+// History comes once from /api/temps; after that each websocket state carries
+// the newest reading (printer.temps_at), appended here so pushes stay small.
+const CH_WINDOW = 1800, CH_MAX = 360, CH_GAP = 30;   // seconds, samples, seconds
+let chTemps = [], chLast = null, chLoadedAt = 0;
+
+function chMerge(rows) {
+  const seen = new Set(chTemps.map(r => r[0]));
+  rows.forEach(r => {
+    if (Array.isArray(r) && r[0] != null && r[1] != null && r[3] != null && !seen.has(r[0])) {
+      seen.add(r[0]); chTemps.push(r);
+    }
+  });
+  chTemps.sort((a, b) => a[0] - b[0]);
+  if (chTemps.length) {
+    const cutoff = chTemps[chTemps.length - 1][0] - CH_WINDOW;
+    chTemps = chTemps.filter(r => r[0] >= cutoff).slice(-CH_MAX);
+  }
+}
+
+async function loadTemps() {
+  chLoadedAt = Date.now();
+  try {
+    const r = await fetch('/api/temps');
+    if (!r.ok) return;
+    const j = await r.json();
+    chMerge(j.samples || []);
+    if (chLast) renderCharts(chLast);
+  } catch (e) { /* chart just fills in from live updates */ }
+}
+
+function chNiceMax(v) {
+  const steps = [30, 60, 90, 120, 150, 180, 240, 300, 360, 450, 600];
+  for (const s of steps) if (v * 1.05 <= s) return s;
+  return Math.ceil(v * 1.05 / 150) * 150;
+}
+
+// Pure: builds the SVG markup for the temperature plot at a given pixel size.
+function chTempsSvg(rows, w, h) {
+  const L = 34, R = 10, T = 8, B = 20, pw = Math.max(10, w - L - R), ph = h - T - B;
+  if (rows.length < 2) {
+    return `<text class="ch-empty" x="${w / 2}" y="${h / 2}" text-anchor="middle">` +
+           'Collecting temperature data…</text>';
+  }
+  const tEnd = rows[rows.length - 1][0], t0 = tEnd - CH_WINDOW;
+  let top = 0;
+  rows.forEach(r => { for (let i = 1; i < 5; i++) if (r[i] != null && r[i] > top) top = r[i]; });
+  const yMax = chNiceMax(Math.max(top, 25));
+  const X = t => L + Math.min(1, Math.max(0, (t - t0) / CH_WINDOW)) * pw;
+  const Y = v => T + (1 - Math.min(1, Math.max(0, v / yMax))) * ph;
+  const f = n => n.toFixed(1);
+  // One path per series; a new sub-path starts after a gap in the data (a
+  // disconnect) or, for targets, wherever the heater is off.
+  const path = (col, isTarget) => {
+    let d = '', prev = null;
+    rows.forEach(r => {
+      const v = r[col];
+      if (v == null || (isTarget && v <= 0)) { prev = null; return; }
+      const brk = prev == null || r[0] - prev > CH_GAP;
+      d += (brk ? 'M' : 'L') + f(X(r[0])) + ' ' + f(Y(v));
+      prev = r[0];
+    });
+    return d;
+  };
+  let out = '';
+  for (let i = 0; i <= 3; i++) {
+    const v = yMax * i / 3, y = Math.round(Y(v)) + .5;
+    out += `<line class="ch-grid" x1="${L}" x2="${L + pw}" y1="${y}" y2="${y}"/>`;
+    if (i) out += `<text class="ch-axis" x="${L - 6}" y="${y + 3.5}" text-anchor="end">${Math.round(v)}°</text>`;
+  }
+  out += `<text class="ch-axis" x="${L}" y="${h - 4}">30 min ago</text>`;
+  if (pw > 220) out += `<text class="ch-axis" x="${L + pw / 2}" y="${h - 4}" text-anchor="middle">15 min</text>`;
+  out += `<text class="ch-axis" x="${L + pw}" y="${h - 4}" text-anchor="end">now · °C</text>`;
+  const series = [[4, 'ch-target ch-bed', true], [2, 'ch-target ch-nozzle', true],
+                  [3, 'ch-line ch-bed', false], [1, 'ch-line ch-nozzle', false]];
+  series.forEach(([col, cls, isTarget]) => {
+    const d = path(col, isTarget);
+    if (d) out += `<path class="${cls}" d="${d}"/>`;
+  });
+  const last = rows[rows.length - 1];
+  out += `<circle class="ch-dot ch-bed" cx="${f(X(last[0]))}" cy="${f(Y(last[3]))}" r="4"/>`;
+  out += `<circle class="ch-dot ch-nozzle" cx="${f(X(last[0]))}" cy="${f(Y(last[1]))}" r="4"/>`;
+  return out;
+}
+
+function chLegendHtml(p) {
+  const val = (t, tgt) => t == null ? '—'
+    : Math.round(t) + '°' + (tgt ? ' <span>/ ' + Math.round(tgt) + '°</span>' : '');
+  return '<span class="ch-key"><i class="ch-swatch" style="border-color:var(--amber)"></i>Nozzle <b>' +
+           val(p.nozzle_temp, p.nozzle_target) + '</b></span>' +
+         '<span class="ch-key"><i class="ch-swatch" style="border-color:var(--blue)"></i>Bed <b>' +
+           val(p.bed_temp, p.bed_target) + '</b></span>' +
+         '<span class="ch-key"><i class="ch-swatch dash"></i>Target</span>';
+}
+
+// Pure: tick marks for the layer bar. marks are 0..1 fractions of total layers.
+function chTicksHtml(marks, progress) {
+  return (marks || []).filter(m => m > 0 && m < 1).map(m =>
+    `<i class="ch-tick${m <= progress ? ' done' : ''}" style="left:${(m * 100).toFixed(2)}%" title="Color change"></i>`
+  ).join('');
+}
+
+function renderCharts(d) {
+  chLast = d;
+  const p = d.printer || {};
+  const card = document.getElementById('charts-card');
+  if (!card) return;
+  if (!p.connected) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+
+  if (p.temps_at != null && p.nozzle_temp != null && p.bed_temp != null) {
+    const lastTs = chTemps.length ? chTemps[chTemps.length - 1][0] : null;
+    // Missed readings (tab asleep, socket dropped): refill from the server.
+    if (lastTs != null && p.temps_at - lastTs > CH_GAP && Date.now() - chLoadedAt > 10000) loadTemps();
+    chMerge([[p.temps_at, p.nozzle_temp, p.nozzle_target, p.bed_temp, p.bed_target]]);
+  }
+
+  document.getElementById('ch-legend').innerHTML = chLegendHtml(p);
+  const svg = document.getElementById('ch-temps');
+  const w = Math.max(240, Math.round(svg.clientWidth || 600)), h = 170;
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  svg.innerHTML = chTempsSvg(chTemps, w, h);
+
+  const layer = document.getElementById('ch-layer');
+  if (p.printing && p.progress != null) {
+    const frac = Math.min(1, Math.max(0, p.progress));
+    const marks = p.total_layers ? (p.color_change_marks || []) : [];
+    layer.style.display = 'block';
+    document.getElementById('ch-layer-label').textContent =
+      p.layer_str ? 'Layer ' + p.layer_str : 'Print progress';
+    document.getElementById('ch-layer-pct').textContent = (frac * 100).toFixed(1) + '%';
+    document.getElementById('ch-bar-fill').style.width = (frac * 100).toFixed(2) + '%';
+    const bar = document.getElementById('ch-bar');
+    bar.querySelectorAll('.ch-tick').forEach(n => n.remove());
+    bar.insertAdjacentHTML('beforeend', chTicksHtml(marks, frac));
+    const n = marks.filter(m => m > 0 && m < 1).length;
+    const note = document.getElementById('ch-layer-note');
+    note.textContent = n ? n + ' color change' + (n > 1 ? 's' : '') + ' marked' : '';
+    note.style.display = n ? 'block' : 'none';
+  } else {
+    layer.style.display = 'none';
+  }
+}
+
+// Redraw at the new pixel width so axis text stays a readable size.
+if (window.ResizeObserver) {
+  new ResizeObserver(() => { if (chLast) renderCharts(chLast); })
+    .observe(document.getElementById('ch-temps'));
+}
+
+// ── Failure review ─────────────────────────────────────────────────────────
+let frShownId = null, frBusy = false, sparkKey = '';
+
+function renderFailureReview(d) {
+  const card = document.getElementById('fr-card');
+  if (!card) return;
+  const fr = d.failure_review;
+  if (!fr) {
+    card.classList.remove('show');
+    frShownId = null;
+    return;
+  }
+  card.classList.add('show');
+  if (fr.id === frShownId) return;   // same incident — don't reload the image
+  frShownId = fr.id;
+  const img = document.getElementById('fr-img');
+  if (fr.image_url) { img.src = fr.image_url; img.style.display = ''; }
+  else { img.removeAttribute('src'); img.style.display = 'none'; }
+  document.getElementById('fr-type').textContent = fr.failure_type || 'failure';
+  document.getElementById('fr-conf').textContent =
+    fr.confidence != null ? Math.round(fr.confidence * 100) + '% confidence' : '';
+  document.getElementById('fr-time').textContent =
+    fr.timestamp ? new Date(fr.timestamp * 1000).toTimeString().slice(0, 8) : '';
+  document.getElementById('fr-desc').innerHTML =
+    esc(fr.description || 'No description from the analyzer.');
+}
+
+function renderSparkline(d) {
+  const line = document.getElementById('spark-line');
+  if (!line) return;
+  const hist = Array.isArray(d.confidence_history) ? d.confidence_history : [];
+  const thr = d.threshold ?? 0.7;
+  const fa = d.false_alarm_count || 0;
+  const key = hist.length + ':' + (hist.length ? hist[hist.length - 1][0] : 0) + ':' + thr + ':' + fa;
+  if (key === sparkKey) return;
+  sparkKey = key;
+  // 0–100% maps to y 34–2 (2px breathing room top and bottom of the 36px box).
+  const y = c => (34 - Math.max(0, Math.min(1, c)) * 32).toFixed(1);
+  const ty = y(thr);
+  const tl = document.getElementById('spark-thresh');
+  tl.setAttribute('y1', ty); tl.setAttribute('y2', ty);
+  let pts = '';
+  if (hist.length === 1) pts = `0,${y(hist[0][1])} 100,${y(hist[0][1])}`;
+  else pts = hist.map((p, i) => `${(i / (hist.length - 1) * 100).toFixed(1)},${y(p[1])}`).join(' ');
+  line.setAttribute('points', pts);
+  document.getElementById('spark-span').textContent = hist.length
+    ? `last ${hist.length} ${hist.length === 1 ? 'analysis' : 'analyses'} · dashed = threshold`
+    : 'no analyses yet';
+  document.getElementById('spark-false').textContent =
+    fa ? `${fa} false alarm${fa === 1 ? '' : 's'}` : '';
+}
+
+async function resolveFailure(action) {
+  if (frBusy) return;
+  frBusy = true;
+  const btns = document.querySelectorAll('#fr-card .fr-actions button');
+  btns.forEach(b => b.disabled = true);
+  try {
+    const res = await fetch('/api/failure/resolve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ action }),
+    });
+    let data = {};
+    try { data = await res.json(); } catch(e) {}
+    toast(res.ok ? (data.message || 'Done') : (data.error || 'Could not resolve the failure'));
+  } catch(e) {
+    toast('Network error');
+  } finally {
+    frBusy = false;
+    btns.forEach(b => b.disabled = false);
+  }
+}
 
 // ── Toast ──────────────────────────────────────────────────────────────────
 function toast(msg, ms=3000) {
@@ -2275,12 +3081,401 @@ async function saveSettings() {
   }
 }
 
-// Esc closes the modal
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSettings(); });
+// Esc closes the modal and the More sheet
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeSettings(); closeMore(); } });
 
 // ── Boot ───────────────────────────────────────────────────────────────────
 scanCameras();
+loadTemps();
 connect();
+</script>
+</body>
+</html>
+"""
+
+# ── Print history page (separate from the dashboard's _HTML) ─────────────────
+
+@app.get("/history", response_class=HTMLResponse)
+async def history_page():
+    return HTMLResponse(_HISTORY_HTML, headers={"Cache-Control": "no-cache"})
+
+
+_HISTORY_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Print history – Ender3Monitor</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{overflow-x:hidden;max-width:100%}
+
+:root{
+  --bg:#070b14;
+  --surf:#0d1120;
+  --surf2:#121729;
+  --surf3:#181f30;
+  --border:rgba(255,255,255,0.07);
+  --blue:#4f8ef7;
+  --green:#22c55e;
+  --red:#f87171;
+  --amber:#fbbf24;
+  --text:#dde4f0;
+  --muted:#4a5878;
+  --soft:#8693ad;
+  --r:12px;
+}
+
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
+  font-size:14px;
+  line-height:1.5;
+  min-height:100vh;
+  overflow-x:hidden;
+}
+
+header{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:14px 28px;
+  background:var(--surf);
+  border-bottom:1px solid var(--border);
+  position:sticky;top:0;z-index:10;
+}
+.logo{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:700;
+  letter-spacing:-.3px;color:var(--text);text-decoration:none;min-width:0}
+.logo svg{opacity:.85;flex:none}
+.logo span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.header-right{display:flex;align-items:center;gap:12px;flex:none}
+.icon-btn{
+  display:flex;align-items:center;justify-content:center;
+  width:34px;height:34px;padding:0;border-radius:9px;
+  background:var(--surf3);border:1px solid var(--border);color:var(--muted);
+  cursor:pointer;transition:all .15s;text-decoration:none;
+}
+.icon-btn:hover{color:var(--text);border-color:rgba(255,255,255,.14)}
+.back{
+  display:flex;align-items:center;gap:6px;height:34px;padding:0 12px 0 8px;
+  border-radius:9px;background:var(--surf3);border:1px solid var(--border);
+  color:var(--soft);font-size:13px;font-weight:600;text-decoration:none;
+  transition:all .15s;
+}
+.back:hover{color:var(--text);border-color:rgba(255,255,255,.14)}
+
+.page{max-width:900px;margin:0 auto;padding:22px 28px 48px}
+.page-head{display:flex;align-items:baseline;justify-content:space-between;
+  gap:12px;margin-bottom:14px}
+.page-head h1{font-size:20px;font-weight:700;letter-spacing:-.3px}
+.count{color:var(--soft);font-size:12.5px;font-variant-numeric:tabular-nums}
+
+.list{display:flex;flex-direction:column;gap:10px}
+.card{
+  background:var(--surf);border:1px solid var(--border);border-radius:var(--r);
+  overflow:hidden;
+}
+.card.open{border-color:rgba(255,255,255,.13)}
+.card-head{
+  display:flex;align-items:center;gap:14px;width:100%;
+  padding:12px;background:none;border:0;color:inherit;font:inherit;
+  text-align:left;cursor:pointer;
+}
+.card-head:hover{background:rgba(255,255,255,.02)}
+.card-head:focus-visible{outline:2px solid var(--blue);outline-offset:-2px;border-radius:var(--r)}
+.thumb{
+  flex:none;width:96px;height:72px;border-radius:8px;overflow:hidden;
+  background:var(--surf3);border:1px solid var(--border);
+  display:flex;align-items:center;justify-content:center;color:var(--muted);
+}
+.thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.body{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.row1{display:flex;align-items:center;gap:8px;min-width:0}
+.name{flex:1;min-width:0;font-size:14.5px;font-weight:600;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.when{color:var(--soft);font-size:12.5px}
+.stats{display:flex;flex-wrap:wrap;gap:2px 14px;color:var(--soft);font-size:12.5px;
+  font-variant-numeric:tabular-nums}
+.stats b{color:var(--text);font-weight:600}
+.stats .bad b{color:var(--red)}
+.chev{flex:none;color:var(--muted);transition:transform .15s}
+.card.open .chev{transform:rotate(180deg)}
+
+.badge{
+  flex:none;display:inline-flex;align-items:center;
+  padding:2px 9px;border-radius:100px;
+  font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;
+  white-space:nowrap;
+}
+.b-completed{background:rgba(34,197,94,.12);color:var(--green)}
+.b-stopped{background:rgba(134,147,173,.14);color:var(--soft)}
+.b-failed{background:rgba(248,113,113,.12);color:var(--red)}
+.b-ok{background:rgba(34,197,94,.12);color:var(--green)}
+.b-fail{background:rgba(248,113,113,.12);color:var(--red)}
+
+.detail{display:none;border-top:1px solid var(--border);padding:14px 12px 12px;
+  background:var(--surf2)}
+.card.open .detail{display:block}
+.facts{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+  gap:10px 16px;margin-bottom:14px}
+.fact .k{color:var(--soft);font-size:11px;font-weight:600;letter-spacing:.06em;
+  text-transform:uppercase}
+.fact .v{font-size:13.5px;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.sec{color:var(--soft);font-size:11px;font-weight:600;letter-spacing:.06em;
+  text-transform:uppercase;margin-bottom:6px}
+.log{
+  max-height:320px;overflow-y:auto;border:1px solid var(--border);
+  border-radius:8px;background:var(--surf);
+}
+.ev{display:grid;grid-template-columns:auto auto minmax(0,1fr) auto;gap:8px;
+  align-items:start;padding:7px 10px;font-size:12.5px;
+  border-bottom:1px solid var(--border)}
+.ev:last-child{border-bottom:0}
+.ev-time{color:var(--soft);font-family:monospace;font-size:11.5px;padding-top:2px}
+.ev-desc{min-width:0;overflow-wrap:anywhere}
+.ev-conf{color:var(--soft);font-family:monospace;font-size:11.5px;padding-top:2px}
+.note{color:var(--soft);font-size:12.5px;padding:12px 10px}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.btn{
+  display:inline-flex;align-items:center;gap:7px;min-height:36px;padding:0 14px;
+  border-radius:9px;background:var(--surf3);border:1px solid var(--border);
+  color:var(--text);font:inherit;font-size:13px;font-weight:600;
+  text-decoration:none;cursor:pointer;transition:all .15s;
+}
+.btn:hover{border-color:rgba(255,255,255,.18)}
+.btn-primary{background:rgba(79,142,247,.14);border-color:rgba(79,142,247,.3);color:var(--blue)}
+.btn-danger{color:var(--red);margin-left:auto}
+.btn-danger:hover{border-color:rgba(248,113,113,.4)}
+
+.empty{
+  text-align:center;padding:56px 20px;border:1px dashed rgba(255,255,255,.1);
+  border-radius:var(--r);color:var(--soft);
+}
+.empty svg{color:var(--muted);margin-bottom:10px}
+.empty h2{color:var(--text);font-size:16px;font-weight:600;margin-bottom:4px}
+.empty a{color:var(--blue);text-decoration:none}
+
+@media (max-width:600px){
+  header{padding:12px 16px}
+  .page{padding:16px 12px 40px}
+  .card-head{gap:11px;padding:10px}
+  .thumb{width:76px;height:57px}
+  .chev{display:none}
+  .ev{grid-template-columns:auto minmax(0,1fr) auto}
+  .ev .badge{justify-self:start}
+  .ev-desc{grid-column:1 / -1;grid-row:2}
+  .btn-danger{margin-left:0}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <a class="logo" href="/" title="Back to dashboard">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+         stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+      <path d="M3 21h18M5 21V9l7-6 7 6v12"/>
+      <rect x="9" y="13" width="6" height="8" rx="1"/>
+      <path d="M9 13h6"/>
+    </svg>
+    <span>Ender3Monitor</span>
+  </a>
+  <div class="header-right">
+    <a class="back" href="/">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M15 18l-6-6 6-6"/>
+      </svg>
+      Dashboard
+    </a>
+  </div>
+</header>
+
+<main class="page">
+  <div class="page-head">
+    <h1>Print history</h1>
+    <span class="count" id="count"></span>
+  </div>
+  <div class="list" id="list"><div class="note">Loading…</div></div>
+</main>
+
+<script>
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  if (h) return h + 'h ' + m + 'm';
+  if (m) return m + 'm';
+  return sec + 's';
+}
+
+function fmtDate(epoch) {
+  if (!epoch) return '—';
+  return new Date(epoch * 1000).toLocaleString(undefined,
+    {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'});
+}
+
+function fmtCost(v) {
+  v = Number(v) || 0;
+  return '$' + (v > 0 && v < 0.01 ? v.toFixed(3) : v.toFixed(2));
+}
+
+const OUTCOMES = {completed: 'Completed', stopped: 'Stopped', failed: 'Failed'};
+function outcomeBadge(o) {
+  const key = OUTCOMES[o] ? o : 'stopped';
+  return `<span class="badge b-${key}">${OUTCOMES[key]}</span>`;
+}
+
+const PHOTO_ICON = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+  stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/>
+  <path d="M21 16l-5-5-8 8"/></svg>`;
+
+function cardHtml(p) {
+  const id = encodeURIComponent(p.id);
+  const thumb = p.has_thumbnail
+    ? `<img src="/api/history/${id}/thumb" alt="" loading="lazy">`
+    : PHOTO_ICON;
+  const fails = Number(p.failure_count) || 0;
+  const alarms = Number(p.false_alarms) || 0;
+  return `<article class="card" data-id="${esc(p.id)}">
+    <button class="card-head" type="button" aria-expanded="false">
+      <span class="thumb">${thumb}</span>
+      <span class="body">
+        <span class="row1">
+          <span class="name">${esc(p.job_name || fmtDate(p.ended_at))}</span>
+          ${outcomeBadge(p.outcome)}
+        </span>
+        <span class="when">${p.job_name ? esc(fmtDate(p.ended_at)) + ' · ' : ''}${esc(fmtDuration(p.duration_seconds))}</span>
+        <span class="stats">
+          <span>AI <b>${esc(fmtCost(p.ai_cost_usd))}</b></span>
+          <span class="${fails ? 'bad' : ''}"><b>${fails}</b> failure${fails === 1 ? '' : 's'}</span>
+          <span><b>${alarms}</b> false alarm${alarms === 1 ? '' : 's'}</span>
+        </span>
+      </span>
+      <svg class="chev" width="18" height="18" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6 9l6 6 6-6"/></svg>
+    </button>
+    <div class="detail"></div>
+  </article>`;
+}
+
+function fact(k, v) {
+  return `<div class="fact"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
+}
+
+function eventsHtml(events) {
+  if (!events || !events.length) {
+    return '<div class="note">No events were logged for this print.</div>';
+  }
+  return events.slice().reverse().map(e => {
+    const t = new Date((e.t || 0) * 1000).toTimeString().slice(0, 8);
+    const ft = e.type || 'none';
+    const lbl = e.detected ? ft : (ft === 'no_printer' ? 'no printer' : (ft === 'none' ? 'ok' : ft));
+    const conf = e.conf != null ? Math.round(e.conf * 100) + '%' : '';
+    return `<div class="ev">
+      <span class="ev-time">${esc(t)}</span>
+      <span class="badge ${e.detected ? 'b-fail' : 'b-ok'}">${esc(String(lbl).replace(/_/g, ' '))}</span>
+      <span class="ev-desc">${esc(e.desc || '')}</span>
+      <span class="ev-conf">${esc(conf)}</span>
+    </div>`;
+  }).join('');
+}
+
+function detailHtml(p) {
+  const types = (p.failure_types || []).join(', ');
+  let h = '<div class="facts">'
+    + fact('Started', fmtDate(p.started_at))
+    + fact('Ended', fmtDate(p.ended_at))
+    + fact('Duration', fmtDuration(p.duration_seconds))
+    + fact('Frames analysed', p.frames_analyzed != null ? p.frames_analyzed : '—')
+    + (p.total_layers ? fact('Layers', p.total_layers) : '')
+    + (types ? fact('Failure types', types) : '')
+    + '</div>';
+  h += '<div class="sec">Event log</div><div class="log">' + eventsHtml(p.events) + '</div>';
+  h += '<div class="actions">';
+  if (p.timelapse && p.timelapse_available) {
+    h += `<a class="btn btn-primary" href="/download/timelapse?name=${encodeURIComponent(p.timelapse)}">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+      Download timelapse</a>`;
+  }
+  h += '<button class="btn btn-danger" type="button" data-delete>Delete</button></div>';
+  return h;
+}
+
+const listEl = document.getElementById('list');
+const countEl = document.getElementById('count');
+
+function renderList(prints) {
+  countEl.textContent = prints.length ? prints.length + (prints.length === 1 ? ' print' : ' prints') : '';
+  if (!prints.length) {
+    listEl.innerHTML = `<div class="empty">
+      <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></svg>
+      <h2>No prints yet</h2>
+      <p>Each monitored print is saved here when it finishes or is stopped.
+         <a href="/">Back to the dashboard</a></p>
+    </div>`;
+    return;
+  }
+  listEl.innerHTML = prints.map(cardHtml).join('');
+}
+
+async function load() {
+  try {
+    const r = await fetch('/api/history');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    renderList(data.prints || []);
+  } catch (err) {
+    countEl.textContent = '';
+    listEl.innerHTML = '<div class="note">Could not load print history ('
+      + esc(err.message) + '). <a class="btn" href="/history">Retry</a></div>';
+  }
+}
+
+async function toggle(card) {
+  const open = card.classList.toggle('open');
+  card.querySelector('.card-head').setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (!open || card.dataset.loaded) return;
+  const detail = card.querySelector('.detail');
+  detail.innerHTML = '<div class="note">Loading…</div>';
+  try {
+    const r = await fetch('/api/history/' + encodeURIComponent(card.dataset.id));
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    detail.innerHTML = detailHtml(await r.json());
+    card.dataset.loaded = '1';
+  } catch (err) {
+    detail.innerHTML = '<div class="note">Could not load this print (' + esc(err.message) + ').</div>';
+  }
+}
+
+async function removeCard(card) {
+  if (!confirm('Delete this print from the history?')) return;
+  try {
+    const r = await fetch('/api/history/' + encodeURIComponent(card.dataset.id), {method: 'DELETE'});
+    if (!r.ok && r.status !== 404) throw new Error('HTTP ' + r.status);
+    load();
+  } catch (err) {
+    alert('Delete failed: ' + err.message);
+  }
+}
+
+listEl.addEventListener('click', e => {
+  const card = e.target.closest('.card');
+  if (!card) return;
+  if (e.target.closest('[data-delete]')) { removeCard(card); return; }
+  if (e.target.closest('.card-head')) toggle(card);
+});
+
+load();
 </script>
 </body>
 </html>

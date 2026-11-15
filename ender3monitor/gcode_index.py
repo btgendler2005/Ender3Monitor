@@ -233,6 +233,32 @@ class GcodeIndex:
         i = bisect.bisect_right(self.m600_offsets, pos)
         return self.m600_offsets[i] if i < len(self.m600_offsets) else None
 
+    def color_change_marks(self) -> List[float]:
+        """Where the embedded M600s fall, as 0..1 fractions of total layers.
+
+        Slicers differ on whether the M600 is written at the start of the new
+        layer or the end of the old one, so the position inside its layer is
+        interpolated by bytes: either way the mark lands on the boundary where
+        the swap really happens. Empty when the file has no M600s or no layer
+        table to place them against.
+        """
+        offs = self.layer_offsets
+        total = self.total_layers or len(offs)
+        if not total or not self.m600_offsets or not offs:
+            return []
+        marks = []
+        for off in self.m600_offsets:
+            i = bisect.bisect_right(offs, off)          # 1-based layer holding it
+            if i <= 0:
+                marks.append(0.0)
+                continue
+            start = offs[i - 1]
+            end = offs[i] if i < len(offs) else max(self.size_bytes, off + 1)
+            within = (off - start) / (end - start) if end > start else 0.0
+            done = (i - 1) + min(1.0, max(0.0, within))
+            marks.append(round(min(1.0, done / total), 4))
+        return marks
+
     def color_change_near(self, pos: Optional[int],
                           behind: int = 32768, ahead: int = 4096) -> bool:
         """Is there an embedded M600 close enough to `pos` to explain a pause?

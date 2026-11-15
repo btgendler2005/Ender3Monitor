@@ -1232,3 +1232,463 @@ def test_notification_toggles_mute_channels():
     assert p.channels() == ["telegram"] and p.enabled
     p.telegram_muted = True
     assert p.channels() == [] and not p.enabled
+
+
+# ── Pause/Resume toggle state ────────────────────────────────────────────────
+
+def test_paused_flag_follows_our_own_pause_resume_and_job_end():
+    from ender3monitor.printer import PrinterController
+    pc = PrinterController.__new__(PrinterController)
+    pc.status = PrinterStatus(connected=True, printing=True)
+    sent = []
+    pc.send = lambda gcode, **k: sent.append(gcode) or "ok"
+
+    pc.pause()
+    assert pc.status.paused and pc.status.as_dict()["paused"] is True
+    pc.resume()
+    assert not pc.status.paused
+    pc.cooldown()
+    assert pc.status.paused          # cooldown parks the print too
+    assert sent == ["M25", "M24", "M25", "M104 S0", "M140 S0", "M107"]
+
+
+def test_install_assets_are_served_and_skip_auth():
+    import web
+    assert "/manifest.webmanifest" in web._PUBLIC_PATHS
+    assert all(f"/icon-{n}.png" in web._PUBLIC_PATHS for n in web._ICON_SIZES)
+    png = web._icon_png(180)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert 'rel="manifest"' in web._HTML and 'id="btn-estop"' in web._HTML
+
+
+# ── printer: temperature history (dashboard chart) ───────────────────────────
+
+def _pc_with_reply(reply):
+    pc = PrinterController(port="")
+    pc.send = lambda *a, **k: reply
+    return pc
+
+
+def test_temp_history_appends_only_valid_readings():
+    pc = _pc_with_reply("ok T:210.5 /215.0 B:59.8 /60.0 @:0 B@:0")
+    pc.query_temps()
+    rows = pc.temp_history()
+    assert len(rows) == 1
+    ts, nozzle, nozzle_target, bed, bed_target = rows[0]
+    assert (nozzle, nozzle_target, bed, bed_target) == (210.5, 215.0, 59.8, 60.0)
+    assert ts == pc.status.temps_at == pc.status.as_dict()["temps_at"]
+
+    # A reply with no temperatures in it (empty read, dropped link, unrelated
+    # line) must not add a sample or repeat the previous one.
+    for junk in ("", "echo:busy: paused for user", "ok"):
+        pc.send = lambda *a, **k: junk
+        pc.query_temps()
+    assert len(pc.temp_history()) == 1
+
+
+def test_temp_history_is_bounded_and_windowed():
+    from ender3monitor.printer import TEMP_HISTORY_MAX_SAMPLES, TEMP_HISTORY_SECONDS
+    pc = PrinterController(port="")
+    pc.status.nozzle_temp, pc.status.bed_temp = 200.0, 60.0
+    base = 1_000_000.0
+    for i in range(TEMP_HISTORY_MAX_SAMPLES + 50):
+        pc._record_temps(now=base + i * 5)
+    newest = base + (TEMP_HISTORY_MAX_SAMPLES + 49) * 5
+    rows = pc.temp_history(now=newest)
+    assert len(rows) == TEMP_HISTORY_MAX_SAMPLES          # oldest were dropped
+    assert rows[-1][0] == newest
+    assert [r[0] for r in rows] == sorted(r[0] for r in rows)
+    # Readings older than the window are not served (e.g. after a long outage).
+    assert len(pc.temp_history(now=newest + TEMP_HISTORY_SECONDS - 10)) == 3
+    assert pc.temp_history(now=newest + TEMP_HISTORY_SECONDS + 1) == []
+    # Callers get copies, not the live buffer.
+    rows[0][1] = -1
+    assert pc.temp_history(now=newest)[0][1] == 200.0
+
+
+def test_temp_history_skips_incomplete_reading():
+    pc = PrinterController(port="")
+    pc._record_temps()                      # nothing read yet
+    assert pc.temp_history() == [] and pc.status.temps_at is None
+
+
+def test_color_change_marks_are_layer_fractions(tmp_path):
+    # The fixture writes its M600 at the end of layer 5 of 10 → halfway.
+    idx = parse_gcode(_write_gcode(tmp_path, layers=10, m600_at=4))
+    marks = idx.color_change_marks()
+    assert len(marks) == 1 and marks[0] == pytest.approx(0.5, abs=0.03)
+    assert parse_gcode(_write_gcode(tmp_path, layers=10)).color_change_marks() == []
+    # An M600 written at the very start of a layer lands on the same boundary.
+    at_start = GcodeIndex(size_bytes=1000, total_layers=4,
+                          layer_offsets=[0, 250, 500, 750], m600_offsets=[500])
+    assert at_start.color_change_marks() == [0.5]
+    assert GcodeIndex(m600_offsets=[10]).color_change_marks() == []   # no layer table
+
+
+def test_printer_status_color_change_marks_default_and_clear():
+    st = PrinterStatus()
+    assert st.as_dict()["color_change_marks"] == []
+    st.color_change_marks = [0.25, 0.5]
+    st.job_name = "x.gcode"
+    assert st.as_dict()["color_change_marks"] == [0.25, 0.5]
+    st.clear_gcode_context()
+    assert st.color_change_marks == []
+
+
+# ── failure review: Resume / Keep paused / False alarm ──────────────────────
+
+class _ReviewPrinter:
+    def __init__(self, connected=True):
+        self.connected = connected
+        self.resumed = 0
+
+    def resume(self):
+        self.resumed += 1
+
+
+class _FakeMonitorForReview:
+    """Bare object exposing only what the failure-review methods touch."""
+    def __init__(self, connected=True):
+        self.printer = _ReviewPrinter(connected)
+        self._lock = threading.Lock()
+        self.events = deque(maxlen=50)
+        self.failure_review = None
+        self.false_alarm_count = 0
+
+
+def _open_review(m, frame=None):
+    from ender3monitor.analyzer import AnalysisResult
+    result =AnalysisResult(failure_detected=True, confidence=0.91,
+                            failure_type="spaghetti/stringing",
+                            description="Loose strands over the bed")
+    return Monitor._open_failure_review(m, result, frame)
+
+
+def test_failure_review_captures_incident_and_frame():
+    m = _FakeMonitorForReview()
+    review = _open_review(m, np.zeros((48, 64, 3), dtype=np.uint8))
+    assert m.failure_review is review
+    assert review["failure_type"] == "spaghetti/stringing"
+    assert review["confidence"] == 0.91
+    assert review["description"] == "Loose strands over the bed"
+    assert review["timestamp"] > 0
+    assert review["jpeg"][:2] == b"\xff\xd8"          # a real JPEG
+
+
+def test_failure_review_resume_resumes_and_clears():
+    m = _FakeMonitorForReview()
+    _open_review(m)
+    res = Monitor.resolve_failure_review(m, "resume")
+    assert res["ok"] and m.printer.resumed == 1
+    assert m.failure_review is None
+    assert m.false_alarm_count == 0 and not m.events
+
+
+def test_failure_review_resume_without_printer_just_clears():
+    m = _FakeMonitorForReview(connected=False)
+    _open_review(m)
+    res = Monitor.resolve_failure_review(m, "resume")
+    assert res["ok"] and m.printer.resumed == 0
+    assert m.failure_review is None
+
+
+def test_failure_review_keep_paused_only_clears():
+    m = _FakeMonitorForReview()
+    _open_review(m)
+    res = Monitor.resolve_failure_review(m, "keep_paused")
+    assert res["ok"] and m.printer.resumed == 0
+    assert m.failure_review is None
+    assert m.false_alarm_count == 0 and not m.events
+
+
+def test_failure_review_false_alarm_counts_logs_and_does_not_resume():
+    m = _FakeMonitorForReview()
+    _open_review(m)
+    res = Monitor.resolve_failure_review(m, "false_alarm")
+    assert res["ok"]
+    assert m.printer.resumed == 0                      # dismissal only
+    assert m.false_alarm_count == 1
+    assert m.failure_review is None
+    assert len(m.events) == 1
+    ev = m.events[0]
+    assert ev["type"] == "false_alarm" and ev["detected"] is False
+    assert "spaghetti/stringing" in ev["desc"] and ev["conf"] == 0.91
+
+
+def test_failure_review_rejects_bad_action_stale_id_and_no_review():
+    m = _FakeMonitorForReview()
+    assert not Monitor.resolve_failure_review(m, "resume")["ok"]      # nothing pending
+    review = _open_review(m)
+    assert not Monitor.resolve_failure_review(m, "explode")["ok"]
+    assert not Monitor.resolve_failure_review(m, "resume", "stale-id")["ok"]
+    assert m.failure_review is review and m.printer.resumed == 0      # untouched
+    assert Monitor.resolve_failure_review(m, "resume", review["id"])["ok"]
+    # Answered once — a second press finds nothing to resolve.
+    assert not Monitor.resolve_failure_review(m, "false_alarm", review["id"])["ok"]
+    assert m.false_alarm_count == 0 and m.printer.resumed == 1
+
+
+def test_failure_review_callback_data_roundtrip():
+    from monitor import (FAILURE_REVIEW_ACTIONS, failure_review_buttons,
+                         parse_failure_review_callback)
+    buttons = failure_review_buttons("1700000000000")
+    assert [parse_failure_review_callback(d) for _, d in buttons] == [
+        (a, "1700000000000") for a in FAILURE_REVIEW_ACTIONS]
+    assert all(len(d.encode()) <= 64 for _, d in buttons)             # Telegram limit
+    for junk in ("", "fr:resume", "xx:resume:1", "fr:explode:1", "/resume"):
+        assert parse_failure_review_callback(junk) is None
+
+
+# ── telegram: inline buttons on the failure alert ───────────────────────────
+
+def test_push_telegram_attaches_inline_keyboard(monkeypatch):
+    import urllib.parse
+    from ender3monitor.push import PushNotifier
+    posts = []
+    monkeypatch.setattr(PushNotifier, "_post",
+                        staticmethod(lambda url, data, headers=None: posts.append(data)))
+    p = PushNotifier(telegram_bot_token="t", telegram_chat_id="42")
+
+    p.send("Failure", "msg", "high", telegram_buttons=[("Resume", "fr:resume:1")])
+    p.send("Plain", "msg")
+    with_buttons, plain = (urllib.parse.parse_qs(d.decode()) for d in posts)
+    markup = json.loads(with_buttons["reply_markup"][0])
+    assert markup == {"inline_keyboard": [[{"text": "Resume",
+                                            "callback_data": "fr:resume:1"}]]}
+    assert "reply_markup" not in plain
+
+
+def _recording_bot(allowed, callback_handler, edit_ok=True):
+    """TelegramBot with the network calls replaced by a call log."""
+    from ender3monitor.telegram_bot import TelegramBot
+    bot = TelegramBot("token", allowed, {}, callback_handler=callback_handler)
+    bot.calls = []
+    bot.answer_callback = lambda cq_id, text="": bot.calls.append(("answer", cq_id, text))
+    bot.edit_message = lambda chat, mid, text: (
+        bot.calls.append(("edit", chat, mid, text)) or edit_ok)
+    bot.send_message = lambda chat, text: bot.calls.append(("send", chat, text))
+    return bot
+
+
+def _callback_update(chat_id, data="fr:false_alarm:1"):
+    return {"update_id": 7, "callback_query": {
+        "id": "cq1", "data": data,
+        "message": {"message_id": 99, "chat": {"id": chat_id}, "text": "Print failure"},
+    }}
+
+
+def test_telegram_callback_resolves_and_edits_the_alert():
+    seen = []
+    bot = _recording_bot({42}, lambda data: seen.append(data) or "Marked as false alarm")
+    bot._handle_update(_callback_update(42))
+    assert seen == ["fr:false_alarm:1"]
+    assert bot.calls[0] == ("answer", "cq1", "Marked as false alarm")
+    kind, chat, mid, text = bot.calls[1]
+    assert (kind, chat, mid) == ("edit", 42, 99)
+    assert text.startswith("Print failure") and "Marked as false alarm" in text
+    assert len(bot.calls) == 2                         # no extra reply when the edit worked
+
+
+def test_telegram_callback_replies_when_edit_fails():
+    bot = _recording_bot({42}, lambda data: "Kept paused.", edit_ok=False)
+    bot._handle_update(_callback_update(42, "fr:keep_paused:1"))
+    assert bot.calls[-1] == ("send", 42, "Kept paused.")
+
+
+def test_telegram_callback_from_unauthorized_chat_is_refused():
+    seen = []
+    bot = _recording_bot({42}, lambda data: seen.append(data) or "done")
+    bot._handle_update(_callback_update(666))
+    assert seen == []                                  # handler never ran
+    assert [c[0] for c in bot.calls] == ["answer"]
+    assert "Not authorized" in bot.calls[0][2]
+
+
+def test_telegram_callback_drives_the_monitor_resolve():
+    from monitor import parse_failure_review_callback
+    m = _FakeMonitorForReview()
+    review = _open_review(m)
+
+    def handler(data):
+        action, rid = parse_failure_review_callback(data)
+        return Monitor.resolve_failure_review(m, action, rid)["message"]
+
+    bot = _recording_bot({42}, handler)
+    bot._handle_update(_callback_update(42, f"fr:false_alarm:{review['id']}"))
+    assert m.false_alarm_count == 1 and m.failure_review is None
+    assert m.printer.resumed == 0
+
+# ── Print history ───────────────────────────────────────────────────────────
+from ender3monitor.history import (  # noqa: E402
+    MAX_EVENTS, HistoryStore, build_record, format_recent, record_session,
+)
+
+
+def _hist_rec(n=0, **kw):
+    rec = {"started_at": 1000.0 + n, "ended_at": 2000.0 + n, "duration_seconds": 1000,
+           "job_name": f"job{n}.gcode", "outcome": "completed", "failure_count": 0,
+           "failure_types": [], "false_alarms": 0, "frames_analyzed": 5,
+           "ai_cost_usd": 0.12, "thumbnail": None, "timelapse": None,
+           "events": [{"t": 1500.0, "type": "none"}]}
+    rec.update(kw)
+    return rec
+
+
+def test_history_add_is_newest_first_and_list_omits_events(tmp_path):
+    store = HistoryStore(tmp_path / "h")
+    a = store.add(_hist_rec(1))
+    b = store.add(_hist_rec(2))
+    assert a["id"] != b["id"]
+    listed = store.list()
+    assert [r["job_name"] for r in listed] == ["job2.gcode", "job1.gcode"]
+    assert all("events" not in r for r in listed)
+    assert store.get(a["id"])["events"] == [{"t": 1500.0, "type": "none"}]
+    assert store.get("nope") is None
+    assert len(store.list(limit=1)) == 1
+
+
+def test_history_caps_records_and_trims_events(tmp_path):
+    store = HistoryStore(tmp_path / "h", max_records=3)
+    thumb = tmp_path / "h" / "old.jpg"
+    (tmp_path / "h").mkdir()
+    thumb.write_bytes(b"x")
+    store.add(_hist_rec(0, thumbnail="old.jpg"))
+    for n in range(1, 5):
+        store.add(_hist_rec(n, events=[{"t": i} for i in range(MAX_EVENTS + 20)]))
+    assert len(store) == 3
+    assert [r["job_name"] for r in store.list()] == ["job4.gcode", "job3.gcode", "job2.gcode"]
+    assert not thumb.exists()                       # dropped record's thumbnail went too
+    ev = store.get(store.list()[0]["id"])["events"]
+    assert len(ev) == MAX_EVENTS and ev[-1] == {"t": MAX_EVENTS + 19}
+
+
+def test_history_persists_across_instances(tmp_path):
+    store = HistoryStore(tmp_path / "h")
+    rec = store.add(_hist_rec(7, outcome="failed", failure_types=["spaghetti"]))
+    assert store.update(rec["id"], timelapse="timelapse_x.mp4")
+    assert not (tmp_path / "h" / "history.json.tmp").exists()
+    again = HistoryStore(tmp_path / "h")
+    got = again.get(rec["id"])
+    assert got["outcome"] == "failed" and got["failure_types"] == ["spaghetti"]
+    assert got["timelapse"] == "timelapse_x.mp4"
+
+
+@pytest.mark.parametrize("junk", ["{not json", '{"a": 1}', "[1, 2, {}]", ""])
+def test_history_tolerates_corrupt_or_missing_file(tmp_path, junk):
+    d = tmp_path / "h"
+    assert HistoryStore(d).list() == []             # missing dir/file
+    d.mkdir()
+    (d / "history.json").write_text(junk)
+    store = HistoryStore(d)
+    assert store.list() == []
+    store.add(_hist_rec(1))                         # and it recovers on the next write
+    assert len(HistoryStore(d)) == 1
+
+
+def test_history_delete_removes_record_and_thumbnail(tmp_path):
+    store = HistoryStore(tmp_path / "h")
+    name = store.save_thumbnail("abc", np.zeros((720, 1280, 3), dtype=np.uint8))
+    assert name == "abc.jpg" and (tmp_path / "h" / name).is_file()
+    rec = store.add(_hist_rec(1, thumbnail=name))
+    keep = store.add(_hist_rec(2))
+    assert store.delete(rec["id"]) is True
+    assert store.delete(rec["id"]) is False
+    assert not (tmp_path / "h" / name).exists()
+    assert [r["id"] for r in HistoryStore(tmp_path / "h").list()] == [keep["id"]]
+
+
+def test_history_thumb_path_cannot_escape_the_directory(tmp_path):
+    store = HistoryStore(tmp_path / "h")
+    p = store.thumb_path_for({"thumbnail": "../../etc/passwd"})
+    assert p == tmp_path / "h" / "passwd"
+    assert store.thumb_path_for({"thumbnail": None}) is None
+
+
+class _HistStatus:
+    elapsed_seconds = 3725
+    job_name = None            # already cleared by the time the print has ended
+    total_layers = None
+
+
+class _FakeMonitorForHistory:
+    def __init__(self):
+        self.printer = type("P", (), {"status": _HistStatus()})()
+        self.frame_count = 12
+        self.failure_count = 2
+        self.session_cost_usd = 0.3456789
+        self._session_started_at = 5000.0
+        self._print_active_since = 5100.0
+        self._history_job = ("benchy.gcode", 240)
+        self._history_timelapse = "timelapse_1.mp4"
+        self._run_failure_types = {"spaghetti", "none", "warping"}
+        self.events = deque([
+            {"t": 4000.0, "type": "none", "desc": "previous session"},
+            {"t": 5200.0, "type": "spaghetti", "conf": 0.9, "desc": "mess", "detected": True},
+        ], maxlen=50)
+
+
+def test_build_record_snapshots_the_session():
+    m = _FakeMonitorForHistory()
+    rec = build_record(m, "completed", now=9000.0)
+    assert rec["outcome"] == "completed"
+    assert rec["started_at"] == 5000.0 and rec["ended_at"] == 9000.0
+    assert rec["duration_seconds"] == 3725           # printer's job timer wins
+    assert rec["job_name"] == "benchy.gcode" and rec["total_layers"] == 240
+    assert rec["failure_count"] == 2
+    assert rec["failure_types"] == ["spaghetti", "warping"]
+    assert rec["false_alarms"] == 0                  # attribute not present yet
+    assert rec["frames_analyzed"] == 12
+    assert rec["ai_cost_usd"] == 0.3457
+    assert rec["timelapse"] == "timelapse_1.mp4"
+    assert [e["type"] for e in rec["events"]] == ["spaghetti"]   # earlier session dropped
+    json.dumps(rec)                                  # must be JSON-serialisable
+
+    m.false_alarm_count = 3
+    m.printer.status.elapsed_seconds = None
+    rec = build_record(m, "bogus", now=9000.0)
+    assert rec["false_alarms"] == 3
+    assert rec["outcome"] == "stopped"
+    assert rec["duration_seconds"] == 3900           # falls back to print-active time
+
+
+def test_record_session_skips_empty_sessions_and_saves_thumbnail(tmp_path):
+    store = HistoryStore(tmp_path / "h")
+    m = _FakeMonitorForHistory()
+    m.frame_count = 0
+    assert record_session(store, m, "stopped") is None
+    assert len(store) == 0
+
+    m.frame_count = 4
+    frame = np.full((480, 960, 3), 127, dtype=np.uint8)
+    rec = record_session(store, m, "stopped", frame, now=9000.0)
+    assert rec["thumbnail"] == rec["id"] + ".jpg"
+    assert (tmp_path / "h" / rec["thumbnail"]).stat().st_size > 0
+    assert store.list()[0]["id"] == rec["id"]
+    # No frame → still recorded, just without a thumbnail.
+    assert record_session(store, m, "failed", None, now=9100.0)["thumbnail"] is None
+
+
+def test_monitor_record_history_runs_once_and_never_raises(tmp_path):
+    m = _FakeMonitorForHistory()
+    m.history = HistoryStore(tmp_path / "h")
+    m._history_recorded = False
+    m._history_last_id = None
+    Monitor._record_history(m, "completed", None)
+    Monitor._record_history(m, "stopped", None)      # second call is a no-op
+    assert len(m.history) == 1 and m._history_last_id == m.history.list()[0]["id"]
+
+    class _Boom:
+        def new_id(self, *_a):
+            raise OSError("disk full")
+    m.history, m._history_recorded = _Boom(), False
+    Monitor._record_history(m, "completed", None)    # swallowed
+
+
+def test_history_format_recent(tmp_path):
+    store = HistoryStore(tmp_path / "h")
+    assert format_recent(store) == "No prints recorded yet."
+    for n in range(7):
+        store.add(_hist_rec(n))
+    text = format_recent(store, limit=5)
+    assert text.count("job") == 5 and "job6.gcode" in text and "job1.gcode" not in text
+    assert "completed" in text and "16m" in text and "$0.12" in text
