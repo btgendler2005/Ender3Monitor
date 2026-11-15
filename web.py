@@ -123,6 +123,17 @@ class StreamCapture:
         self._IDLE_DEMAND_WINDOW = 5.0     # seconds a snapshot keeps us "active"
         self._IDLE_READ_SLEEP = 0.5        # idle: ~2 fps camera reads
         self._IDLE_ENCODE_INTERVAL = 2.0   # idle: refresh the jpeg every 2 s
+        # Set by add_viewer()/latest_jpeg() so an idle loop wakes immediately
+        # instead of finishing its _IDLE_READ_SLEEP before serving a new viewer.
+        self._wake = threading.Event()
+
+        # Push-based frame delivery: every published jpeg bumps _jpeg_seq and
+        # wakes the asyncio waiters registered by next_jpeg(), so MJPEG viewers
+        # get a frame the moment it is encoded rather than on their own poll
+        # tick (which added ~40 ms average latency and dropped frames to beat).
+        self._jpeg_seq = 0
+        self._jpeg_ts = 0.0
+        self._waiters: set = set()   # {(loop, asyncio.Event)}
 
     # ── lifecycle ──
     def start(self) -> None:
@@ -171,7 +182,7 @@ class StreamCapture:
         self._frame_ready = self._stop_worker = None
 
     def _loop(self) -> None:
-        last_encode = 0.0
+        next_encode = 0.0
         while self._running:
             # Paused (or reindexing): drop the worker so a scan can use the camera.
             if self._paused:
@@ -195,27 +206,50 @@ class StreamCapture:
                 continue   # no new frame yet; loop back and re-check liveness
             self._frame_ready.clear()
 
-            frame = np.ndarray((self.height, self.width, 3), dtype=np.uint8,
-                                buffer=self._shm.buf).copy()
+            view = np.ndarray((self.height, self.width, 3), dtype=np.uint8,
+                              buffer=self._shm.buf)
+            # cv2.flip already writes a new array, so flip straight from the
+            # shared buffer instead of copying first and flipping the copy.
+            flip = self.flip
+            frame = cv2.flip(view, flip) if flip is not None else view.copy()
             ops.camera_frames_total.labels("ok").inc()
-            if self.flip is not None:
-                frame = cv2.flip(frame, self.flip)
             with self._lock:
                 self._latest_raw = frame
             now = time.time()
             active = self._has_demand()
             encode_interval = (self._encode_interval if active
                                else self._IDLE_ENCODE_INTERVAL)
-            if now - last_encode >= encode_interval:
+            # Schedule encodes on a fixed timeline (next_encode += interval)
+            # rather than "interval since the last encode": frames only arrive
+            # every ~33-40 ms, so the latter always overshoots to the next
+            # frame and a 12 fps target actually ran at ~9 fps on a 26 fps
+            # camera. Re-anchor if we fell behind or the interval shrank
+            # (idle -> active), so a new viewer gets a frame immediately.
+            if next_encode - now > encode_interval or now - next_encode > encode_interval:
+                next_encode = now
+            if now >= next_encode:
                 ok2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
                 if ok2:
-                    with self._lock:
-                        self._latest_jpeg = buf.tobytes()
-                last_encode = now
+                    self._publish_jpeg(buf.tobytes())
+                next_encode += encode_interval
             if not active:
-                # Idle: don't spin the camera at full rate for nobody.
-                time.sleep(self._IDLE_READ_SLEEP)
+                # Idle: don't spin the camera at full rate for nobody — but
+                # wake at once if a viewer or snapshot request arrives.
+                self._wake.wait(self._IDLE_READ_SLEEP)
+                self._wake.clear()
         self._teardown_worker()
+
+    def _publish_jpeg(self, data: bytes) -> None:
+        with self._lock:
+            self._latest_jpeg = data
+            self._jpeg_seq += 1
+            self._jpeg_ts = time.time()
+            waiters = list(self._waiters)
+        for loop, ev in waiters:
+            try:
+                loop.call_soon_threadsafe(ev.set)
+            except RuntimeError:
+                pass   # that event loop has closed
 
     # ── controls ──
     def set_paused(self, paused: bool) -> None:
@@ -238,6 +272,7 @@ class StreamCapture:
     def add_viewer(self) -> None:
         with self._lock:
             self._viewers += 1
+        self._wake.set()
 
     def remove_viewer(self) -> None:
         with self._lock:
@@ -252,8 +287,38 @@ class StreamCapture:
         # Reading the jpeg signals demand — wakes the encoder for a few seconds
         # so an on-demand /snapshot (UI, Telegram) gets a fresh image next call.
         self._last_jpeg_demand = time.time()
+        self._wake.set()
         with self._lock:
             return self._latest_jpeg
+
+    def jpeg_age(self) -> float:
+        """Seconds since the latest jpeg was encoded (inf if none yet)."""
+        with self._lock:
+            return time.time() - self._jpeg_ts if self._latest_jpeg is not None else float("inf")
+
+    async def next_jpeg(self, last_seq: int, timeout: float):
+        """Return (seq, jpeg) as soon as a jpeg newer than `last_seq` exists.
+
+        Returns immediately if one already does; otherwise waits up to
+        `timeout` seconds for the capture thread to publish one and returns
+        whatever is current (possibly unchanged) when the wait ends.
+        """
+        loop = asyncio.get_running_loop()
+        ev = asyncio.Event()
+        waiter = (loop, ev)
+        with self._lock:
+            if self._jpeg_seq != last_seq and self._latest_jpeg is not None:
+                return self._jpeg_seq, self._latest_jpeg
+            self._waiters.add(waiter)
+        try:
+            await asyncio.wait_for(ev.wait(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            with self._lock:
+                self._waiters.discard(waiter)
+        with self._lock:
+            return self._jpeg_seq, self._latest_jpeg
 
     def latest_frame(self):
         """Return a copy of the latest raw frame (for analysis/timelapse)."""
@@ -662,20 +727,46 @@ app.add_middleware(_MetricsMiddleware)
 
 # ── WebSocket broadcast ───────────────────────────────────────────────────────
 
+_PUSH_CHECK_INTERVAL = 0.5   # how often state is checked for changes
+_PUSH_KEEPALIVE = 10.0       # resend unchanged state at least this often
+_WS_SEND_TIMEOUT = 2.0       # a client slower than this is dropped, not waited on
+_last_push_msg: Optional[str] = None
+_last_push_time = 0.0
+
+
+async def _send_all(msg: str) -> None:
+    """Send `msg` to every browser concurrently; drop clients that fail or stall."""
+    global _last_push_msg, _last_push_time
+    _last_push_msg, _last_push_time = msg, time.monotonic()
+    clients = list(_clients)
+    if not clients:
+        return
+    results = await asyncio.gather(
+        *(asyncio.wait_for(ws.send_text(msg), _WS_SEND_TIMEOUT) for ws in clients),
+        return_exceptions=True,
+    )
+    for ws, res in zip(clients, results):
+        if isinstance(res, BaseException):
+            _clients.discard(ws)
+    ops.ws_clients.set(len(_clients))
+
+
 async def _push_loop() -> None:
-    """Push state to all connected browsers every 2 s."""
+    """Push state to connected browsers as soon as it changes.
+
+    Checks every 0.5 s but only sends when the serialized state differs from
+    the last push (or the keepalive lapses), so status/temperature changes
+    reach the UI ~4x sooner than the old fixed 2 s push while idle traffic —
+    and browser re-renders — drop to almost nothing.
+    """
     while True:
-        await asyncio.sleep(2)
+        await asyncio.sleep(_PUSH_CHECK_INTERVAL)
         if not _clients:
             continue
         msg = json.dumps(_state())
-        dead: Set[WebSocket] = set()
-        for ws in list(_clients):
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                dead.add(ws)
-        _clients.difference_update(dead)
+        if (msg != _last_push_msg
+                or time.monotonic() - _last_push_time >= _PUSH_KEEPALIVE):
+            await _send_all(msg)
 
 
 def _state() -> dict:
@@ -717,6 +808,10 @@ async def ws_endpoint(ws: WebSocket) -> None:
         while True:
             await ws.receive_text()   # keep-alive drain
     except WebSocketDisconnect:
+        pass
+    finally:
+        # Any exit (not only a clean disconnect) must unregister the client,
+        # or broadcasts keep trying to write to a dead socket.
         _clients.discard(ws)
         ops.ws_clients.set(len(_clients))
 
@@ -803,14 +898,7 @@ async def _broadcast() -> None:
     """Push current state to every connected browser immediately."""
     if not _clients:
         return
-    msg = json.dumps(_state())
-    dead: Set[WebSocket] = set()
-    for ws in list(_clients):
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            dead.add(ws)
-    _clients.difference_update(dead)
+    await _send_all(json.dumps(_state()))
 
 
 @app.post("/api/start")
@@ -823,14 +911,16 @@ async def api_start(body: StartBody = StartBody()):
 
     # Point the persistent capture at the chosen camera (if specified), then
     # hand the monitor that same capture as its frame source — no second handle.
+    loop = asyncio.get_running_loop()
     if _stream is not None and cam is not None and cam != _stream.index:
-        _stream.set_index(cam)
+        # set_index sleeps while the old worker is torn down — keep that off
+        # the event loop so the stream and websocket don't freeze meanwhile.
+        await loop.run_in_executor(None, _stream.set_index, cam)
         await asyncio.sleep(0.5)   # let the new camera produce a first frame
 
     provider = _stream.latest_frame if _stream is not None else None
     cam_for_monitor = cam if cam is not None else (_stream.index if _stream else None)
 
-    loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None,
         lambda: _monitor.start(camera_index=cam_for_monitor, frame_provider=provider),
@@ -999,14 +1089,28 @@ async def api_preview(body: PreviewBody):
         return JSONResponse({"error": "stream not ready"}, 503)
     if _monitor and _monitor._running:
         return JSONResponse({"error": "stop monitoring before switching camera"}, 409)
-    _stream.set_index(body.camera_index)
+    # Off the event loop: set_index blocks ~0.3 s while the worker restarts.
+    await asyncio.get_running_loop().run_in_executor(
+        None, _stream.set_index, body.camera_index)
     return {"camera_index": body.camera_index}
+
+
+_SNAPSHOT_MAX_AGE = 1.0   # seconds; older idle frames trigger a fresh encode
 
 
 @app.get("/snapshot")
 async def snapshot():
-    """On-demand JPEG snapshot (single frame from the live buffer)."""
-    data = _stream.latest_jpeg() if _stream else None
+    """On-demand JPEG snapshot (single frame from the live buffer).
+
+    With no live viewers the buffer is only refreshed every ~2 s, so a stale
+    frame triggers a wake-up and a short wait (≤1 s) for a fresh one.
+    """
+    data = _stream.latest_jpeg() if _stream else None   # also wakes the encoder
+    if _stream is not None and (data is None or _stream.jpeg_age() > _SNAPSHOT_MAX_AGE):
+        with _stream._lock:
+            seq = _stream._jpeg_seq
+        _, fresh = await _stream.next_jpeg(seq, _SNAPSHOT_MAX_AGE)
+        data = fresh or data
     if data is None:
         return Response(status_code=204)
     return Response(data, media_type="image/jpeg",
@@ -1014,29 +1118,34 @@ async def snapshot():
 
 
 async def _mjpeg_generator():
-    """Yield MJPEG frames from the shared live buffer at _STREAM_FPS.
+    """Yield MJPEG frames from the shared live buffer as they are encoded.
 
-    Registers as a viewer so the capture loop runs at full rate while at least
-    one stream is open. Skips unchanged frames (identity check — the encoder
-    replaces the buffer object on every encode) so we never resend the same
-    JPEG, which matters on phone connections.
+    Registers as a viewer so the capture loop runs at full rate (_STREAM_FPS
+    encodes) while at least one stream is open. Each frame is pushed the
+    moment the encoder publishes it (next_jpeg), instead of on a fixed poll
+    tick that added up to one frame interval of latency and periodically
+    skipped frames when the two clocks drifted. Unchanged frames are never
+    resent. The 0.5 s wait timeout bounds how long shutdown can go unnoticed.
     """
-    if _stream:
-        _stream.add_viewer()
+    if _stream is None:
+        return
+    _stream.add_viewer()
     try:
-        interval = 1.0 / _STREAM_FPS
-        last_sent = None
+        last_seq = -1
         while not _shutting_down.is_set():
-            frame = _stream.latest_jpeg() if _stream else None
-            if frame is not None and frame is not last_sent:
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n" +
-                    frame +
-                    b"\r\n"
-                )
-                last_sent = frame
-            await asyncio.sleep(interval)
+            seq, frame = await _stream.next_jpeg(last_seq, 0.5)
+            if frame is None or seq == last_seq:
+                continue
+            last_seq = seq
+            # Content-Length lets the browser decode each part as soon as its
+            # last byte arrives rather than waiting for the next boundary.
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n" +
+                frame +
+                b"\r\n"
+            )
     finally:
         if _stream:
             _stream.remove_viewer()
@@ -1466,6 +1575,7 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
   .ev-conf{grid-area:conf;padding-top:0}
   .ev-desc{grid-area:desc;-webkit-line-clamp:4}
 }
+button.busy { cursor: progress; opacity: .6; }
 </style>
 </head>
 <body>
@@ -1581,10 +1691,10 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
       </div>
       <div style="font-size:11px;color:var(--muted);margin-top:8px" id="printer-progress"></div>
       <div class="printer-controls">
-        <button class="pbtn" onclick="doPrinter('pause')">Pause</button>
-        <button class="pbtn" onclick="doPrinter('resume')">Resume</button>
-        <button class="pbtn" onclick="doPrinter('cooldown')">Cooldown</button>
-        <button class="pbtn pbtn-stop" onclick="doPrinter('estop')">E‑Stop</button>
+        <button class="pbtn" onclick="doPrinter('pause', this)">Pause</button>
+        <button class="pbtn" onclick="doPrinter('resume', this)">Resume</button>
+        <button class="pbtn" onclick="doPrinter('cooldown', this)">Cooldown</button>
+        <button class="pbtn pbtn-stop" onclick="doPrinter('estop', this)">E‑Stop</button>
       </div>
     </div>
 
@@ -1649,14 +1759,58 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
 <div id="toast"></div>
 
 <script>
-let ws, lastFrames = -1, camList = [];
+let ws, lastFrames = -1, camList = [], lastEventsKey = null, wsWasDown = false;
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen    = () => {
+    // Back after a drop (e.g. server restart): the old MJPEG socket died with
+    // it and the <img> stays frozen on its last frame unless reopened.
+    if (wsWasDown) { wsWasDown = false; restartStream(); }
+  };
   ws.onmessage = e => render(JSON.parse(e.data));
-  ws.onclose   = () => setTimeout(connect, 2500);
+  ws.onclose   = () => {
+    // Make stale data obvious instead of silently showing the last state.
+    wsWasDown = true;
+    document.getElementById('pill').className = 'pill pill-fail';
+    document.getElementById('pill-text').textContent = 'Disconnected — reconnecting…';
+    setTimeout(connect, 2500);
+  };
+}
+
+// ── Live stream: recover from drops, pause in background tabs ──────────────
+const BLANK_IMG = 'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==';
+let streamRetry = null;
+function restartStream() {
+  const img = document.getElementById('cam');
+  clearTimeout(streamRetry);
+  if (document.hidden) return;              // resumed by visibilitychange
+  img.src = '/stream?t=' + Date.now();      // cache-buster forces a new socket
+}
+(function() {
+  const img = document.getElementById('cam');
+  img.addEventListener('error', () => {
+    if (img.src === BLANK_IMG || document.hidden) return;
+    clearTimeout(streamRetry);
+    streamRetry = setTimeout(restartStream, 2000);
+  });
+  // A hidden tab still pulls ~12 fps and keeps the encoder at full rate for
+  // nobody; close the stream while hidden and reopen it when visible.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { clearTimeout(streamRetry); img.src = BLANK_IMG; }
+    else restartStream();
+  });
+})();
+
+// Disable a button while its request is in flight (no double-submits, and
+// the user sees the click registered even if the server takes a moment).
+async function busy(id, fn) {
+  const btn = typeof id === 'string' ? document.getElementById(id) : id;
+  if (btn) { if (btn.disabled) return; btn.disabled = true; btn.classList.add('busy'); }
+  try { return await fn(); }
+  finally { if (btn) { btn.disabled = false; btn.classList.remove('busy'); } }
 }
 
 // ── Render state ───────────────────────────────────────────────────────────
@@ -1844,11 +1998,11 @@ async function previewCamera() {
 async function doStart() {
   const cam = selectedCam();
   const body = cam !== null ? { camera_index: cam } : {};
-  const data = await api('start', body);
-  if (data) render(data);
+  const data = await busy('btn-start', () => api('start', body));
+  if (data) render(data);   // after busy() so render sets the final disabled state
 }
 async function doStop() {
-  const data = await api('stop');
+  const data = await busy('btn-stop', () => api('stop'));
   if (data) render(data);
 }
 async function doTimelapse() {
@@ -1880,22 +2034,24 @@ async function toggleAutoStart() {
 }
 
 // Manual printer control over USB
-async function doPrinter(action) {
+async function doPrinter(action, btn) {
   if (action === 'estop' &&
       !confirm('Emergency stop halts the printer immediately and requires a power-cycle to recover. Continue?')) {
     return;
   }
-  try {
-    const res = await fetch('/api/printer', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ action }),
-    });
-    const data = await res.json();
-    toast(res.ok ? (data.message || 'Done') : (data.error || 'Printer command failed'));
-  } catch(e) {
-    toast('Printer command failed');
-  }
+  await busy(btn, async () => {
+    try {
+      const res = await fetch('/api/printer', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ action }),
+      });
+      const data = await res.json();
+      toast(res.ok ? (data.message || 'Done') : (data.error || 'Printer command failed'));
+    } catch(e) {
+      toast('Printer command failed');
+    }
+  });
 }
 
 // Returns parsed JSON on success, null on error
@@ -1906,7 +2062,14 @@ async function api(action, body = null) {
       headers: body ? {'Content-Type': 'application/json'} : {},
       body:    body ? JSON.stringify(body) : undefined,
     });
-    if (!res.ok) { toast('Error: ' + res.statusText); return null; }
+    if (!res.ok) {
+      // Show the server's own message (e.g. "Printer not connected") — the
+      // status text alone is often empty or just "Conflict".
+      let msg = res.statusText || ('HTTP ' + res.status);
+      try { const j = await res.json(); if (j && j.error) msg = j.error; } catch(e) {}
+      toast('Error: ' + msg);
+      return null;
+    }
     return await res.json();
   } catch(e) { toast('Network error'); return null; }
 }
@@ -1918,6 +2081,11 @@ function esc(s) {
 }
 
 function renderEvents(events) {
+  // Rebuilding the log's DOM on every push re-laid-out up to 50 rows and
+  // wiped any text selection/hover; only rebuild when the events changed.
+  const key = JSON.stringify(events);
+  if (key === lastEventsKey) return;
+  lastEventsKey = key;
   const log = document.getElementById('log');
   if (!events.length) {
     log.innerHTML = '<div class="log-empty">No events yet — start monitoring to begin.</div>';
@@ -1943,6 +2111,7 @@ function renderEvents(events) {
 
 async function clearLog() {
   await api('events/clear');   // server clears; next state push re-renders empty
+  lastEventsKey = '[]';        // the empty list is already shown below
   document.getElementById('log').innerHTML =
     '<div class="log-empty">Log cleared.</div>';
 }
@@ -1967,9 +2136,6 @@ function toast(msg, ms=3000) {
 
 // ── Settings panel ──────────────────────────────────────────────────────────
 let settingsSchema = null, settingsValues = {};
-
-function esc(s){ return String(s).replace(/[&<>"]/g, c =>
-  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 async function openSettings() {
   const overlay = document.getElementById('settings-overlay');
