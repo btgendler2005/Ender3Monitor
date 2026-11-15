@@ -1029,6 +1029,17 @@ async def api_status():
     return _state()
 
 
+@app.get("/api/temps")
+async def api_temps():
+    """Temperature history for the dashboard chart (kept out of the websocket
+    state so pushes stay small). Rows: [unix_ts, nozzle, nozzle_target, bed,
+    bed_target], oldest first."""
+    from ender3monitor.printer import TEMP_HISTORY_SECONDS
+    samples = _monitor.printer.temp_history() if _monitor is not None else []
+    return {"window_seconds": TEMP_HISTORY_SECONDS, "now": time.time(),
+            "samples": samples}
+
+
 @app.post("/api/events/clear")
 async def api_events_clear():
     if _monitor is None:
@@ -1503,6 +1514,36 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
 }
 .ev-conf{color:var(--muted);font-family:monospace;text-align:right;padding-top:2px}
 
+/* ── Charts ── */
+.charts-card{grid-column:1/-1;min-width:0}
+.ch-legend{display:flex;flex-wrap:wrap;gap:6px 18px;margin-bottom:10px;font-size:12px;color:var(--muted)}
+.ch-key{display:inline-flex;align-items:center;gap:7px;white-space:nowrap}
+.ch-key b{color:var(--text);font-weight:700;font-variant-numeric:tabular-nums}
+.ch-key b span{color:var(--muted);font-weight:500}
+.ch-swatch{width:14px;height:0;border-top:2px solid var(--muted);border-radius:2px;flex:none}
+.ch-swatch.dash{border-top-style:dashed}
+.ch-svg{display:block;width:100%;height:170px;overflow:visible}
+.ch-grid{stroke:var(--border);stroke-width:1;shape-rendering:crispEdges}
+.ch-axis{fill:var(--muted);font-size:10.5px;font-family:inherit;font-variant-numeric:tabular-nums}
+.ch-empty{fill:var(--muted);font-size:12px;font-style:italic}
+.ch-line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.ch-target{fill:none;stroke-width:1.25;stroke-dasharray:4 4;opacity:.7}
+.ch-nozzle{stroke:var(--amber)}
+.ch-bed{stroke:var(--blue)}
+.ch-dot{stroke:var(--surf);stroke-width:2}
+.ch-dot.ch-nozzle{fill:var(--amber)}
+.ch-dot.ch-bed{fill:var(--blue)}
+.ch-layer{margin-top:16px;padding-top:14px;border-top:1px solid var(--border)}
+.ch-layer-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;
+               font-size:12px;color:var(--muted);margin-bottom:7px}
+.ch-layer-head b{color:var(--text);font-weight:700;font-variant-numeric:tabular-nums}
+.ch-bar{position:relative;height:8px;background:var(--surf3);border-radius:4px}
+.ch-bar-fill{height:100%;width:0;background:var(--blue);border-radius:4px;transition:width .7s cubic-bezier(.4,0,.2,1)}
+.ch-tick{position:absolute;top:-3px;bottom:-3px;width:2px;margin-left:-1px;border-radius:1px;
+         background:var(--amber);box-shadow:0 0 0 1px var(--surf)}
+.ch-tick.done{background:var(--muted)}
+.ch-layer-note{font-size:10.5px;color:var(--muted);margin-top:7px}
+
 /* ── Toast ── */
 #toast{
   position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(80px);
@@ -1856,6 +1897,20 @@ button.busy { cursor: progress; opacity: .6; }
     </details>
   </div>
 
+  <!-- Charts -->
+  <div class="card charts-card" id="charts-card" style="display:none">
+    <div class="card-label">Temperatures</div>
+    <div class="ch-legend" id="ch-legend"></div>
+    <svg class="ch-svg" id="ch-temps" viewBox="0 0 600 170" role="img"
+         aria-label="Nozzle and bed temperature over the last 30 minutes"></svg>
+    <div class="ch-layer" id="ch-layer" style="display:none">
+      <div class="ch-layer-head"><span id="ch-layer-label">Print progress</span><b id="ch-layer-pct"></b></div>
+      <div class="ch-bar" id="ch-bar"><div class="ch-bar-fill" id="ch-bar-fill"></div></div>
+      <div class="ch-layer-note" id="ch-layer-note"></div>
+    </div>
+  </div>
+  <!-- /Charts -->
+
 </div>
 
 <!-- Sticky action bar: the controls you reach for mid-print -->
@@ -2116,6 +2171,7 @@ function render(d) {
 
   // Event log — rendered from the server-side history so it survives reloads.
   if (Array.isArray(d.events)) renderEvents(d.events);
+  renderCharts(d);
 }
 
 // ── Status headline ────────────────────────────────────────────────────────
@@ -2438,6 +2494,156 @@ async function clearLog() {
   }
 })();
 
+// ── Charts (temperature history + layer progress) ──────────────────────────
+// History comes once from /api/temps; after that each websocket state carries
+// the newest reading (printer.temps_at), appended here so pushes stay small.
+const CH_WINDOW = 1800, CH_MAX = 360, CH_GAP = 30;   // seconds, samples, seconds
+let chTemps = [], chLast = null, chLoadedAt = 0;
+
+function chMerge(rows) {
+  const seen = new Set(chTemps.map(r => r[0]));
+  rows.forEach(r => {
+    if (Array.isArray(r) && r[0] != null && r[1] != null && r[3] != null && !seen.has(r[0])) {
+      seen.add(r[0]); chTemps.push(r);
+    }
+  });
+  chTemps.sort((a, b) => a[0] - b[0]);
+  if (chTemps.length) {
+    const cutoff = chTemps[chTemps.length - 1][0] - CH_WINDOW;
+    chTemps = chTemps.filter(r => r[0] >= cutoff).slice(-CH_MAX);
+  }
+}
+
+async function loadTemps() {
+  chLoadedAt = Date.now();
+  try {
+    const r = await fetch('/api/temps');
+    if (!r.ok) return;
+    const j = await r.json();
+    chMerge(j.samples || []);
+    if (chLast) renderCharts(chLast);
+  } catch (e) { /* chart just fills in from live updates */ }
+}
+
+function chNiceMax(v) {
+  const steps = [30, 60, 90, 120, 150, 180, 240, 300, 360, 450, 600];
+  for (const s of steps) if (v * 1.05 <= s) return s;
+  return Math.ceil(v * 1.05 / 150) * 150;
+}
+
+// Pure: builds the SVG markup for the temperature plot at a given pixel size.
+function chTempsSvg(rows, w, h) {
+  const L = 34, R = 10, T = 8, B = 20, pw = Math.max(10, w - L - R), ph = h - T - B;
+  if (rows.length < 2) {
+    return `<text class="ch-empty" x="${w / 2}" y="${h / 2}" text-anchor="middle">` +
+           'Collecting temperature data…</text>';
+  }
+  const tEnd = rows[rows.length - 1][0], t0 = tEnd - CH_WINDOW;
+  let top = 0;
+  rows.forEach(r => { for (let i = 1; i < 5; i++) if (r[i] != null && r[i] > top) top = r[i]; });
+  const yMax = chNiceMax(Math.max(top, 25));
+  const X = t => L + Math.min(1, Math.max(0, (t - t0) / CH_WINDOW)) * pw;
+  const Y = v => T + (1 - Math.min(1, Math.max(0, v / yMax))) * ph;
+  const f = n => n.toFixed(1);
+  // One path per series; a new sub-path starts after a gap in the data (a
+  // disconnect) or, for targets, wherever the heater is off.
+  const path = (col, isTarget) => {
+    let d = '', prev = null;
+    rows.forEach(r => {
+      const v = r[col];
+      if (v == null || (isTarget && v <= 0)) { prev = null; return; }
+      const brk = prev == null || r[0] - prev > CH_GAP;
+      d += (brk ? 'M' : 'L') + f(X(r[0])) + ' ' + f(Y(v));
+      prev = r[0];
+    });
+    return d;
+  };
+  let out = '';
+  for (let i = 0; i <= 3; i++) {
+    const v = yMax * i / 3, y = Math.round(Y(v)) + .5;
+    out += `<line class="ch-grid" x1="${L}" x2="${L + pw}" y1="${y}" y2="${y}"/>`;
+    if (i) out += `<text class="ch-axis" x="${L - 6}" y="${y + 3.5}" text-anchor="end">${Math.round(v)}°</text>`;
+  }
+  out += `<text class="ch-axis" x="${L}" y="${h - 4}">30 min ago</text>`;
+  if (pw > 220) out += `<text class="ch-axis" x="${L + pw / 2}" y="${h - 4}" text-anchor="middle">15 min</text>`;
+  out += `<text class="ch-axis" x="${L + pw}" y="${h - 4}" text-anchor="end">now · °C</text>`;
+  const series = [[4, 'ch-target ch-bed', true], [2, 'ch-target ch-nozzle', true],
+                  [3, 'ch-line ch-bed', false], [1, 'ch-line ch-nozzle', false]];
+  series.forEach(([col, cls, isTarget]) => {
+    const d = path(col, isTarget);
+    if (d) out += `<path class="${cls}" d="${d}"/>`;
+  });
+  const last = rows[rows.length - 1];
+  out += `<circle class="ch-dot ch-bed" cx="${f(X(last[0]))}" cy="${f(Y(last[3]))}" r="4"/>`;
+  out += `<circle class="ch-dot ch-nozzle" cx="${f(X(last[0]))}" cy="${f(Y(last[1]))}" r="4"/>`;
+  return out;
+}
+
+function chLegendHtml(p) {
+  const val = (t, tgt) => t == null ? '—'
+    : Math.round(t) + '°' + (tgt ? ' <span>/ ' + Math.round(tgt) + '°</span>' : '');
+  return '<span class="ch-key"><i class="ch-swatch" style="border-color:var(--amber)"></i>Nozzle <b>' +
+           val(p.nozzle_temp, p.nozzle_target) + '</b></span>' +
+         '<span class="ch-key"><i class="ch-swatch" style="border-color:var(--blue)"></i>Bed <b>' +
+           val(p.bed_temp, p.bed_target) + '</b></span>' +
+         '<span class="ch-key"><i class="ch-swatch dash"></i>Target</span>';
+}
+
+// Pure: tick marks for the layer bar. marks are 0..1 fractions of total layers.
+function chTicksHtml(marks, progress) {
+  return (marks || []).filter(m => m > 0 && m < 1).map(m =>
+    `<i class="ch-tick${m <= progress ? ' done' : ''}" style="left:${(m * 100).toFixed(2)}%" title="Color change"></i>`
+  ).join('');
+}
+
+function renderCharts(d) {
+  chLast = d;
+  const p = d.printer || {};
+  const card = document.getElementById('charts-card');
+  if (!card) return;
+  if (!p.connected) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+
+  if (p.temps_at != null && p.nozzle_temp != null && p.bed_temp != null) {
+    const lastTs = chTemps.length ? chTemps[chTemps.length - 1][0] : null;
+    // Missed readings (tab asleep, socket dropped): refill from the server.
+    if (lastTs != null && p.temps_at - lastTs > CH_GAP && Date.now() - chLoadedAt > 10000) loadTemps();
+    chMerge([[p.temps_at, p.nozzle_temp, p.nozzle_target, p.bed_temp, p.bed_target]]);
+  }
+
+  document.getElementById('ch-legend').innerHTML = chLegendHtml(p);
+  const svg = document.getElementById('ch-temps');
+  const w = Math.max(240, Math.round(svg.clientWidth || 600)), h = 170;
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  svg.innerHTML = chTempsSvg(chTemps, w, h);
+
+  const layer = document.getElementById('ch-layer');
+  if (p.printing && p.progress != null) {
+    const frac = Math.min(1, Math.max(0, p.progress));
+    const marks = p.total_layers ? (p.color_change_marks || []) : [];
+    layer.style.display = 'block';
+    document.getElementById('ch-layer-label').textContent =
+      p.layer_str ? 'Layer ' + p.layer_str : 'Print progress';
+    document.getElementById('ch-layer-pct').textContent = (frac * 100).toFixed(1) + '%';
+    document.getElementById('ch-bar-fill').style.width = (frac * 100).toFixed(2) + '%';
+    const bar = document.getElementById('ch-bar');
+    bar.querySelectorAll('.ch-tick').forEach(n => n.remove());
+    bar.insertAdjacentHTML('beforeend', chTicksHtml(marks, frac));
+    const n = marks.filter(m => m > 0 && m < 1).length;
+    const note = document.getElementById('ch-layer-note');
+    note.textContent = n ? n + ' color change' + (n > 1 ? 's' : '') + ' marked' : '';
+    note.style.display = n ? 'block' : 'none';
+  } else {
+    layer.style.display = 'none';
+  }
+}
+
+// Redraw at the new pixel width so axis text stays a readable size.
+if (window.ResizeObserver) {
+  new ResizeObserver(() => { if (chLast) renderCharts(chLast); })
+    .observe(document.getElementById('ch-temps'));
+}
+
 // ── Toast ──────────────────────────────────────────────────────────────────
 function toast(msg, ms=3000) {
   const t = document.getElementById('toast');
@@ -2570,6 +2776,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeSetti
 
 // ── Boot ───────────────────────────────────────────────────────────────────
 scanCameras();
+loadTemps();
 connect();
 </script>
 </body>

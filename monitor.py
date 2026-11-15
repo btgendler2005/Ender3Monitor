@@ -397,6 +397,7 @@ class Monitor:
         # ahead of it by the planner queue depth, so prefer Z for the layer.
         st.layer = idx.layer_at_z(st.z_height) or idx.layer_at_offset(st.file_position)
         st.feature = idx.feature_at_offset(st.file_position)
+        st.color_change_marks = idx.color_change_marks()
 
         remaining, source = self._raw_remaining(idx, st.file_position)
         if remaining is None:

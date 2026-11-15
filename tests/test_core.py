@@ -1259,3 +1259,77 @@ def test_install_assets_are_served_and_skip_auth():
     png = web._icon_png(180)
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
     assert 'rel="manifest"' in web._HTML and 'id="btn-estop"' in web._HTML
+
+
+# ── printer: temperature history (dashboard chart) ───────────────────────────
+
+def _pc_with_reply(reply):
+    pc = PrinterController(port="")
+    pc.send = lambda *a, **k: reply
+    return pc
+
+
+def test_temp_history_appends_only_valid_readings():
+    pc = _pc_with_reply("ok T:210.5 /215.0 B:59.8 /60.0 @:0 B@:0")
+    pc.query_temps()
+    rows = pc.temp_history()
+    assert len(rows) == 1
+    ts, nozzle, nozzle_target, bed, bed_target = rows[0]
+    assert (nozzle, nozzle_target, bed, bed_target) == (210.5, 215.0, 59.8, 60.0)
+    assert ts == pc.status.temps_at == pc.status.as_dict()["temps_at"]
+
+    # A reply with no temperatures in it (empty read, dropped link, unrelated
+    # line) must not add a sample or repeat the previous one.
+    for junk in ("", "echo:busy: paused for user", "ok"):
+        pc.send = lambda *a, **k: junk
+        pc.query_temps()
+    assert len(pc.temp_history()) == 1
+
+
+def test_temp_history_is_bounded_and_windowed():
+    from ender3monitor.printer import TEMP_HISTORY_MAX_SAMPLES, TEMP_HISTORY_SECONDS
+    pc = PrinterController(port="")
+    pc.status.nozzle_temp, pc.status.bed_temp = 200.0, 60.0
+    base = 1_000_000.0
+    for i in range(TEMP_HISTORY_MAX_SAMPLES + 50):
+        pc._record_temps(now=base + i * 5)
+    newest = base + (TEMP_HISTORY_MAX_SAMPLES + 49) * 5
+    rows = pc.temp_history(now=newest)
+    assert len(rows) == TEMP_HISTORY_MAX_SAMPLES          # oldest were dropped
+    assert rows[-1][0] == newest
+    assert [r[0] for r in rows] == sorted(r[0] for r in rows)
+    # Readings older than the window are not served (e.g. after a long outage).
+    assert len(pc.temp_history(now=newest + TEMP_HISTORY_SECONDS - 10)) == 3
+    assert pc.temp_history(now=newest + TEMP_HISTORY_SECONDS + 1) == []
+    # Callers get copies, not the live buffer.
+    rows[0][1] = -1
+    assert pc.temp_history(now=newest)[0][1] == 200.0
+
+
+def test_temp_history_skips_incomplete_reading():
+    pc = PrinterController(port="")
+    pc._record_temps()                      # nothing read yet
+    assert pc.temp_history() == [] and pc.status.temps_at is None
+
+
+def test_color_change_marks_are_layer_fractions(tmp_path):
+    # The fixture writes its M600 at the end of layer 5 of 10 → halfway.
+    idx = parse_gcode(_write_gcode(tmp_path, layers=10, m600_at=4))
+    marks = idx.color_change_marks()
+    assert len(marks) == 1 and marks[0] == pytest.approx(0.5, abs=0.03)
+    assert parse_gcode(_write_gcode(tmp_path, layers=10)).color_change_marks() == []
+    # An M600 written at the very start of a layer lands on the same boundary.
+    at_start = GcodeIndex(size_bytes=1000, total_layers=4,
+                          layer_offsets=[0, 250, 500, 750], m600_offsets=[500])
+    assert at_start.color_change_marks() == [0.5]
+    assert GcodeIndex(m600_offsets=[10]).color_change_marks() == []   # no layer table
+
+
+def test_printer_status_color_change_marks_default_and_clear():
+    st = PrinterStatus()
+    assert st.as_dict()["color_change_marks"] == []
+    st.color_change_marks = [0.25, 0.5]
+    st.job_name = "x.gcode"
+    assert st.as_dict()["color_change_marks"] == [0.25, 0.5]
+    st.clear_gcode_context()
+    assert st.color_change_marks == []
