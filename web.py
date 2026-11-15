@@ -1208,24 +1208,18 @@ header{
 
 .counts{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .count-box{
-  background:var(--surf3);border-radius:9px;
-  padding:14px 16px;
+  background:var(--surf3);border-radius:10px;
+  padding:9px 12px;
 }
-.count-box .lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
-.count-box .num{font-size:26px;font-weight:800;line-height:1}
+.count-box .lbl{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:3px}
+.count-box .num{font-size:18px;font-weight:800;line-height:1.1;white-space:nowrap}
 .cost-line{margin-top:10px;font-size:10px;color:var(--muted);opacity:.7}
 .cost-line span{font-weight:600}
 
 /* ── Print status pills ── */
-.print-pills{display:none;flex-wrap:wrap;gap:8px;margin-top:10px}
-.stat-pill{
-  flex:1 1 120px;background:var(--surf3);border-radius:999px;
-  padding:9px 16px;display:flex;flex-direction:column;gap:2px;
-}
-.stat-pill .k{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
-.stat-pill .v{font-size:16px;font-weight:800;line-height:1.1;color:var(--text)}
-.stat-pill .v small{font-size:11px;font-weight:600;color:var(--muted)}
-.stat-pill.pct .v{color:var(--blue)}
+.print-pills{display:none;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:10px}
+.print-pills .count-box .num{font-size:16px}
+.print-pills .pct .num{color:var(--blue)}
 .stat-chip{font-size:11px;color:var(--muted);background:var(--surf3);border-radius:999px;padding:4px 10px}
 
 /* ── Printer controls ── */
@@ -1585,18 +1579,18 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
       <div class="counts">
         <div class="count-box">
           <div class="lbl">Nozzle</div>
-          <div class="num" id="temp-nozzle" style="font-size:20px">—</div>
+          <div class="num" id="temp-nozzle" style="font-size:16px">—</div>
         </div>
         <div class="count-box">
           <div class="lbl">Bed</div>
-          <div class="num" id="temp-bed" style="font-size:20px">—</div>
+          <div class="num" id="temp-bed" style="font-size:16px">—</div>
         </div>
       </div>
       <div class="print-pills" id="print-pills">
-        <div class="stat-pill pct"><span class="k">Progress</span><span class="v" id="pp-pct">—</span></div>
-        <div class="stat-pill"><span class="k">Elapsed / Left</span>
-          <span class="v"><span id="pp-elapsed">—</span> <small>/</small> <span id="pp-left">—</span></span></div>
-        <div id="pp-chips" style="display:flex;flex-wrap:wrap;gap:6px;width:100%"></div>
+        <div class="count-box pct"><div class="lbl">Progress</div><div class="num" id="pp-pct">—</div></div>
+        <div class="count-box"><div class="lbl">Elapsed</div><div class="num" id="pp-elapsed">—</div></div>
+        <div class="count-box"><div class="lbl">Left</div><div class="num" id="pp-left">—</div></div>
+        <div id="pp-chips" style="grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px"></div>
       </div>
       <div style="font-size:11px;color:var(--muted);margin-top:8px" id="printer-progress"></div>
       <div class="printer-controls">
@@ -1759,7 +1753,8 @@ function render(d) {
       document.getElementById('pp-pct').textContent = (p.progress * 100).toFixed(1) + '%';
       document.getElementById('pp-elapsed').textContent = p.elapsed_str || '—';
       document.getElementById('pp-left').textContent =
-        p.remaining_str ? '~' + p.remaining_str + src : '—';
+        p.remaining_str ? '~' + p.remaining_str : '—';
+      document.getElementById('pp-left').title = src ? 'Estimate source:' + src : '';
       const chips = [];
       if (p.layer_str) chips.push('Layer ' + p.layer_str);
       if (p.feature) chips.push(p.feature);
@@ -1778,7 +1773,7 @@ function render(d) {
       prog.textContent = p.port ? 'Idle · ' + p.port : 'Idle';
       prog.style.color = 'var(--muted)';
     }
-    document.getElementById('print-pills').style.display = showPills ? 'flex' : 'none';
+    document.getElementById('print-pills').style.display = showPills ? 'grid' : 'none';
   } else {
     pb.style.display = 'none';
   }
