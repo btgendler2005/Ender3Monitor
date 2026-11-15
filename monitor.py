@@ -4,6 +4,7 @@
 import sys
 import threading
 import time
+from pathlib import Path
 from collections import deque
 from datetime import datetime
 from typing import Callable, Optional
@@ -26,6 +27,7 @@ from ender3monitor.timelapse import TimelapseManager
 from ender3monitor.printer import PrinterController, _fmt_duration
 from ender3monitor.push import PushNotifier
 from ender3monitor.maintenance import MaintenanceTracker
+from ender3monitor.history import HistoryStore, record_session
 from ender3monitor.settings import Settings
 from ender3monitor.gcode_index import (
     BRIDGING_FEATURES, GcodeIndex, IndexStore, VolumeWatcher,
@@ -288,6 +290,18 @@ class Monitor:
         # True once something is listening for Telegram button presses (the
         # web UI's bot); without it the alert goes out with no buttons.
         self.telegram_review_buttons: bool = False
+
+        # Print history (one record per monitoring session; best-effort)
+        self.history: Optional[HistoryStore] = None
+        try:
+            self.history = HistoryStore()
+        except Exception as exc:
+            print(f"  [HISTORY] disabled: {exc}")
+        self._session_started_at: Optional[float] = None
+        self._history_job: Optional[tuple] = None        # (job_name, total_layers)
+        self._history_timelapse: Optional[str] = None    # MP4 compiled this session
+        self._history_recorded: bool = True              # no session to record yet
+        self._history_last_id: Optional[str] = None
 
         # Warmup gating — signal-based when USB connected, else time-based grace
         self._grace_until: float = 0.0   # set in start() (no-USB fallback)
@@ -561,6 +575,7 @@ class Monitor:
             if self.printer.connected:
                 self.printer.refresh_status()   # temps + print state + time + Z
                 self._update_gcode_context()    # layer/feature/ETA from the sliced file
+                self._note_history_job()        # remember the job name for history
                 self._maybe_auto_start()        # begin monitoring on print start
                 self._maybe_capture_layer_frame()
                 self._check_printer_completion()  # falling-edge finish at 5 s cadence
@@ -588,6 +603,27 @@ class Monitor:
 
             ticks += 1
             self._printer_poll_stop.wait(timeout=PRINTER_POLL_INTERVAL)
+
+    def _note_history_job(self) -> None:
+        """Remember the job name while it is known — the G-code context is
+        cleared as soon as the printer stops, before the history record is cut."""
+        try:
+            st = self.printer.status
+            if self._running and st.job_name:
+                self._history_job = (st.job_name, st.total_layers)
+        except Exception:
+            pass
+
+    def _record_history(self, outcome: str, frame: Optional[np.ndarray]) -> None:
+        """Write this session's print-history record, once. Never raises."""
+        try:
+            if self.history is None or self._history_recorded:
+                return
+            self._history_recorded = True
+            rec = record_session(self.history, self, outcome, frame)
+            self._history_last_id = rec["id"] if rec else None
+        except Exception as exc:
+            print(f"\n  [HISTORY ERROR] {exc}")
 
     def _maybe_capture_layer_frame(self) -> None:
         """Layer-synced timelapse: save one frame whenever the Z height steps up.
@@ -1326,6 +1362,9 @@ class Monitor:
         except Exception as exc:
             print(f"\n  [MAINT ERROR] {exc}")
 
+        # Print history — after the report so a compiled timelapse is linked
+        self._record_history("completed", frame)
+
     def _build_report_stats(self) -> str:
         """One-line-per-stat summary text for the completion report."""
         avg = (self._conf_sum / self._conf_n) if self._conf_n else 0.0
@@ -1364,6 +1403,7 @@ class Monitor:
         try:
             mp4 = self.timelapse.compile(**self._timelapse_compile_kwargs())
             if mp4:
+                self._history_timelapse = Path(mp4).name
                 self.push.send_video(mp4, caption="Timelapse")
         except Exception as exc:
             print(f"\n  [REPORT] timelapse compile/send skipped: {exc}")
@@ -1414,6 +1454,11 @@ class Monitor:
         self.failure_review = None
         self.confidence_history.clear()
         self.session_cost_usd = 0.0
+        self._session_started_at = time.time()
+        self._history_job = None
+        self._history_timelapse = None
+        self._history_recorded = False
+        self._history_last_id = None
         self.last_result = None
         self.status = "Monitoring…"
         self._grace_until = time.time() + STARTUP_GRACE_SECONDS
@@ -1459,6 +1504,15 @@ class Monitor:
         if self._monitor_thread and self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=3)
         self._stop_event.clear()
+        # Print history — manual stop (a finished print is recorded on completion)
+        if self.status != "Print Complete":
+            frame = None
+            try:
+                frame = self._frame_provider() if self._frame_provider else None
+            except Exception:
+                pass
+            self._record_history("failed" if self.failure_count else "stopped",
+                                 frame if frame is not None else self._prev_analysis_frame)
         if self.camera:
             self.camera.release()
             self.camera = None
@@ -1504,6 +1558,14 @@ class Monitor:
         result = self.timelapse.compile(**self._timelapse_compile_kwargs())
         if result:
             print(f"  Saved: {result}")
+            # Link it to this session's history record (now or when it is cut).
+            try:
+                self._history_timelapse = Path(result).name
+                if self.history is not None and self._history_last_id:
+                    self.history.update(self._history_last_id,
+                                        timelapse=self._history_timelapse)
+            except Exception:
+                pass
         return result
 
     def compile_timelapse_session(self, session_dir) -> Optional[str]:
