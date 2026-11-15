@@ -45,14 +45,21 @@ class PushNotifier:
 
     # ------------------------------------------------------------------ #
 
-    def send(self, title: str, message: str, priority: str = "default") -> None:
-        """Fire the notification to every configured channel. Never raises."""
+    def send(self, title: str, message: str, priority: str = "default",
+             telegram_buttons: Optional[list] = None) -> None:
+        """Fire the notification to every configured channel. Never raises.
+
+        telegram_buttons: optional [(label, callback_data), …] shown as one row
+        of inline buttons under the Telegram message (other channels ignore it).
+        Presses arrive as callback_query updates on the bot's getUpdates poll.
+        """
         if self.ntfy_topic:
             self._safe_channel("ntfy", self._send_ntfy, title, message, priority)
         if self.discord_webhook:
             self._safe_channel("discord", self._send_discord, title, message, priority)
         if self._telegram_ready:
-            self._safe_channel("telegram", self._send_telegram, title, message, priority)
+            self._safe_channel("telegram", self._send_telegram, title, message, priority,
+                               telegram_buttons)
 
     def _safe_channel(self, channel: str, fn, *args) -> None:
         result = "ok"
@@ -100,14 +107,20 @@ class PushNotifier:
         self._post(self.discord_webhook, json.dumps(payload).encode("utf-8"),
                    {"Content-Type": "application/json"})
 
-    def _send_telegram(self, title: str, message: str, priority: str) -> None:
+    def _send_telegram(self, title: str, message: str, priority: str,
+                       buttons: Optional[list] = None) -> None:
         url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
         text = f"*{title}*\n{message}"
-        data = urllib.parse.urlencode({
+        params = {
             "chat_id": self.telegram_chat_id,
             "text": text,
             "parse_mode": "Markdown",
-        }).encode("utf-8")
+        }
+        if buttons:
+            params["reply_markup"] = json.dumps({"inline_keyboard": [[
+                {"text": label, "callback_data": data} for label, data in buttons
+            ]]})
+        data = urllib.parse.urlencode(params).encode("utf-8")
         self._post(url, data, {"Content-Type": "application/x-www-form-urlencoded"})
 
     # ── media (Telegram only) — used by the completion report ──
