@@ -4,6 +4,7 @@
 import sys
 import threading
 import time
+from pathlib import Path
 from collections import deque
 from datetime import datetime
 from typing import Callable, Optional
@@ -26,6 +27,7 @@ from ender3monitor.timelapse import TimelapseManager
 from ender3monitor.printer import PrinterController, _fmt_duration
 from ender3monitor.push import PushNotifier
 from ender3monitor.maintenance import MaintenanceTracker
+from ender3monitor.history import HistoryStore, record_session
 from ender3monitor.settings import Settings
 from ender3monitor.gcode_index import (
     BRIDGING_FEATURES, GcodeIndex, IndexStore, VolumeWatcher,
@@ -74,6 +76,36 @@ FAILURE_CONFIRM_SECONDS = 90        # ~1.5 min of sustained failure before alert
 SPAGHETTI_CONFIRM_SECONDS = 45      # spaghetti is time-critical — confirm faster
 FAILURE_CONFIRM_FRAMES = 3          # legacy default (used if interval is unknown)
 SPAGHETTI_CONFIRM_FRAMES = 2
+
+
+# Failure review: answers a user can give to a confirmed failure, and how many
+# [ts, confidence] points to keep for the dashboard sparkline.
+FAILURE_REVIEW_ACTIONS = ("resume", "keep_paused", "false_alarm")
+CONFIDENCE_HISTORY_MAX = 300
+FAILURE_REVIEW_CALLBACK_PREFIX = "fr"
+
+
+def failure_review_buttons(review_id: str) -> list:
+    """Telegram inline-keyboard row for a failure alert: [(label, callback_data)].
+
+    callback_data is "fr:<action>:<review_id>" (well under Telegram's 64 bytes).
+    """
+    p = FAILURE_REVIEW_CALLBACK_PREFIX
+    return [
+        ("▶️ Resume", f"{p}:resume:{review_id}"),
+        ("⏸ Keep paused", f"{p}:keep_paused:{review_id}"),
+        ("🚫 False alarm", f"{p}:false_alarm:{review_id}"),
+    ]
+
+
+def parse_failure_review_callback(data: str) -> Optional[tuple]:
+    """"fr:<action>:<review_id>" → (action, review_id), or None if not ours."""
+    parts = (data or "").split(":")
+    if len(parts) != 3 or parts[0] != FAILURE_REVIEW_CALLBACK_PREFIX:
+        return None
+    if parts[1] not in FAILURE_REVIEW_ACTIONS:
+        return None
+    return parts[1], parts[2]
 
 
 def _confirm_frames(window_seconds: int, interval_seconds: float) -> int:
@@ -248,6 +280,29 @@ class Monitor:
         self.events: deque = deque(maxlen=50)
         self.session_cost_usd: float = 0.0
 
+        # Failure review — set when a failure is confirmed, cleared when the
+        # user answers it (dashboard card / Telegram buttons). Holds the flagged
+        # JPEG in memory; see resolve_failure_review().
+        self.failure_review: Optional[dict] = None
+        self.false_alarm_count: int = 0
+        # [unix_ts, confidence] per analysis for the current print (sparkline).
+        self.confidence_history: deque = deque(maxlen=CONFIDENCE_HISTORY_MAX)
+        # True once something is listening for Telegram button presses (the
+        # web UI's bot); without it the alert goes out with no buttons.
+        self.telegram_review_buttons: bool = False
+
+        # Print history (one record per monitoring session; best-effort)
+        self.history: Optional[HistoryStore] = None
+        try:
+            self.history = HistoryStore()
+        except Exception as exc:
+            print(f"  [HISTORY] disabled: {exc}")
+        self._session_started_at: Optional[float] = None
+        self._history_job: Optional[tuple] = None        # (job_name, total_layers)
+        self._history_timelapse: Optional[str] = None    # MP4 compiled this session
+        self._history_recorded: bool = True              # no session to record yet
+        self._history_last_id: Optional[str] = None
+
         # Warmup gating — signal-based when USB connected, else time-based grace
         self._grace_until: float = 0.0   # set in start() (no-USB fallback)
         self._warmup_done: bool = False
@@ -397,6 +452,7 @@ class Monitor:
         # ahead of it by the planner queue depth, so prefer Z for the layer.
         st.layer = idx.layer_at_z(st.z_height) or idx.layer_at_offset(st.file_position)
         st.feature = idx.feature_at_offset(st.file_position)
+        st.color_change_marks = idx.color_change_marks()
 
         remaining, source = self._raw_remaining(idx, st.file_position)
         if remaining is None:
@@ -519,6 +575,7 @@ class Monitor:
             if self.printer.connected:
                 self.printer.refresh_status()   # temps + print state + time + Z
                 self._update_gcode_context()    # layer/feature/ETA from the sliced file
+                self._note_history_job()        # remember the job name for history
                 self._maybe_auto_start()        # begin monitoring on print start
                 self._maybe_capture_layer_frame()
                 self._check_printer_completion()  # falling-edge finish at 5 s cadence
@@ -546,6 +603,27 @@ class Monitor:
 
             ticks += 1
             self._printer_poll_stop.wait(timeout=PRINTER_POLL_INTERVAL)
+
+    def _note_history_job(self) -> None:
+        """Remember the job name while it is known — the G-code context is
+        cleared as soon as the printer stops, before the history record is cut."""
+        try:
+            st = self.printer.status
+            if self._running and st.job_name:
+                self._history_job = (st.job_name, st.total_layers)
+        except Exception:
+            pass
+
+    def _record_history(self, outcome: str, frame: Optional[np.ndarray]) -> None:
+        """Write this session's print-history record, once. Never raises."""
+        try:
+            if self.history is None or self._history_recorded:
+                return
+            self._history_recorded = True
+            rec = record_session(self.history, self, outcome, frame)
+            self._history_last_id = rec["id"] if rec else None
+        except Exception as exc:
+            print(f"\n  [HISTORY ERROR] {exc}")
 
     def _maybe_capture_layer_frame(self) -> None:
         """Layer-synced timelapse: save one frame whenever the Z height steps up.
@@ -1055,6 +1133,8 @@ class Monitor:
                         self._conf_sum += result.confidence
                         self._conf_n += 1
                         self._conf_peak = max(self._conf_peak, result.confidence)
+                        self.confidence_history.append(
+                            [round(time.time(), 1), round(result.confidence, 3)])
                         threshold = self.settings.get("confidence_threshold")
                         self.metrics.record_analysis(
                             result.confidence,
@@ -1143,16 +1223,23 @@ class Monitor:
         """All side effects for a confirmed failure: email, push, auto-pause."""
         self._run_failure_types.add(result.failure_type)   # for maintenance trend tracking
 
+        # 0. Park the incident for review (dashboard card / Telegram buttons)
+        review = self._open_failure_review(result, frame)
+
         # 1. Email (existing behaviour)
         self._send_alert(result, frame)
 
         # 2. Push notification
         if self.push.enabled:
             msg = result.description or f"{result.failure_type} detected"
+            kwargs = {}
+            if self.telegram_review_buttons:
+                kwargs["telegram_buttons"] = failure_review_buttons(review["id"])
             self.push.send(
                 title=f"⚠️ Print failure: {result.failure_type}",
                 message=f"{msg}\nConfidence {result.confidence:.0%}",
                 priority="high",
+                **kwargs,
             )
 
         # 3. Auto-pause / cooldown / e-stop over USB
@@ -1169,6 +1256,75 @@ class Monitor:
                     )
             else:
                 print("\n  [PRINTER] Auto-pause enabled but printer not connected.")
+
+    # ------------------------------------------------------------------ #
+    # Failure review (Resume / Keep paused / False alarm)                  #
+    # ------------------------------------------------------------------ #
+
+    def _open_failure_review(self, result: AnalysisResult,
+                             frame: Optional[np.ndarray]) -> dict:
+        """Record a confirmed failure as the pending review and return it."""
+        jpeg = None
+        if frame is not None:
+            try:
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                jpeg = buf.tobytes() if ok else None
+            except Exception:
+                jpeg = None
+        now = time.time()
+        review = {
+            "id": str(int(now * 1000)),
+            "failure_type": result.failure_type,
+            "confidence": round(result.confidence, 3),
+            "description": result.description or "",
+            "timestamp": now,
+            "jpeg": jpeg,
+        }
+        with self._lock:
+            self.failure_review = review
+        return review
+
+    def resolve_failure_review(self, action: str,
+                               review_id: Optional[str] = None) -> dict:
+        """Answer the pending failure review.
+
+        action: "resume"      — resume the print (if the printer is connected)
+                "keep_paused" — acknowledge, leave the printer as it is
+                "false_alarm" — count + log it as a false alarm; dismissal
+                                only, the printer is NOT resumed
+        review_id, when given, must match the pending review — so a button on
+        an old alert can't answer a newer incident.
+
+        Returns {"ok": bool, "message": str}. Blocks on serial I/O for "resume".
+        """
+        action = (action or "").lower()
+        if action not in FAILURE_REVIEW_ACTIONS:
+            return {"ok": False, "message": f"unknown action '{action}'"}
+        with self._lock:
+            review = self.failure_review
+            if review is None or (review_id is not None
+                                  and str(review_id) != review["id"]):
+                return {"ok": False, "message": "No failure waiting for review."}
+            self.failure_review = None
+            if action == "false_alarm":
+                self.false_alarm_count += 1
+                self.events.append({
+                    "t": time.time(),
+                    "type": "false_alarm",
+                    "conf": review["confidence"],
+                    "desc": f"False alarm — {review['failure_type']} dismissed",
+                    "detected": False,
+                })
+
+        if action == "resume":
+            if not self.printer.connected:
+                return {"ok": True,
+                        "message": "Review cleared — printer not connected, nothing resumed."}
+            self.printer.resume()
+            return {"ok": True, "message": "Print resumed."}
+        if action == "keep_paused":
+            return {"ok": True, "message": "Kept paused."}
+        return {"ok": True, "message": "Marked as false alarm — printer left as is."}
 
     def _send_alert(self, result: AnalysisResult, frame: np.ndarray) -> None:
         if not self.notifier.enabled:
@@ -1205,6 +1361,9 @@ class Monitor:
                     self.push.send(title="Maintenance", message=alert, priority="default")
         except Exception as exc:
             print(f"\n  [MAINT ERROR] {exc}")
+
+        # Print history — after the report so a compiled timelapse is linked
+        self._record_history("completed", frame)
 
     def _build_report_stats(self) -> str:
         """One-line-per-stat summary text for the completion report."""
@@ -1244,6 +1403,7 @@ class Monitor:
         try:
             mp4 = self.timelapse.compile(**self._timelapse_compile_kwargs())
             if mp4:
+                self._history_timelapse = Path(mp4).name
                 self.push.send_video(mp4, caption="Timelapse")
         except Exception as exc:
             print(f"\n  [REPORT] timelapse compile/send skipped: {exc}")
@@ -1290,7 +1450,15 @@ class Monitor:
         self._running = True
         self.frame_count = 0
         self.failure_count = 0
+        self.false_alarm_count = 0
+        self.failure_review = None
+        self.confidence_history.clear()
         self.session_cost_usd = 0.0
+        self._session_started_at = time.time()
+        self._history_job = None
+        self._history_timelapse = None
+        self._history_recorded = False
+        self._history_last_id = None
         self.last_result = None
         self.status = "Monitoring…"
         self._grace_until = time.time() + STARTUP_GRACE_SECONDS
@@ -1336,6 +1504,15 @@ class Monitor:
         if self._monitor_thread and self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=3)
         self._stop_event.clear()
+        # Print history — manual stop (a finished print is recorded on completion)
+        if self.status != "Print Complete":
+            frame = None
+            try:
+                frame = self._frame_provider() if self._frame_provider else None
+            except Exception:
+                pass
+            self._record_history("failed" if self.failure_count else "stopped",
+                                 frame if frame is not None else self._prev_analysis_frame)
         if self.camera:
             self.camera.release()
             self.camera = None
@@ -1381,6 +1558,14 @@ class Monitor:
         result = self.timelapse.compile(**self._timelapse_compile_kwargs())
         if result:
             print(f"  Saved: {result}")
+            # Link it to this session's history record (now or when it is cut).
+            try:
+                self._history_timelapse = Path(result).name
+                if self.history is not None and self._history_last_id:
+                    self.history.update(self._history_last_id,
+                                        timelapse=self._history_timelapse)
+            except Exception:
+                pass
         return result
 
     def compile_timelapse_session(self, session_dir) -> Optional[str]:
