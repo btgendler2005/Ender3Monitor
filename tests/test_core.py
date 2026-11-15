@@ -1333,3 +1333,187 @@ def test_printer_status_color_change_marks_default_and_clear():
     assert st.as_dict()["color_change_marks"] == [0.25, 0.5]
     st.clear_gcode_context()
     assert st.color_change_marks == []
+
+
+# ── failure review: Resume / Keep paused / False alarm ──────────────────────
+
+class _ReviewPrinter:
+    def __init__(self, connected=True):
+        self.connected = connected
+        self.resumed = 0
+
+    def resume(self):
+        self.resumed += 1
+
+
+class _FakeMonitorForReview:
+    """Bare object exposing only what the failure-review methods touch."""
+    def __init__(self, connected=True):
+        self.printer = _ReviewPrinter(connected)
+        self._lock = threading.Lock()
+        self.events = deque(maxlen=50)
+        self.failure_review = None
+        self.false_alarm_count = 0
+
+
+def _open_review(m, frame=None):
+    from ender3monitor.analyzer import AnalysisResult
+    result =AnalysisResult(failure_detected=True, confidence=0.91,
+                            failure_type="spaghetti/stringing",
+                            description="Loose strands over the bed")
+    return Monitor._open_failure_review(m, result, frame)
+
+
+def test_failure_review_captures_incident_and_frame():
+    m = _FakeMonitorForReview()
+    review = _open_review(m, np.zeros((48, 64, 3), dtype=np.uint8))
+    assert m.failure_review is review
+    assert review["failure_type"] == "spaghetti/stringing"
+    assert review["confidence"] == 0.91
+    assert review["description"] == "Loose strands over the bed"
+    assert review["timestamp"] > 0
+    assert review["jpeg"][:2] == b"\xff\xd8"          # a real JPEG
+
+
+def test_failure_review_resume_resumes_and_clears():
+    m = _FakeMonitorForReview()
+    _open_review(m)
+    res = Monitor.resolve_failure_review(m, "resume")
+    assert res["ok"] and m.printer.resumed == 1
+    assert m.failure_review is None
+    assert m.false_alarm_count == 0 and not m.events
+
+
+def test_failure_review_resume_without_printer_just_clears():
+    m = _FakeMonitorForReview(connected=False)
+    _open_review(m)
+    res = Monitor.resolve_failure_review(m, "resume")
+    assert res["ok"] and m.printer.resumed == 0
+    assert m.failure_review is None
+
+
+def test_failure_review_keep_paused_only_clears():
+    m = _FakeMonitorForReview()
+    _open_review(m)
+    res = Monitor.resolve_failure_review(m, "keep_paused")
+    assert res["ok"] and m.printer.resumed == 0
+    assert m.failure_review is None
+    assert m.false_alarm_count == 0 and not m.events
+
+
+def test_failure_review_false_alarm_counts_logs_and_does_not_resume():
+    m = _FakeMonitorForReview()
+    _open_review(m)
+    res = Monitor.resolve_failure_review(m, "false_alarm")
+    assert res["ok"]
+    assert m.printer.resumed == 0                      # dismissal only
+    assert m.false_alarm_count == 1
+    assert m.failure_review is None
+    assert len(m.events) == 1
+    ev = m.events[0]
+    assert ev["type"] == "false_alarm" and ev["detected"] is False
+    assert "spaghetti/stringing" in ev["desc"] and ev["conf"] == 0.91
+
+
+def test_failure_review_rejects_bad_action_stale_id_and_no_review():
+    m = _FakeMonitorForReview()
+    assert not Monitor.resolve_failure_review(m, "resume")["ok"]      # nothing pending
+    review = _open_review(m)
+    assert not Monitor.resolve_failure_review(m, "explode")["ok"]
+    assert not Monitor.resolve_failure_review(m, "resume", "stale-id")["ok"]
+    assert m.failure_review is review and m.printer.resumed == 0      # untouched
+    assert Monitor.resolve_failure_review(m, "resume", review["id"])["ok"]
+    # Answered once — a second press finds nothing to resolve.
+    assert not Monitor.resolve_failure_review(m, "false_alarm", review["id"])["ok"]
+    assert m.false_alarm_count == 0 and m.printer.resumed == 1
+
+
+def test_failure_review_callback_data_roundtrip():
+    from monitor import (FAILURE_REVIEW_ACTIONS, failure_review_buttons,
+                         parse_failure_review_callback)
+    buttons = failure_review_buttons("1700000000000")
+    assert [parse_failure_review_callback(d) for _, d in buttons] == [
+        (a, "1700000000000") for a in FAILURE_REVIEW_ACTIONS]
+    assert all(len(d.encode()) <= 64 for _, d in buttons)             # Telegram limit
+    for junk in ("", "fr:resume", "xx:resume:1", "fr:explode:1", "/resume"):
+        assert parse_failure_review_callback(junk) is None
+
+
+# ── telegram: inline buttons on the failure alert ───────────────────────────
+
+def test_push_telegram_attaches_inline_keyboard(monkeypatch):
+    import urllib.parse
+    from ender3monitor.push import PushNotifier
+    posts = []
+    monkeypatch.setattr(PushNotifier, "_post",
+                        staticmethod(lambda url, data, headers=None: posts.append(data)))
+    p = PushNotifier(telegram_bot_token="t", telegram_chat_id="42")
+
+    p.send("Failure", "msg", "high", telegram_buttons=[("Resume", "fr:resume:1")])
+    p.send("Plain", "msg")
+    with_buttons, plain = (urllib.parse.parse_qs(d.decode()) for d in posts)
+    markup = json.loads(with_buttons["reply_markup"][0])
+    assert markup == {"inline_keyboard": [[{"text": "Resume",
+                                            "callback_data": "fr:resume:1"}]]}
+    assert "reply_markup" not in plain
+
+
+def _recording_bot(allowed, callback_handler, edit_ok=True):
+    """TelegramBot with the network calls replaced by a call log."""
+    from ender3monitor.telegram_bot import TelegramBot
+    bot = TelegramBot("token", allowed, {}, callback_handler=callback_handler)
+    bot.calls = []
+    bot.answer_callback = lambda cq_id, text="": bot.calls.append(("answer", cq_id, text))
+    bot.edit_message = lambda chat, mid, text: (
+        bot.calls.append(("edit", chat, mid, text)) or edit_ok)
+    bot.send_message = lambda chat, text: bot.calls.append(("send", chat, text))
+    return bot
+
+
+def _callback_update(chat_id, data="fr:false_alarm:1"):
+    return {"update_id": 7, "callback_query": {
+        "id": "cq1", "data": data,
+        "message": {"message_id": 99, "chat": {"id": chat_id}, "text": "Print failure"},
+    }}
+
+
+def test_telegram_callback_resolves_and_edits_the_alert():
+    seen = []
+    bot = _recording_bot({42}, lambda data: seen.append(data) or "Marked as false alarm")
+    bot._handle_update(_callback_update(42))
+    assert seen == ["fr:false_alarm:1"]
+    assert bot.calls[0] == ("answer", "cq1", "Marked as false alarm")
+    kind, chat, mid, text = bot.calls[1]
+    assert (kind, chat, mid) == ("edit", 42, 99)
+    assert text.startswith("Print failure") and "Marked as false alarm" in text
+    assert len(bot.calls) == 2                         # no extra reply when the edit worked
+
+
+def test_telegram_callback_replies_when_edit_fails():
+    bot = _recording_bot({42}, lambda data: "Kept paused.", edit_ok=False)
+    bot._handle_update(_callback_update(42, "fr:keep_paused:1"))
+    assert bot.calls[-1] == ("send", 42, "Kept paused.")
+
+
+def test_telegram_callback_from_unauthorized_chat_is_refused():
+    seen = []
+    bot = _recording_bot({42}, lambda data: seen.append(data) or "done")
+    bot._handle_update(_callback_update(666))
+    assert seen == []                                  # handler never ran
+    assert [c[0] for c in bot.calls] == ["answer"]
+    assert "Not authorized" in bot.calls[0][2]
+
+
+def test_telegram_callback_drives_the_monitor_resolve():
+    from monitor import parse_failure_review_callback
+    m = _FakeMonitorForReview()
+    review = _open_review(m)
+
+    def handler(data):
+        action, rid = parse_failure_review_callback(data)
+        return Monitor.resolve_failure_review(m, action, rid)["message"]
+
+    bot = _recording_bot({42}, handler)
+    bot._handle_update(_callback_update(42, f"fr:false_alarm:{review['id']}"))
+    assert m.false_alarm_count == 1 and m.failure_review is None
+    assert m.printer.resumed == 0

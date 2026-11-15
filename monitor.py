@@ -76,6 +76,36 @@ FAILURE_CONFIRM_FRAMES = 3          # legacy default (used if interval is unknow
 SPAGHETTI_CONFIRM_FRAMES = 2
 
 
+# Failure review: answers a user can give to a confirmed failure, and how many
+# [ts, confidence] points to keep for the dashboard sparkline.
+FAILURE_REVIEW_ACTIONS = ("resume", "keep_paused", "false_alarm")
+CONFIDENCE_HISTORY_MAX = 300
+FAILURE_REVIEW_CALLBACK_PREFIX = "fr"
+
+
+def failure_review_buttons(review_id: str) -> list:
+    """Telegram inline-keyboard row for a failure alert: [(label, callback_data)].
+
+    callback_data is "fr:<action>:<review_id>" (well under Telegram's 64 bytes).
+    """
+    p = FAILURE_REVIEW_CALLBACK_PREFIX
+    return [
+        ("▶️ Resume", f"{p}:resume:{review_id}"),
+        ("⏸ Keep paused", f"{p}:keep_paused:{review_id}"),
+        ("🚫 False alarm", f"{p}:false_alarm:{review_id}"),
+    ]
+
+
+def parse_failure_review_callback(data: str) -> Optional[tuple]:
+    """"fr:<action>:<review_id>" → (action, review_id), or None if not ours."""
+    parts = (data or "").split(":")
+    if len(parts) != 3 or parts[0] != FAILURE_REVIEW_CALLBACK_PREFIX:
+        return None
+    if parts[1] not in FAILURE_REVIEW_ACTIONS:
+        return None
+    return parts[1], parts[2]
+
+
 def _confirm_frames(window_seconds: int, interval_seconds: float) -> int:
     """Frames needed to span ``window_seconds`` at the current capture cadence.
 
@@ -247,6 +277,17 @@ class Monitor:
         # Server-side event log (survives browser reloads) + per-print API cost.
         self.events: deque = deque(maxlen=50)
         self.session_cost_usd: float = 0.0
+
+        # Failure review — set when a failure is confirmed, cleared when the
+        # user answers it (dashboard card / Telegram buttons). Holds the flagged
+        # JPEG in memory; see resolve_failure_review().
+        self.failure_review: Optional[dict] = None
+        self.false_alarm_count: int = 0
+        # [unix_ts, confidence] per analysis for the current print (sparkline).
+        self.confidence_history: deque = deque(maxlen=CONFIDENCE_HISTORY_MAX)
+        # True once something is listening for Telegram button presses (the
+        # web UI's bot); without it the alert goes out with no buttons.
+        self.telegram_review_buttons: bool = False
 
         # Warmup gating — signal-based when USB connected, else time-based grace
         self._grace_until: float = 0.0   # set in start() (no-USB fallback)
@@ -1056,6 +1097,8 @@ class Monitor:
                         self._conf_sum += result.confidence
                         self._conf_n += 1
                         self._conf_peak = max(self._conf_peak, result.confidence)
+                        self.confidence_history.append(
+                            [round(time.time(), 1), round(result.confidence, 3)])
                         threshold = self.settings.get("confidence_threshold")
                         self.metrics.record_analysis(
                             result.confidence,
@@ -1144,16 +1187,23 @@ class Monitor:
         """All side effects for a confirmed failure: email, push, auto-pause."""
         self._run_failure_types.add(result.failure_type)   # for maintenance trend tracking
 
+        # 0. Park the incident for review (dashboard card / Telegram buttons)
+        review = self._open_failure_review(result, frame)
+
         # 1. Email (existing behaviour)
         self._send_alert(result, frame)
 
         # 2. Push notification
         if self.push.enabled:
             msg = result.description or f"{result.failure_type} detected"
+            kwargs = {}
+            if self.telegram_review_buttons:
+                kwargs["telegram_buttons"] = failure_review_buttons(review["id"])
             self.push.send(
                 title=f"⚠️ Print failure: {result.failure_type}",
                 message=f"{msg}\nConfidence {result.confidence:.0%}",
                 priority="high",
+                **kwargs,
             )
 
         # 3. Auto-pause / cooldown / e-stop over USB
@@ -1170,6 +1220,75 @@ class Monitor:
                     )
             else:
                 print("\n  [PRINTER] Auto-pause enabled but printer not connected.")
+
+    # ------------------------------------------------------------------ #
+    # Failure review (Resume / Keep paused / False alarm)                  #
+    # ------------------------------------------------------------------ #
+
+    def _open_failure_review(self, result: AnalysisResult,
+                             frame: Optional[np.ndarray]) -> dict:
+        """Record a confirmed failure as the pending review and return it."""
+        jpeg = None
+        if frame is not None:
+            try:
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                jpeg = buf.tobytes() if ok else None
+            except Exception:
+                jpeg = None
+        now = time.time()
+        review = {
+            "id": str(int(now * 1000)),
+            "failure_type": result.failure_type,
+            "confidence": round(result.confidence, 3),
+            "description": result.description or "",
+            "timestamp": now,
+            "jpeg": jpeg,
+        }
+        with self._lock:
+            self.failure_review = review
+        return review
+
+    def resolve_failure_review(self, action: str,
+                               review_id: Optional[str] = None) -> dict:
+        """Answer the pending failure review.
+
+        action: "resume"      — resume the print (if the printer is connected)
+                "keep_paused" — acknowledge, leave the printer as it is
+                "false_alarm" — count + log it as a false alarm; dismissal
+                                only, the printer is NOT resumed
+        review_id, when given, must match the pending review — so a button on
+        an old alert can't answer a newer incident.
+
+        Returns {"ok": bool, "message": str}. Blocks on serial I/O for "resume".
+        """
+        action = (action or "").lower()
+        if action not in FAILURE_REVIEW_ACTIONS:
+            return {"ok": False, "message": f"unknown action '{action}'"}
+        with self._lock:
+            review = self.failure_review
+            if review is None or (review_id is not None
+                                  and str(review_id) != review["id"]):
+                return {"ok": False, "message": "No failure waiting for review."}
+            self.failure_review = None
+            if action == "false_alarm":
+                self.false_alarm_count += 1
+                self.events.append({
+                    "t": time.time(),
+                    "type": "false_alarm",
+                    "conf": review["confidence"],
+                    "desc": f"False alarm — {review['failure_type']} dismissed",
+                    "detected": False,
+                })
+
+        if action == "resume":
+            if not self.printer.connected:
+                return {"ok": True,
+                        "message": "Review cleared — printer not connected, nothing resumed."}
+            self.printer.resume()
+            return {"ok": True, "message": "Print resumed."}
+        if action == "keep_paused":
+            return {"ok": True, "message": "Kept paused."}
+        return {"ok": True, "message": "Marked as false alarm — printer left as is."}
 
     def _send_alert(self, result: AnalysisResult, frame: np.ndarray) -> None:
         if not self.notifier.enabled:
@@ -1291,6 +1410,9 @@ class Monitor:
         self._running = True
         self.frame_count = 0
         self.failure_count = 0
+        self.false_alarm_count = 0
+        self.failure_review = None
+        self.confidence_history.clear()
         self.session_cost_usd = 0.0
         self.last_result = None
         self.status = "Monitoring…"

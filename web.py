@@ -549,6 +549,19 @@ def _tg_timelapse(args):
     return _read_mp4_as_video_reply(mp4, "Timelapse")
 
 
+def _tg_failure_callback(data: str) -> str:
+    """Inline-button press under a failure alert → resolve the pending review."""
+    from monitor import parse_failure_review_callback
+    parsed = parse_failure_review_callback(data)
+    if parsed is None or _monitor is None:
+        return "Unknown button."
+    action, review_id = parsed
+    ops.telegram_commands_total.labels(f"failure_{action}").inc()
+    res = _monitor.resolve_failure_review(action, review_id)
+    icon = {"resume": "▶️", "keep_paused": "⏸", "false_alarm": "🚫"}[action]
+    return f"{icon} {res['message']}" if res["ok"] else res["message"]
+
+
 def _build_telegram_handlers():
     handlers = {
         "status":   (_tg_status,   "current status + temps + progress"),
@@ -616,8 +629,10 @@ async def lifespan(app: FastAPI):
     # Interactive Telegram bot (optional)
     if _config.telegram_bot_token:
         allowed = _parse_allowed_chats(_config.telegram_allowed_chats)
-        _telegram = TelegramBot(_config.telegram_bot_token, allowed, _build_telegram_handlers())
+        _telegram = TelegramBot(_config.telegram_bot_token, allowed, _build_telegram_handlers(),
+                                callback_handler=_tg_failure_callback)
         _telegram.start()
+        _monitor.telegram_review_buttons = True   # failure alerts get reply buttons
         log.info("Telegram bot started (authorized chats: %s)",
                  allowed if allowed else "none yet — DM the bot to get your chat ID")
 
@@ -785,6 +800,21 @@ async def _push_loop() -> None:
             await _send_all(msg)
 
 
+def _failure_review_state() -> Optional[dict]:
+    """The pending failure review for the UI — everything but the JPEG bytes."""
+    fr = _monitor.failure_review
+    if fr is None:
+        return None
+    return {
+        "id": fr["id"],
+        "failure_type": fr["failure_type"],
+        "confidence": fr["confidence"],
+        "description": fr["description"],
+        "timestamp": fr["timestamp"],
+        "image_url": (f"/api/failure/snapshot?t={fr['id']}" if fr.get("jpeg") else None),
+    }
+
+
 def _state() -> dict:
     if _monitor is None:
         return {"status": "starting", "is_running": False}
@@ -806,6 +836,9 @@ def _state() -> dict:
         "threshold": _monitor.settings.get("confidence_threshold"),
         "cost_usd": round(_monitor.session_cost_usd, 4),
         "events": list(_monitor.events),
+        "failure_review": _failure_review_state(),
+        "false_alarm_count": _monitor.false_alarm_count,
+        "confidence_history": list(_monitor.confidence_history),
     }
 
 
@@ -996,6 +1029,38 @@ async def api_printer(body: PrinterActionBody):
     await loop.run_in_executor(None, fn)
     await _broadcast()
     return {"message": msg}
+
+
+class FailureResolveBody(BaseModel):
+    action: str   # resume | keep_paused | false_alarm
+
+
+@app.get("/api/failure/snapshot")
+async def api_failure_snapshot():
+    """The frame that triggered the pending failure review."""
+    fr = _monitor.failure_review if _monitor is not None else None
+    if fr is None or not fr.get("jpeg"):
+        return JSONResponse({"error": "no failure snapshot"}, 404)
+    return Response(fr["jpeg"], media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/failure/resolve")
+async def api_failure_resolve(body: FailureResolveBody):
+    """Answer the pending failure review: resume, keep paused, or false alarm."""
+    if _monitor is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    from monitor import FAILURE_REVIEW_ACTIONS
+    action = (body.action or "").lower()
+    if action not in FAILURE_REVIEW_ACTIONS:
+        return JSONResponse({"error": f"unknown action '{action}'"}, 400)
+
+    loop = asyncio.get_running_loop()
+    res = await loop.run_in_executor(None, _monitor.resolve_failure_review, action)
+    await _broadcast()
+    if not res["ok"]:
+        return JSONResponse({"error": res["message"]}, 409)
+    return {"message": res["message"]}
 
 
 def _timelapse_dir() -> Path:
@@ -1544,6 +1609,42 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
 .ch-tick.done{background:var(--muted)}
 .ch-layer-note{font-size:10.5px;color:var(--muted);margin-top:7px}
 
+/* ── Failure review ── */
+.fr-card{display:none;grid-column:1/-1;border-color:rgba(248,113,113,.35)}
+.fr-card.show{display:block}
+.fr-card .card-label{color:var(--red)}
+.fr-body{display:flex;gap:18px;align-items:flex-start}
+.fr-img{
+  flex:0 0 300px;width:300px;max-width:100%;aspect-ratio:16/9;
+  object-fit:cover;border-radius:8px;background:var(--surf3);display:block;
+}
+.fr-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:10px}
+.fr-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.fr-type{font-size:20px;font-weight:700;color:var(--red);overflow-wrap:anywhere}
+.fr-conf{font-size:13px;font-weight:600;color:var(--amber)}
+.fr-time{font-size:11.5px;color:var(--muted)}
+.fr-desc{font-size:13px;line-height:1.55;overflow-wrap:anywhere}
+.fr-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:4px}
+.fr-actions button{justify-content:center;padding:11px 20px;font-size:14px;font-weight:600}
+.fr-resume{background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.3);color:var(--green)}
+.fr-resume:hover{background:rgba(34,197,94,.2)}
+.fr-keep{background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.3);color:var(--amber)}
+.fr-keep:hover{background:rgba(251,191,36,.18)}
+.fr-false{background:var(--surf3);color:var(--blue)}
+.fr-actions button:disabled{opacity:.5;cursor:default}
+.fr-note{font-size:11.5px;color:var(--muted)}
+.conf-spark{margin-top:10px}
+.conf-spark svg{display:block;width:100%;height:36px;background:var(--surf3);border-radius:6px}
+.conf-spark-meta{display:flex;justify-content:space-between;gap:8px;margin-top:5px;
+                 font-size:10.5px;color:var(--muted)}
+@media (max-width:760px){
+  .fr-body{flex-direction:column;gap:12px}
+  .fr-img{flex:none;width:100%}
+  .fr-actions{flex-wrap:nowrap;gap:8px}
+  .fr-actions button{flex:1 1 0;min-width:0;padding:15px 4px;font-size:13.5px}
+}
+/* ── /Failure review ── */
+
 /* ── Toast ── */
 #toast{
   position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(80px);
@@ -1827,6 +1928,29 @@ button.busy { cursor: progress; opacity: .6; }
 
 <div class="page">
 
+  <!-- Failure review -->
+  <div class="card fr-card" id="fr-card">
+    <div class="card-label">Failure detected — review</div>
+    <div class="fr-body">
+      <img class="fr-img" id="fr-img" alt="Flagged frame">
+      <div class="fr-info">
+        <div class="fr-head">
+          <span class="fr-type" id="fr-type">—</span>
+          <span class="fr-conf" id="fr-conf"></span>
+          <span class="fr-time" id="fr-time"></span>
+        </div>
+        <div class="fr-desc" id="fr-desc"></div>
+        <div class="fr-actions">
+          <button class="fr-resume" onclick="resolveFailure('resume')">Resume</button>
+          <button class="fr-keep" onclick="resolveFailure('keep_paused')">Keep paused</button>
+          <button class="fr-false" onclick="resolveFailure('false_alarm')">False alarm</button>
+        </div>
+        <div class="fr-note">False alarm only dismisses this alert — it does not resume the print.</div>
+      </div>
+    </div>
+  </div>
+  <!-- /Failure review -->
+
   <!-- Camera, with the AI's latest observation as its caption -->
   <div class="card cam-card">
     <img id="cam" src="/stream" alt="Live camera view of the printer">
@@ -1846,6 +1970,23 @@ button.busy { cursor: progress; opacity: .6; }
       <div class="conf-track">
         <div class="conf-fill" id="conf-fill" style="width:0;background:var(--green)"></div>
       </div>
+      <!-- Confidence sparkline -->
+      <div class="conf-spark" id="conf-spark">
+        <svg viewBox="0 0 100 36" preserveAspectRatio="none" role="img"
+             aria-label="Confidence over this print, with the alert threshold">
+          <line id="spark-thresh" x1="0" x2="100" y1="18" y2="18" stroke="var(--red)"
+                stroke-width="1" stroke-dasharray="4 3" opacity=".7"
+                vector-effect="non-scaling-stroke"/>
+          <polyline id="spark-line" fill="none" stroke="var(--blue)" stroke-width="1.5"
+                    stroke-linejoin="round" stroke-linecap="round"
+                    vector-effect="non-scaling-stroke" points=""/>
+        </svg>
+        <div class="conf-spark-meta">
+          <span id="spark-span">no analyses yet</span>
+          <span id="spark-false"></span>
+        </div>
+      </div>
+      <!-- /Confidence sparkline -->
     </div>
 
     <div class="type-row">
@@ -2172,6 +2313,7 @@ function render(d) {
   // Event log — rendered from the server-side history so it survives reloads.
   if (Array.isArray(d.events)) renderEvents(d.events);
   renderCharts(d);
+  renderFailureReview(d); renderSparkline(d);
 }
 
 // ── Status headline ────────────────────────────────────────────────────────
@@ -2642,6 +2784,80 @@ function renderCharts(d) {
 if (window.ResizeObserver) {
   new ResizeObserver(() => { if (chLast) renderCharts(chLast); })
     .observe(document.getElementById('ch-temps'));
+}
+
+// ── Failure review ─────────────────────────────────────────────────────────
+let frShownId = null, frBusy = false, sparkKey = '';
+
+function renderFailureReview(d) {
+  const card = document.getElementById('fr-card');
+  if (!card) return;
+  const fr = d.failure_review;
+  if (!fr) {
+    card.classList.remove('show');
+    frShownId = null;
+    return;
+  }
+  card.classList.add('show');
+  if (fr.id === frShownId) return;   // same incident — don't reload the image
+  frShownId = fr.id;
+  const img = document.getElementById('fr-img');
+  if (fr.image_url) { img.src = fr.image_url; img.style.display = ''; }
+  else { img.removeAttribute('src'); img.style.display = 'none'; }
+  document.getElementById('fr-type').textContent = fr.failure_type || 'failure';
+  document.getElementById('fr-conf').textContent =
+    fr.confidence != null ? Math.round(fr.confidence * 100) + '% confidence' : '';
+  document.getElementById('fr-time').textContent =
+    fr.timestamp ? new Date(fr.timestamp * 1000).toTimeString().slice(0, 8) : '';
+  document.getElementById('fr-desc').innerHTML =
+    esc(fr.description || 'No description from the analyzer.');
+}
+
+function renderSparkline(d) {
+  const line = document.getElementById('spark-line');
+  if (!line) return;
+  const hist = Array.isArray(d.confidence_history) ? d.confidence_history : [];
+  const thr = d.threshold ?? 0.7;
+  const fa = d.false_alarm_count || 0;
+  const key = hist.length + ':' + (hist.length ? hist[hist.length - 1][0] : 0) + ':' + thr + ':' + fa;
+  if (key === sparkKey) return;
+  sparkKey = key;
+  // 0–100% maps to y 34–2 (2px breathing room top and bottom of the 36px box).
+  const y = c => (34 - Math.max(0, Math.min(1, c)) * 32).toFixed(1);
+  const ty = y(thr);
+  const tl = document.getElementById('spark-thresh');
+  tl.setAttribute('y1', ty); tl.setAttribute('y2', ty);
+  let pts = '';
+  if (hist.length === 1) pts = `0,${y(hist[0][1])} 100,${y(hist[0][1])}`;
+  else pts = hist.map((p, i) => `${(i / (hist.length - 1) * 100).toFixed(1)},${y(p[1])}`).join(' ');
+  line.setAttribute('points', pts);
+  document.getElementById('spark-span').textContent = hist.length
+    ? `last ${hist.length} ${hist.length === 1 ? 'analysis' : 'analyses'} · dashed = threshold`
+    : 'no analyses yet';
+  document.getElementById('spark-false').textContent =
+    fa ? `${fa} false alarm${fa === 1 ? '' : 's'}` : '';
+}
+
+async function resolveFailure(action) {
+  if (frBusy) return;
+  frBusy = true;
+  const btns = document.querySelectorAll('#fr-card .fr-actions button');
+  btns.forEach(b => b.disabled = true);
+  try {
+    const res = await fetch('/api/failure/resolve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ action }),
+    });
+    let data = {};
+    try { data = await res.json(); } catch(e) {}
+    toast(res.ok ? (data.message || 'Done') : (data.error || 'Could not resolve the failure'));
+  } catch(e) {
+    toast('Network error');
+  } finally {
+    frBusy = false;
+    btns.forEach(b => b.disabled = false);
+  }
 }
 
 // ── Toast ──────────────────────────────────────────────────────────────────

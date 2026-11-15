@@ -17,6 +17,12 @@ returns either:
   • ("photo", jpeg_bytes, str)  → sent as a photo with a caption
   • ("video", mp4_bytes, str)   → sent as a video with a caption
   • a list of any of the above  → sent as a sequence of messages/media
+
+Inline buttons — a press on an inline-keyboard button (e.g. the Resume / Keep
+paused / False alarm row under a failure alert) arrives as a `callback_query`
+update. It is passed to `callback_handler(data: str) -> str`; the returned text
+is shown as the button's toast and appended to the alert, whose buttons are
+then removed. The same chat allowlist applies.
 """
 from __future__ import annotations
 
@@ -37,10 +43,12 @@ _API = "https://api.telegram.org/bot{token}/{method}"
 
 class TelegramBot:
     def __init__(self, token: str, allowed_chats: Set[int],
-                 handlers: Dict[str, Tuple[Handler, str]]) -> None:
+                 handlers: Dict[str, Tuple[Handler, str]],
+                 callback_handler: Optional[Callable[[str], str]] = None) -> None:
         self.token = token
         self.allowed_chats = set(allowed_chats)
         self.handlers = handlers
+        self.callback_handler = callback_handler
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._offset = 0
@@ -82,6 +90,9 @@ class TelegramBot:
                 self._stop.wait(timeout=3)
 
     def _handle_update(self, upd: dict) -> None:
+        if upd.get("callback_query"):
+            self._handle_callback(upd["callback_query"])
+            return
         msg = upd.get("message") or upd.get("channel_post")
         if not msg:
             return
@@ -118,6 +129,31 @@ class TelegramBot:
         items = result if isinstance(result, list) else [result]
         for item in items:
             self._send_result_item(chat_id, item)
+
+    def _handle_callback(self, cq: dict) -> None:
+        """An inline-button press. Authorised by the chat the button lives in."""
+        cq_id = cq.get("id")
+        msg = cq.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        if chat_id not in self.allowed_chats:
+            self.answer_callback(cq_id, "⛔ Not authorized.")
+            return
+        if self.callback_handler is None:
+            self.answer_callback(cq_id, "Buttons aren't enabled.")
+            return
+        try:
+            outcome = self.callback_handler(cq.get("data") or "")
+        except Exception as exc:
+            outcome = f"⚠️ Failed: {exc}"
+        outcome = str(outcome or "Done.")
+        self.answer_callback(cq_id, outcome)
+        # Record the outcome on the alert itself and drop its buttons, so the
+        # chat history shows what was decided and it can't be pressed twice.
+        message_id = msg.get("message_id")
+        original = msg.get("text") or ""
+        if message_id is None or not self.edit_message(
+                chat_id, message_id, f"{original}\n\n→ {outcome}".strip()):
+            self.send_message(chat_id, outcome)
 
     def _send_result_item(self, chat_id: int, result) -> None:
         if isinstance(result, tuple) and result and result[0] == "photo":
@@ -160,6 +196,29 @@ class TelegramBot:
                 return
             except Exception:
                 continue
+
+    def _call(self, method: str, params: dict) -> bool:
+        """POST a simple (non-multipart) Bot API call. True if Telegram said ok."""
+        try:
+            url = _API.format(token=self.token, method=method)
+            data = urllib.parse.urlencode(params).encode()
+            with urllib.request.urlopen(urllib.request.Request(url, data=data),
+                                        timeout=10) as resp:
+                return bool(json.load(resp).get("ok"))
+        except Exception:
+            return False
+
+    def answer_callback(self, callback_query_id, text: str = "") -> bool:
+        """Stop the button's spinner and show `text` as a toast (≤200 chars)."""
+        if callback_query_id is None:
+            return False
+        return self._call("answerCallbackQuery",
+                          {"callback_query_id": callback_query_id, "text": text[:200]})
+
+    def edit_message(self, chat_id: int, message_id: int, text: str) -> bool:
+        """Replace a message's text; sending no reply_markup removes its buttons."""
+        return self._call("editMessageText",
+                          {"chat_id": chat_id, "message_id": message_id, "text": text})
 
     def send_photo(self, chat_id: int, jpeg: bytes, caption: str = "") -> None:
         try:
