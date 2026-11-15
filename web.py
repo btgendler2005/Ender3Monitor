@@ -1213,6 +1213,20 @@ header{
 }
 .count-box .lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
 .count-box .num{font-size:26px;font-weight:800;line-height:1}
+.cost-line{margin-top:10px;font-size:10px;color:var(--muted);opacity:.7}
+.cost-line span{font-weight:600}
+
+/* ── Print status pills ── */
+.print-pills{display:none;flex-wrap:wrap;gap:8px;margin-top:10px}
+.stat-pill{
+  flex:1 1 120px;background:var(--surf3);border-radius:999px;
+  padding:9px 16px;display:flex;flex-direction:column;gap:2px;
+}
+.stat-pill .k{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.stat-pill .v{font-size:16px;font-weight:800;line-height:1.1;color:var(--text)}
+.stat-pill .v small{font-size:11px;font-weight:600;color:var(--muted)}
+.stat-pill.pct .v{color:var(--blue)}
+.stat-chip{font-size:11px;color:var(--muted);background:var(--surf3);border-radius:999px;padding:4px 10px}
 
 /* ── Printer controls ── */
 .printer-controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
@@ -1561,9 +1575,8 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
       </div>
     </div>
 
-    <div class="count-box" id="cost-box" style="margin-top:10px">
-      <div class="lbl">Est. API cost · this print</div>
-      <div class="num" id="cost" style="color:var(--green)">$0.00</div>
+    <div class="cost-line" id="cost-box" title="Estimated AI API cost for this print">
+      Est. AI cost · this print <span id="cost">$0.00</span>
     </div>
 
     <!-- Printer (USB) — hidden until a printer is connected -->
@@ -1578,6 +1591,12 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
           <div class="lbl">Bed</div>
           <div class="num" id="temp-bed" style="font-size:20px">—</div>
         </div>
+      </div>
+      <div class="print-pills" id="print-pills">
+        <div class="stat-pill pct"><span class="k">Progress</span><span class="v" id="pp-pct">—</span></div>
+        <div class="stat-pill"><span class="k">Elapsed / Left</span>
+          <span class="v"><span id="pp-elapsed">—</span> <small>/</small> <span id="pp-left">—</span></span></div>
+        <div id="pp-chips" style="display:flex;flex-wrap:wrap;gap:6px;width:100%"></div>
       </div>
       <div style="font-size:11px;color:var(--muted);margin-top:8px" id="printer-progress"></div>
       <div class="printer-controls">
@@ -1724,6 +1743,7 @@ function render(d) {
     document.getElementById('temp-nozzle').textContent = fmt(p.nozzle_temp, p.nozzle_target);
     document.getElementById('temp-bed').textContent    = fmt(p.bed_temp, p.bed_target);
     const prog = document.getElementById('printer-progress');
+    let showPills = false;
     if (p.filament_runout) {
       // Shown ahead of the M600 line: a runout also parks the printer waiting
       // on the user, and calling that a color change would send you to the
@@ -1734,24 +1754,23 @@ function render(d) {
       prog.textContent = '🎨 Paused — change filament (M600)';
       prog.style.color = 'var(--amber)';
     } else if (p.printing && p.progress != null) {
-      const parts = [(p.progress * 100).toFixed(1) + '%'];
-      // Layer/feature come from the sliced file; absent when no index matched,
-      // in which case this reads exactly as it did before the G-code index.
-      if (p.layer_str) parts.push('layer ' + p.layer_str);
-      if (p.elapsed_str)   parts.push(p.elapsed_str + ' elapsed');
-      if (p.remaining_str) {
-        // Say where the estimate came from — a slicer/model ETA is worth more
-        // trust than the byte-percentage projection, and hiding the difference
-        // would make the better number indistinguishable from the worse one.
-        const src = {slicer: ' (slicer)', model: ' (modelled)'}[p.remaining_source] || '';
-        parts.push('~' + p.remaining_str + ' left' + src);
-      }
-      if (p.feature) parts.push(p.feature);
-      prog.textContent = parts.join('  ·  ');
-      prog.style.color = 'var(--muted)';
-      if (p.next_color_change_str) {
-        prog.textContent += '   🎨 color change in ~' + p.next_color_change_str;
-      }
+      prog.textContent = '';
+      const src = {slicer: ' (slicer)', model: ' (modelled)'}[p.remaining_source] || '';
+      document.getElementById('pp-pct').textContent = (p.progress * 100).toFixed(1) + '%';
+      document.getElementById('pp-elapsed').textContent = p.elapsed_str || '—';
+      document.getElementById('pp-left').textContent =
+        p.remaining_str ? '~' + p.remaining_str + src : '—';
+      const chips = [];
+      if (p.layer_str) chips.push('Layer ' + p.layer_str);
+      if (p.feature) chips.push(p.feature);
+      if (p.next_color_change_str) chips.push('🎨 color change in ~' + p.next_color_change_str);
+      const box = document.getElementById('pp-chips');
+      box.innerHTML = '';
+      chips.forEach(t => {
+        const c = document.createElement('span');
+        c.className = 'stat-chip'; c.textContent = t; box.appendChild(c);
+      });
+      showPills = true;
     } else if (p.printing) {
       prog.textContent = 'Printing…';
       prog.style.color = 'var(--muted)';
@@ -1759,6 +1778,7 @@ function render(d) {
       prog.textContent = p.port ? 'Idle · ' + p.port : 'Idle';
       prog.style.color = 'var(--muted)';
     }
+    document.getElementById('print-pills').style.display = showPills ? 'flex' : 'none';
   } else {
     pb.style.display = 'none';
   }
