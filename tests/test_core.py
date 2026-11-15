@@ -1517,3 +1517,178 @@ def test_telegram_callback_drives_the_monitor_resolve():
     bot._handle_update(_callback_update(42, f"fr:false_alarm:{review['id']}"))
     assert m.false_alarm_count == 1 and m.failure_review is None
     assert m.printer.resumed == 0
+
+# ── Print history ───────────────────────────────────────────────────────────
+from ender3monitor.history import (  # noqa: E402
+    MAX_EVENTS, HistoryStore, build_record, format_recent, record_session,
+)
+
+
+def _hist_rec(n=0, **kw):
+    rec = {"started_at": 1000.0 + n, "ended_at": 2000.0 + n, "duration_seconds": 1000,
+           "job_name": f"job{n}.gcode", "outcome": "completed", "failure_count": 0,
+           "failure_types": [], "false_alarms": 0, "frames_analyzed": 5,
+           "ai_cost_usd": 0.12, "thumbnail": None, "timelapse": None,
+           "events": [{"t": 1500.0, "type": "none"}]}
+    rec.update(kw)
+    return rec
+
+
+def test_history_add_is_newest_first_and_list_omits_events(tmp_path):
+    store = HistoryStore(tmp_path / "h")
+    a = store.add(_hist_rec(1))
+    b = store.add(_hist_rec(2))
+    assert a["id"] != b["id"]
+    listed = store.list()
+    assert [r["job_name"] for r in listed] == ["job2.gcode", "job1.gcode"]
+    assert all("events" not in r for r in listed)
+    assert store.get(a["id"])["events"] == [{"t": 1500.0, "type": "none"}]
+    assert store.get("nope") is None
+    assert len(store.list(limit=1)) == 1
+
+
+def test_history_caps_records_and_trims_events(tmp_path):
+    store = HistoryStore(tmp_path / "h", max_records=3)
+    thumb = tmp_path / "h" / "old.jpg"
+    (tmp_path / "h").mkdir()
+    thumb.write_bytes(b"x")
+    store.add(_hist_rec(0, thumbnail="old.jpg"))
+    for n in range(1, 5):
+        store.add(_hist_rec(n, events=[{"t": i} for i in range(MAX_EVENTS + 20)]))
+    assert len(store) == 3
+    assert [r["job_name"] for r in store.list()] == ["job4.gcode", "job3.gcode", "job2.gcode"]
+    assert not thumb.exists()                       # dropped record's thumbnail went too
+    ev = store.get(store.list()[0]["id"])["events"]
+    assert len(ev) == MAX_EVENTS and ev[-1] == {"t": MAX_EVENTS + 19}
+
+
+def test_history_persists_across_instances(tmp_path):
+    store = HistoryStore(tmp_path / "h")
+    rec = store.add(_hist_rec(7, outcome="failed", failure_types=["spaghetti"]))
+    assert store.update(rec["id"], timelapse="timelapse_x.mp4")
+    assert not (tmp_path / "h" / "history.json.tmp").exists()
+    again = HistoryStore(tmp_path / "h")
+    got = again.get(rec["id"])
+    assert got["outcome"] == "failed" and got["failure_types"] == ["spaghetti"]
+    assert got["timelapse"] == "timelapse_x.mp4"
+
+
+@pytest.mark.parametrize("junk", ["{not json", '{"a": 1}', "[1, 2, {}]", ""])
+def test_history_tolerates_corrupt_or_missing_file(tmp_path, junk):
+    d = tmp_path / "h"
+    assert HistoryStore(d).list() == []             # missing dir/file
+    d.mkdir()
+    (d / "history.json").write_text(junk)
+    store = HistoryStore(d)
+    assert store.list() == []
+    store.add(_hist_rec(1))                         # and it recovers on the next write
+    assert len(HistoryStore(d)) == 1
+
+
+def test_history_delete_removes_record_and_thumbnail(tmp_path):
+    store = HistoryStore(tmp_path / "h")
+    name = store.save_thumbnail("abc", np.zeros((720, 1280, 3), dtype=np.uint8))
+    assert name == "abc.jpg" and (tmp_path / "h" / name).is_file()
+    rec = store.add(_hist_rec(1, thumbnail=name))
+    keep = store.add(_hist_rec(2))
+    assert store.delete(rec["id"]) is True
+    assert store.delete(rec["id"]) is False
+    assert not (tmp_path / "h" / name).exists()
+    assert [r["id"] for r in HistoryStore(tmp_path / "h").list()] == [keep["id"]]
+
+
+def test_history_thumb_path_cannot_escape_the_directory(tmp_path):
+    store = HistoryStore(tmp_path / "h")
+    p = store.thumb_path_for({"thumbnail": "../../etc/passwd"})
+    assert p == tmp_path / "h" / "passwd"
+    assert store.thumb_path_for({"thumbnail": None}) is None
+
+
+class _HistStatus:
+    elapsed_seconds = 3725
+    job_name = None            # already cleared by the time the print has ended
+    total_layers = None
+
+
+class _FakeMonitorForHistory:
+    def __init__(self):
+        self.printer = type("P", (), {"status": _HistStatus()})()
+        self.frame_count = 12
+        self.failure_count = 2
+        self.session_cost_usd = 0.3456789
+        self._session_started_at = 5000.0
+        self._print_active_since = 5100.0
+        self._history_job = ("benchy.gcode", 240)
+        self._history_timelapse = "timelapse_1.mp4"
+        self._run_failure_types = {"spaghetti", "none", "warping"}
+        self.events = deque([
+            {"t": 4000.0, "type": "none", "desc": "previous session"},
+            {"t": 5200.0, "type": "spaghetti", "conf": 0.9, "desc": "mess", "detected": True},
+        ], maxlen=50)
+
+
+def test_build_record_snapshots_the_session():
+    m = _FakeMonitorForHistory()
+    rec = build_record(m, "completed", now=9000.0)
+    assert rec["outcome"] == "completed"
+    assert rec["started_at"] == 5000.0 and rec["ended_at"] == 9000.0
+    assert rec["duration_seconds"] == 3725           # printer's job timer wins
+    assert rec["job_name"] == "benchy.gcode" and rec["total_layers"] == 240
+    assert rec["failure_count"] == 2
+    assert rec["failure_types"] == ["spaghetti", "warping"]
+    assert rec["false_alarms"] == 0                  # attribute not present yet
+    assert rec["frames_analyzed"] == 12
+    assert rec["ai_cost_usd"] == 0.3457
+    assert rec["timelapse"] == "timelapse_1.mp4"
+    assert [e["type"] for e in rec["events"]] == ["spaghetti"]   # earlier session dropped
+    json.dumps(rec)                                  # must be JSON-serialisable
+
+    m.false_alarm_count = 3
+    m.printer.status.elapsed_seconds = None
+    rec = build_record(m, "bogus", now=9000.0)
+    assert rec["false_alarms"] == 3
+    assert rec["outcome"] == "stopped"
+    assert rec["duration_seconds"] == 3900           # falls back to print-active time
+
+
+def test_record_session_skips_empty_sessions_and_saves_thumbnail(tmp_path):
+    store = HistoryStore(tmp_path / "h")
+    m = _FakeMonitorForHistory()
+    m.frame_count = 0
+    assert record_session(store, m, "stopped") is None
+    assert len(store) == 0
+
+    m.frame_count = 4
+    frame = np.full((480, 960, 3), 127, dtype=np.uint8)
+    rec = record_session(store, m, "stopped", frame, now=9000.0)
+    assert rec["thumbnail"] == rec["id"] + ".jpg"
+    assert (tmp_path / "h" / rec["thumbnail"]).stat().st_size > 0
+    assert store.list()[0]["id"] == rec["id"]
+    # No frame → still recorded, just without a thumbnail.
+    assert record_session(store, m, "failed", None, now=9100.0)["thumbnail"] is None
+
+
+def test_monitor_record_history_runs_once_and_never_raises(tmp_path):
+    m = _FakeMonitorForHistory()
+    m.history = HistoryStore(tmp_path / "h")
+    m._history_recorded = False
+    m._history_last_id = None
+    Monitor._record_history(m, "completed", None)
+    Monitor._record_history(m, "stopped", None)      # second call is a no-op
+    assert len(m.history) == 1 and m._history_last_id == m.history.list()[0]["id"]
+
+    class _Boom:
+        def new_id(self, *_a):
+            raise OSError("disk full")
+    m.history, m._history_recorded = _Boom(), False
+    Monitor._record_history(m, "completed", None)    # swallowed
+
+
+def test_history_format_recent(tmp_path):
+    store = HistoryStore(tmp_path / "h")
+    assert format_recent(store) == "No prints recorded yet."
+    for n in range(7):
+        store.add(_hist_rec(n))
+    text = format_recent(store, limit=5)
+    assert text.count("job") == 5 and "job6.gcode" in text and "job1.gcode" not in text
+    assert "completed" in text and "16m" in text and "$0.12" in text

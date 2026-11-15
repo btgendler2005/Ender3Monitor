@@ -463,6 +463,15 @@ def _tg_maintenance(args):
     return "\n".join(lines)
 
 
+def _tg_history(args):
+    """/history → the last 5 recorded prints (date, name, outcome, duration, cost)."""
+    store = getattr(_monitor, "history", None)
+    if store is None:
+        return "Not ready."
+    from ender3monitor.history import format_recent
+    return format_recent(store, limit=5)
+
+
 def _tg_autostart(args):
     if _monitor is None:
         return "Not ready."
@@ -574,6 +583,7 @@ def _build_telegram_handlers():
         "go":       (_tg_go,       "start monitoring"),
         "stop":     (_tg_stop,     "stop monitoring"),
         "maintenance": (_tg_maintenance, "print hours + upkeep status"),
+        "history":  (_tg_history,  "last 5 prints: outcome, duration, AI cost"),
         "autostart": (_tg_autostart, "auto-start on print: /autostart on|off"),
         "timelapse": (_tg_timelapse, "compile + send the timelapse so far; "
                                      "/timelapse list or /timelapse <n> for older ones"),
@@ -1087,6 +1097,82 @@ async def download_timelapse(name: Optional[str] = None):
         return JSONResponse({"error": "Timelapse not found."}, 404)
 
     return FileResponse(str(candidate), media_type="video/mp4", filename=candidate.name)
+
+
+# ── Print history ─────────────────────────────────────────────────────────────
+
+def _history_store():
+    return getattr(_monitor, "history", None) if _monitor is not None else None
+
+
+def _history_thumb_file(store, rec: Optional[dict]) -> Optional[Path]:
+    """Resolved thumbnail path for a record, or None. Path-traversal safe —
+    only .jpg files directly inside the history dir are served."""
+    p = store.thumb_path_for(rec)
+    if p is None:
+        return None
+    base = store.dir.resolve()
+    candidate = (base / Path(p).name).resolve()
+    if candidate.parent != base or candidate.suffix != ".jpg" or not candidate.is_file():
+        return None
+    return candidate
+
+
+def _history_public(store, rec: dict) -> dict:
+    """A record as the UI sees it, plus what is actually still on disk."""
+    out = dict(rec)
+    out["has_thumbnail"] = _history_thumb_file(store, rec) is not None
+    tl = rec.get("timelapse")
+    tl_ok = False
+    if tl and isinstance(tl, str):
+        base = _timelapse_dir()
+        cand = (base / Path(tl).name).resolve()
+        tl_ok = cand.parent == base and cand.suffix == ".mp4" and cand.is_file()
+    out["timelapse_available"] = tl_ok
+    return out
+
+
+@app.get("/api/history")
+async def api_history():
+    """All recorded prints, newest first, without their event logs."""
+    store = _history_store()
+    if store is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    return {"prints": [_history_public(store, r) for r in store.list()]}
+
+
+@app.get("/api/history/{record_id}")
+async def api_history_get(record_id: str):
+    store = _history_store()
+    if store is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    rec = store.get(record_id)
+    if rec is None:
+        return JSONResponse({"error": "Print not found."}, 404)
+    return _history_public(store, rec)
+
+
+@app.get("/api/history/{record_id}/thumb")
+async def api_history_thumb(record_id: str):
+    store = _history_store()
+    if store is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    # The file is looked up via the stored record, never built from the URL.
+    path = _history_thumb_file(store, store.get(record_id))
+    if path is None:
+        return JSONResponse({"error": "No thumbnail."}, 404)
+    return FileResponse(str(path), media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.delete("/api/history/{record_id}")
+async def api_history_delete(record_id: str):
+    store = _history_store()
+    if store is None:
+        return JSONResponse({"error": "not initialised"}, 503)
+    if not store.delete(record_id):
+        return JSONResponse({"error": "Print not found."}, 404)
+    return {"deleted": record_id}
 
 
 @app.get("/api/status")
@@ -1887,6 +1973,14 @@ button.busy { cursor: progress; opacity: .6; }
       <div class="dot"></div>
       <span id="pill-text">Idle</span>
     </div>
+    <a class="icon-btn" id="history-btn" href="/history" title="Print history" style="text-decoration:none">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/>
+        <path d="M3 3v5h5"/>
+        <path d="M12 7v5l3 2"/>
+      </svg>
+    </a>
     <button class="icon-btn" id="settings-btn" title="Settings" onclick="openSettings()">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -2994,6 +3088,394 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeSetti
 scanCameras();
 loadTemps();
 connect();
+</script>
+</body>
+</html>
+"""
+
+# ── Print history page (separate from the dashboard's _HTML) ─────────────────
+
+@app.get("/history", response_class=HTMLResponse)
+async def history_page():
+    return HTMLResponse(_HISTORY_HTML, headers={"Cache-Control": "no-cache"})
+
+
+_HISTORY_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Print history – Ender3Monitor</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{overflow-x:hidden;max-width:100%}
+
+:root{
+  --bg:#070b14;
+  --surf:#0d1120;
+  --surf2:#121729;
+  --surf3:#181f30;
+  --border:rgba(255,255,255,0.07);
+  --blue:#4f8ef7;
+  --green:#22c55e;
+  --red:#f87171;
+  --amber:#fbbf24;
+  --text:#dde4f0;
+  --muted:#4a5878;
+  --soft:#8693ad;
+  --r:12px;
+}
+
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
+  font-size:14px;
+  line-height:1.5;
+  min-height:100vh;
+  overflow-x:hidden;
+}
+
+header{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:14px 28px;
+  background:var(--surf);
+  border-bottom:1px solid var(--border);
+  position:sticky;top:0;z-index:10;
+}
+.logo{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:700;
+  letter-spacing:-.3px;color:var(--text);text-decoration:none;min-width:0}
+.logo svg{opacity:.85;flex:none}
+.logo span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.header-right{display:flex;align-items:center;gap:12px;flex:none}
+.icon-btn{
+  display:flex;align-items:center;justify-content:center;
+  width:34px;height:34px;padding:0;border-radius:9px;
+  background:var(--surf3);border:1px solid var(--border);color:var(--muted);
+  cursor:pointer;transition:all .15s;text-decoration:none;
+}
+.icon-btn:hover{color:var(--text);border-color:rgba(255,255,255,.14)}
+.back{
+  display:flex;align-items:center;gap:6px;height:34px;padding:0 12px 0 8px;
+  border-radius:9px;background:var(--surf3);border:1px solid var(--border);
+  color:var(--soft);font-size:13px;font-weight:600;text-decoration:none;
+  transition:all .15s;
+}
+.back:hover{color:var(--text);border-color:rgba(255,255,255,.14)}
+
+.page{max-width:900px;margin:0 auto;padding:22px 28px 48px}
+.page-head{display:flex;align-items:baseline;justify-content:space-between;
+  gap:12px;margin-bottom:14px}
+.page-head h1{font-size:20px;font-weight:700;letter-spacing:-.3px}
+.count{color:var(--soft);font-size:12.5px;font-variant-numeric:tabular-nums}
+
+.list{display:flex;flex-direction:column;gap:10px}
+.card{
+  background:var(--surf);border:1px solid var(--border);border-radius:var(--r);
+  overflow:hidden;
+}
+.card.open{border-color:rgba(255,255,255,.13)}
+.card-head{
+  display:flex;align-items:center;gap:14px;width:100%;
+  padding:12px;background:none;border:0;color:inherit;font:inherit;
+  text-align:left;cursor:pointer;
+}
+.card-head:hover{background:rgba(255,255,255,.02)}
+.card-head:focus-visible{outline:2px solid var(--blue);outline-offset:-2px;border-radius:var(--r)}
+.thumb{
+  flex:none;width:96px;height:72px;border-radius:8px;overflow:hidden;
+  background:var(--surf3);border:1px solid var(--border);
+  display:flex;align-items:center;justify-content:center;color:var(--muted);
+}
+.thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.body{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.row1{display:flex;align-items:center;gap:8px;min-width:0}
+.name{flex:1;min-width:0;font-size:14.5px;font-weight:600;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.when{color:var(--soft);font-size:12.5px}
+.stats{display:flex;flex-wrap:wrap;gap:2px 14px;color:var(--soft);font-size:12.5px;
+  font-variant-numeric:tabular-nums}
+.stats b{color:var(--text);font-weight:600}
+.stats .bad b{color:var(--red)}
+.chev{flex:none;color:var(--muted);transition:transform .15s}
+.card.open .chev{transform:rotate(180deg)}
+
+.badge{
+  flex:none;display:inline-flex;align-items:center;
+  padding:2px 9px;border-radius:100px;
+  font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;
+  white-space:nowrap;
+}
+.b-completed{background:rgba(34,197,94,.12);color:var(--green)}
+.b-stopped{background:rgba(134,147,173,.14);color:var(--soft)}
+.b-failed{background:rgba(248,113,113,.12);color:var(--red)}
+.b-ok{background:rgba(34,197,94,.12);color:var(--green)}
+.b-fail{background:rgba(248,113,113,.12);color:var(--red)}
+
+.detail{display:none;border-top:1px solid var(--border);padding:14px 12px 12px;
+  background:var(--surf2)}
+.card.open .detail{display:block}
+.facts{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+  gap:10px 16px;margin-bottom:14px}
+.fact .k{color:var(--soft);font-size:11px;font-weight:600;letter-spacing:.06em;
+  text-transform:uppercase}
+.fact .v{font-size:13.5px;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.sec{color:var(--soft);font-size:11px;font-weight:600;letter-spacing:.06em;
+  text-transform:uppercase;margin-bottom:6px}
+.log{
+  max-height:320px;overflow-y:auto;border:1px solid var(--border);
+  border-radius:8px;background:var(--surf);
+}
+.ev{display:grid;grid-template-columns:auto auto minmax(0,1fr) auto;gap:8px;
+  align-items:start;padding:7px 10px;font-size:12.5px;
+  border-bottom:1px solid var(--border)}
+.ev:last-child{border-bottom:0}
+.ev-time{color:var(--soft);font-family:monospace;font-size:11.5px;padding-top:2px}
+.ev-desc{min-width:0;overflow-wrap:anywhere}
+.ev-conf{color:var(--soft);font-family:monospace;font-size:11.5px;padding-top:2px}
+.note{color:var(--soft);font-size:12.5px;padding:12px 10px}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.btn{
+  display:inline-flex;align-items:center;gap:7px;min-height:36px;padding:0 14px;
+  border-radius:9px;background:var(--surf3);border:1px solid var(--border);
+  color:var(--text);font:inherit;font-size:13px;font-weight:600;
+  text-decoration:none;cursor:pointer;transition:all .15s;
+}
+.btn:hover{border-color:rgba(255,255,255,.18)}
+.btn-primary{background:rgba(79,142,247,.14);border-color:rgba(79,142,247,.3);color:var(--blue)}
+.btn-danger{color:var(--red);margin-left:auto}
+.btn-danger:hover{border-color:rgba(248,113,113,.4)}
+
+.empty{
+  text-align:center;padding:56px 20px;border:1px dashed rgba(255,255,255,.1);
+  border-radius:var(--r);color:var(--soft);
+}
+.empty svg{color:var(--muted);margin-bottom:10px}
+.empty h2{color:var(--text);font-size:16px;font-weight:600;margin-bottom:4px}
+.empty a{color:var(--blue);text-decoration:none}
+
+@media (max-width:600px){
+  header{padding:12px 16px}
+  .page{padding:16px 12px 40px}
+  .card-head{gap:11px;padding:10px}
+  .thumb{width:76px;height:57px}
+  .chev{display:none}
+  .ev{grid-template-columns:auto minmax(0,1fr) auto}
+  .ev .badge{justify-self:start}
+  .ev-desc{grid-column:1 / -1;grid-row:2}
+  .btn-danger{margin-left:0}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <a class="logo" href="/" title="Back to dashboard">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+         stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+      <path d="M3 21h18M5 21V9l7-6 7 6v12"/>
+      <rect x="9" y="13" width="6" height="8" rx="1"/>
+      <path d="M9 13h6"/>
+    </svg>
+    <span>Ender3Monitor</span>
+  </a>
+  <div class="header-right">
+    <a class="back" href="/">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M15 18l-6-6 6-6"/>
+      </svg>
+      Dashboard
+    </a>
+  </div>
+</header>
+
+<main class="page">
+  <div class="page-head">
+    <h1>Print history</h1>
+    <span class="count" id="count"></span>
+  </div>
+  <div class="list" id="list"><div class="note">Loading…</div></div>
+</main>
+
+<script>
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  if (h) return h + 'h ' + m + 'm';
+  if (m) return m + 'm';
+  return sec + 's';
+}
+
+function fmtDate(epoch) {
+  if (!epoch) return '—';
+  return new Date(epoch * 1000).toLocaleString(undefined,
+    {month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'});
+}
+
+function fmtCost(v) {
+  v = Number(v) || 0;
+  return '$' + (v > 0 && v < 0.01 ? v.toFixed(3) : v.toFixed(2));
+}
+
+const OUTCOMES = {completed: 'Completed', stopped: 'Stopped', failed: 'Failed'};
+function outcomeBadge(o) {
+  const key = OUTCOMES[o] ? o : 'stopped';
+  return `<span class="badge b-${key}">${OUTCOMES[key]}</span>`;
+}
+
+const PHOTO_ICON = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+  stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/>
+  <path d="M21 16l-5-5-8 8"/></svg>`;
+
+function cardHtml(p) {
+  const id = encodeURIComponent(p.id);
+  const thumb = p.has_thumbnail
+    ? `<img src="/api/history/${id}/thumb" alt="" loading="lazy">`
+    : PHOTO_ICON;
+  const fails = Number(p.failure_count) || 0;
+  const alarms = Number(p.false_alarms) || 0;
+  return `<article class="card" data-id="${esc(p.id)}">
+    <button class="card-head" type="button" aria-expanded="false">
+      <span class="thumb">${thumb}</span>
+      <span class="body">
+        <span class="row1">
+          <span class="name">${esc(p.job_name || fmtDate(p.ended_at))}</span>
+          ${outcomeBadge(p.outcome)}
+        </span>
+        <span class="when">${p.job_name ? esc(fmtDate(p.ended_at)) + ' · ' : ''}${esc(fmtDuration(p.duration_seconds))}</span>
+        <span class="stats">
+          <span>AI <b>${esc(fmtCost(p.ai_cost_usd))}</b></span>
+          <span class="${fails ? 'bad' : ''}"><b>${fails}</b> failure${fails === 1 ? '' : 's'}</span>
+          <span><b>${alarms}</b> false alarm${alarms === 1 ? '' : 's'}</span>
+        </span>
+      </span>
+      <svg class="chev" width="18" height="18" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6 9l6 6 6-6"/></svg>
+    </button>
+    <div class="detail"></div>
+  </article>`;
+}
+
+function fact(k, v) {
+  return `<div class="fact"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
+}
+
+function eventsHtml(events) {
+  if (!events || !events.length) {
+    return '<div class="note">No events were logged for this print.</div>';
+  }
+  return events.slice().reverse().map(e => {
+    const t = new Date((e.t || 0) * 1000).toTimeString().slice(0, 8);
+    const ft = e.type || 'none';
+    const lbl = e.detected ? ft : (ft === 'no_printer' ? 'no printer' : (ft === 'none' ? 'ok' : ft));
+    const conf = e.conf != null ? Math.round(e.conf * 100) + '%' : '';
+    return `<div class="ev">
+      <span class="ev-time">${esc(t)}</span>
+      <span class="badge ${e.detected ? 'b-fail' : 'b-ok'}">${esc(String(lbl).replace(/_/g, ' '))}</span>
+      <span class="ev-desc">${esc(e.desc || '')}</span>
+      <span class="ev-conf">${esc(conf)}</span>
+    </div>`;
+  }).join('');
+}
+
+function detailHtml(p) {
+  const types = (p.failure_types || []).join(', ');
+  let h = '<div class="facts">'
+    + fact('Started', fmtDate(p.started_at))
+    + fact('Ended', fmtDate(p.ended_at))
+    + fact('Duration', fmtDuration(p.duration_seconds))
+    + fact('Frames analysed', p.frames_analyzed != null ? p.frames_analyzed : '—')
+    + (p.total_layers ? fact('Layers', p.total_layers) : '')
+    + (types ? fact('Failure types', types) : '')
+    + '</div>';
+  h += '<div class="sec">Event log</div><div class="log">' + eventsHtml(p.events) + '</div>';
+  h += '<div class="actions">';
+  if (p.timelapse && p.timelapse_available) {
+    h += `<a class="btn btn-primary" href="/download/timelapse?name=${encodeURIComponent(p.timelapse)}">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+      Download timelapse</a>`;
+  }
+  h += '<button class="btn btn-danger" type="button" data-delete>Delete</button></div>';
+  return h;
+}
+
+const listEl = document.getElementById('list');
+const countEl = document.getElementById('count');
+
+function renderList(prints) {
+  countEl.textContent = prints.length ? prints.length + (prints.length === 1 ? ' print' : ' prints') : '';
+  if (!prints.length) {
+    listEl.innerHTML = `<div class="empty">
+      <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></svg>
+      <h2>No prints yet</h2>
+      <p>Each monitored print is saved here when it finishes or is stopped.
+         <a href="/">Back to the dashboard</a></p>
+    </div>`;
+    return;
+  }
+  listEl.innerHTML = prints.map(cardHtml).join('');
+}
+
+async function load() {
+  try {
+    const r = await fetch('/api/history');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    renderList(data.prints || []);
+  } catch (err) {
+    countEl.textContent = '';
+    listEl.innerHTML = '<div class="note">Could not load print history ('
+      + esc(err.message) + '). <a class="btn" href="/history">Retry</a></div>';
+  }
+}
+
+async function toggle(card) {
+  const open = card.classList.toggle('open');
+  card.querySelector('.card-head').setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (!open || card.dataset.loaded) return;
+  const detail = card.querySelector('.detail');
+  detail.innerHTML = '<div class="note">Loading…</div>';
+  try {
+    const r = await fetch('/api/history/' + encodeURIComponent(card.dataset.id));
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    detail.innerHTML = detailHtml(await r.json());
+    card.dataset.loaded = '1';
+  } catch (err) {
+    detail.innerHTML = '<div class="note">Could not load this print (' + esc(err.message) + ').</div>';
+  }
+}
+
+async function removeCard(card) {
+  if (!confirm('Delete this print from the history?')) return;
+  try {
+    const r = await fetch('/api/history/' + encodeURIComponent(card.dataset.id), {method: 'DELETE'});
+    if (!r.ok && r.status !== 404) throw new Error('HTTP ' + r.status);
+    load();
+  } catch (err) {
+    alert('Delete failed: ' + err.message);
+  }
+}
+
+listEl.addEventListener('click', e => {
+  const card = e.target.closest('.card');
+  if (!card) return;
+  if (e.target.closest('[data-delete]')) { removeCard(card); return; }
+  if (e.target.closest('.card-head')) toggle(card);
+});
+
+load();
 </script>
 </body>
 </html>
