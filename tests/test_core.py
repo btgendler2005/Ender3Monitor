@@ -1217,3 +1217,18 @@ def test_no_all_clear_when_the_print_was_cancelled_instead_of_reloaded():
     assert m.printer.status.filament_runout is False
     assert m._runout_alerted is False
     assert len(m.push.sent) == 1           # no bogus "moving again"
+
+
+# ── notifications: master mute switches ─────────────────────────────────────
+
+def test_notification_toggles_mute_channels():
+    from ender3monitor.notifier import EmailNotifier
+    from ender3monitor.push import PushNotifier
+    e = EmailNotifier("h", 587, "u", "p", "s", "r")
+    assert e.enabled
+    e.muted = True
+    assert not e.enabled
+    p = PushNotifier(telegram_bot_token="t", telegram_chat_id="c")
+    assert p.channels() == ["telegram"] and p.enabled
+    p.telegram_muted = True
+    assert p.channels() == [] and not p.enabled

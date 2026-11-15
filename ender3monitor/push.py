@@ -27,11 +27,11 @@ class PushNotifier:
         self.discord_webhook = (discord_webhook or "").strip()
         self.telegram_bot_token = (telegram_bot_token or "").strip()
         self.telegram_chat_id = (telegram_chat_id or "").strip()
+        self.telegram_muted = False   # runtime toggle (settings: telegram_notifications)
 
     @property
     def enabled(self) -> bool:
-        return bool(self.ntfy_topic or self.discord_webhook
-                    or (self.telegram_bot_token and self.telegram_chat_id))
+        return bool(self.ntfy_topic or self.discord_webhook or self._telegram_ready)
 
     def channels(self) -> List[str]:
         out = []
@@ -39,7 +39,7 @@ class PushNotifier:
             out.append("ntfy")
         if self.discord_webhook:
             out.append("discord")
-        if self.telegram_bot_token and self.telegram_chat_id:
+        if self._telegram_ready:
             out.append("telegram")
         return out
 
@@ -51,7 +51,7 @@ class PushNotifier:
             self._safe_channel("ntfy", self._send_ntfy, title, message, priority)
         if self.discord_webhook:
             self._safe_channel("discord", self._send_discord, title, message, priority)
-        if self.telegram_bot_token and self.telegram_chat_id:
+        if self._telegram_ready:
             self._safe_channel("telegram", self._send_telegram, title, message, priority)
 
     def _safe_channel(self, channel: str, fn, *args) -> None:
@@ -114,7 +114,8 @@ class PushNotifier:
 
     @property
     def _telegram_ready(self) -> bool:
-        return bool(self.telegram_bot_token and self.telegram_chat_id)
+        return bool(self.telegram_bot_token and self.telegram_chat_id) \
+            and not self.telegram_muted
 
     def _telegram_multipart(self, method: str, fields: dict, file_field: str,
                             filename: str, content_type: str, blob: bytes) -> None:
