@@ -17,6 +17,7 @@ Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, f
 - **Printer control over USB** — live nozzle/bed temps, print progress and time remaining, auto-pause/cooldown on a confirmed failure, and manual pause/resume/cooldown/e-stop from the dashboard
 - **Slicer-aware status** — indexes your sliced G-code while the SD card is mounted, then follows the print through it: real layer numbers (`layer 340/1219`), the feature being printed right now, and an ETA from the slicer's own time curve instead of a byte-percentage guess. Also tells the AI when it's looking at a bridge or overhang, so expected sag stops reading as a failure. Falls back to the old behaviour whenever no file matches — see [Slicer-aware status](#slicer-aware-status)
 - **M600 color-change alerts** — detects when the printer pauses mid-print for an embedded filament/color change and pushes a notification, independent of whether AI monitoring is running; suppresses false failure flags while parked waiting for the swap. With a G-code index it also warns *ahead* of time ("color change in ~12 min")
+- **Filament runout alerts** — pushes an alert (Telegram/ntfy/Discord) the moment a print stops for filament, telling you the layer it stopped on and how much was left. Reads the runout sensor directly over USB and calibrates its polarity itself, and on firmware that reports nothing it still catches the runout by spotting a pause the sliced file never asked for — see [Filament runout detection](#filament-runout-detection)
 - **Hands-off start** — auto-starts monitoring when the printer begins a print (USB), and gates warmup on real signals (waits until printing has started and heaters are at target) instead of a fixed timer; falls back to a timer without USB
 - **First-layer inspection** — analyzes more frequently with an adhesion/squish focus during the failure-prone first layer (uses USB Z height)
 - **Layer-synced timelapse** — captures one frame per layer (via USB Z) for a smooth, consistent timelapse; falls back to time-based without USB
@@ -165,6 +166,63 @@ the built-in model. Verify with `grep -c "^M73" yourfile.gcode`. Note this is a
 wasn't running at export — everything falls back to the byte-percentage status
 that predates this. The match is also cross-checked against the live Z height
 and dropped if they disagree, so a wrong file degrades rather than misreports.
+
+---
+
+## Filament runout detection
+
+A runout sensor stops the print — but it does not tell *you*. This turns that
+into a push notification naming the layer it died on, so a spool that runs out
+at 2am isn't discovered at 9am with a cold, half-finished part on the bed.
+
+**Why this is harder than it looks.** Marlin answers a runout by running
+`FILAMENT_RUNOUT_SCRIPT`, which is `M600` by default. That is the *same* command
+an embedded color change uses, so over USB the two events are indistinguishable:
+both just park the head and block waiting on the user, repeating
+`echo:busy: paused for user` until someone intervenes. There is no "filament ran
+out" reply to poll for.
+
+So three signals are used, strongest first:
+
+1. **The sensor itself**, read over `M119` — Marlin reports the runout switch
+   alongside the endstops (`filament: open` / `Filament: TRIGGERED`) whenever one
+   is configured. This is the only unambiguous signal, and the only one that
+   catches a runout before the firmware reacts to it.
+2. **An explicit announcement** from the firmware — a host action or prompt
+   (`//action:out_of_filament`, `//action:prompt_begin FilamentRunout`). Only
+   host-handled configurations (`M412 H1`, `ACTION_ON_FILAMENT_RUNOUT`) emit one.
+3. **A pause nothing in the file asked for.** This is the fallback that carries
+   stock firmware. When the G-code index has matched the running file, it already
+   knows where every embedded `M600` sits. If the printer is blocked waiting on
+   the user and there is no `M600` near the current byte offset, nothing in the
+   print asked for this pause — so the filament ran out.
+
+**Which polarity means "loaded" is not assumed.** `FIL_RUNOUT_STATE` is a
+build-time choice and the switch can be wired either way, so `TRIGGERED` means
+*filament present* on some machines and *filament absent* on others. Guessing
+would mean either silence on a real runout or an alert on every healthy print,
+depending on the machine. Instead the polarity is calibrated: while a print is
+genuinely running and not parked waiting on the user, filament is by definition
+threaded through the sensor, so whatever it reads then is the loaded state. Until
+that baseline is established the reading is reported as unknown, never as a
+runout.
+
+**Setup.** Nothing — it works off the USB connection you already have for temps
+and progress. Turn it off with **Filament runout alert** in the ⚙ settings panel.
+No firmware changes, and nothing is ever sent to the printer beyond the read-only
+`M119` query.
+
+**Limits, stated plainly:**
+
+- Signal 3 needs a matched G-code index. Without one, a runout pause is reported
+  as a color change exactly as it was before — a wrong "your filament ran out" on
+  every multi-color print would be the worse failure, so the ambiguous case is
+  left alone rather than guessed at.
+- Firmware that reports no `filament:` line in `M119` has no sensor the host can
+  see; detection then rests on signals 2 and 3.
+- The alert is a notification only. It does not resume the print or touch the
+  heaters, which stay at temperature — so a long unattended runout still ends in
+  a cold-weld seam or an oozing nozzle. Act on the alert.
 
 ---
 
@@ -389,6 +447,9 @@ Updated every poll while the printer is connected over USB (NaN when unknown), v
 | `e3m_printer_lifetime_seconds` | Gauge | Lifetime print time from firmware EEPROM (M78) |
 | `e3m_printer_filament_change_pause` | Gauge | `1` while paused for a filament/color change (M600) |
 | `e3m_printer_color_changes_total` | Counter | M600 color/filament changes detected mid-print |
+| `e3m_printer_filament_present` | Gauge | `1` when the runout sensor reports filament loaded, `0` when it reports none (absent when there is no sensor or polarity isn't calibrated yet) |
+| `e3m_printer_filament_runout` | Gauge | `1` while a filament runout is believed to be in progress |
+| `e3m_printer_filament_runouts_total` | Counter | Filament runouts detected mid-print |
 
 ### Operational / SRE metrics
 

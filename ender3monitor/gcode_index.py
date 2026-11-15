@@ -233,6 +233,27 @@ class GcodeIndex:
         i = bisect.bisect_right(self.m600_offsets, pos)
         return self.m600_offsets[i] if i < len(self.m600_offsets) else None
 
+    def color_change_near(self, pos: Optional[int],
+                          behind: int = 32768, ahead: int = 4096) -> bool:
+        """Is there an embedded M600 close enough to `pos` to explain a pause?
+
+        Used to tell a planned color change apart from a filament runout, which
+        over serial look identical (both just block waiting on the user). The
+        window is asymmetric because Marlin blocks on the M600 itself while the
+        SD read pointer has already run ahead of it by the command queue plus
+        planner depth — so the M600 that caused a pause sits a short way
+        *behind* the offset M27 reports. The forward slack only covers jitter
+        between the reported offset and the index.
+
+        Returns False when the file has no color changes at all, which is the
+        common case and the one that makes an unexplained pause meaningful.
+        """
+        if pos is None or not self.m600_offsets:
+            return False
+        lo, hi = pos - max(0, behind), pos + max(0, ahead)
+        i = bisect.bisect_left(self.m600_offsets, lo)
+        return i < len(self.m600_offsets) and self.m600_offsets[i] <= hi
+
     def confirm_z(self, pos: Optional[int], z: Optional[float],
                   tolerance_layers: float = 12.0) -> bool:
         """Sanity-check that this index really describes the running print.
