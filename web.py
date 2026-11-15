@@ -39,7 +39,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ender3monitor")
 
 from ender3monitor.camera import CameraManager
-from ender3monitor.camera_worker import capture_worker
+from ender3monitor.camera_worker import FrameExchange, capture_worker, frame_shm_size
 from ender3monitor.config import Config
 from ender3monitor.telegram_bot import TelegramBot
 from ender3monitor.settings import Settings
@@ -108,6 +108,7 @@ class StreamCapture:
         # Worker-process state — touched only from the supervisor thread (_loop).
         self._process: Optional[mp.process.BaseProcess] = None
         self._shm: Optional[SharedMemory] = None
+        self._frames: Optional[FrameExchange] = None
         self._frame_ready = None
         self._stop_worker = None
         self._last_spawn_attempt = 0.0
@@ -151,7 +152,7 @@ class StreamCapture:
     # ── worker process management (supervisor-thread only) ──
     def _spawn_worker(self) -> None:
         self._last_spawn_attempt = time.time()
-        shm = SharedMemory(create=True, size=self.height * self.width * 3)
+        shm = SharedMemory(create=True, size=frame_shm_size(self.width, self.height))
         frame_ready = _MP_CTX.Event()
         stop_worker = _MP_CTX.Event()
         proc = _MP_CTX.Process(
@@ -162,6 +163,7 @@ class StreamCapture:
         )
         proc.start()
         self._process, self._shm = proc, shm
+        self._frames = FrameExchange(shm.buf, self.width, self.height)
         self._frame_ready, self._stop_worker = frame_ready, stop_worker
 
     def _teardown_worker(self) -> None:
@@ -172,6 +174,9 @@ class StreamCapture:
             if self._process.is_alive():
                 self._process.terminate()
                 self._process.join(timeout=1.0)
+        if self._frames is not None:
+            self._frames.release()   # numpy views would block shm.close()
+            self._frames = None
         if self._shm is not None:
             try:
                 self._shm.close()
@@ -206,12 +211,14 @@ class StreamCapture:
                 continue   # no new frame yet; loop back and re-check liveness
             self._frame_ready.clear()
 
-            view = np.ndarray((self.height, self.width, 3), dtype=np.uint8,
-                              buffer=self._shm.buf)
             # cv2.flip already writes a new array, so flip straight from the
-            # shared buffer instead of copying first and flipping the copy.
+            # shared slot instead of copying first and flipping the copy.
+            # read() hands back only a frame the worker didn't touch mid-copy.
             flip = self.flip
-            frame = cv2.flip(view, flip) if flip is not None else view.copy()
+            frame, _ = self._frames.read(
+                (lambda v: cv2.flip(v, flip)) if flip is not None else None)
+            if frame is None:
+                continue   # writer lapped us repeatedly; take the next frame
             ops.camera_frames_total.labels("ok").inc()
             with self._lock:
                 self._latest_raw = frame
