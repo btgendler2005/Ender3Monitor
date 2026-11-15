@@ -669,12 +669,21 @@ def _check_basic_auth(header: str) -> bool:
 # CancelledError traceback. Pure-ASGI middleware passes cancellation straight
 # through and shuts down cleanly.
 
+_ICON_SIZES = (180, 192, 512)
+_PUBLIC_PATHS = {"/manifest.webmanifest"} | {f"/icon-{n}.png" for n in _ICON_SIZES}
+
+
 class _AuthMiddleware:
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or not _auth_enabled():
+            await self.app(scope, receive, send)
+            return
+        # Home-screen install assets: the OS fetches these without the page's
+        # Basic credentials, and they reveal nothing about the printer.
+        if scope.get("path") in _PUBLIC_PATHS:
             await self.app(scope, receive, send)
             return
         if _check_basic_auth(Headers(scope=scope).get("authorization", "")):
@@ -1168,6 +1177,56 @@ async def stream():
     )
 
 
+# ── Home-screen install (manifest + icons) ───────────────────────────────────
+
+@app.get("/manifest.webmanifest")
+async def manifest():
+    """Lets a phone add the dashboard to its home screen as a full-screen app."""
+    return JSONResponse({
+        "name": "Ender3Monitor",
+        "short_name": "Ender3",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#070b14",
+        "theme_color": "#0d1120",
+        "icons": [{"src": f"/icon-{n}.png", "sizes": f"{n}x{n}", "type": "image/png"}
+                  for n in _ICON_SIZES if n != 180],
+    }, media_type="application/manifest+json",
+       headers={"Cache-Control": "public, max-age=86400"})
+
+
+_icon_cache: dict = {}
+
+
+def _icon_png(size: int) -> bytes:
+    """Draw the app icon (a printer gantry over a bed) once per size."""
+    if size not in _icon_cache:
+        n = 512
+        img = np.full((n, n, 3), (32, 17, 13), np.uint8)          # --surf, BGR
+        blue = (247, 142, 79)                                      # --blue, BGR
+        aa = cv2.LINE_AA
+        cv2.line(img, (136, 372), (136, 132), blue, 30, aa)       # left upright
+        cv2.line(img, (376, 372), (376, 132), blue, 30, aa)       # right upright
+        cv2.line(img, (136, 132), (376, 132), blue, 30, aa)       # top beam
+        cv2.line(img, (104, 392), (408, 392), blue, 34, aa)       # bed
+        cv2.rectangle(img, (220, 190), (292, 246), blue, -1, aa)  # print head
+        cv2.fillConvexPoly(img, np.array([[232, 246], [280, 246], [256, 290]]), blue, aa)
+        cv2.rectangle(img, (212, 330), (300, 368), (240, 228, 221), -1, aa)  # part
+        if size != n:
+            img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".png", img)
+        _icon_cache[size] = buf.tobytes() if ok else b""
+    return _icon_cache[size]
+
+
+@app.get("/icon-{size}.png")
+async def icon(size: int):
+    if size not in _ICON_SIZES:
+        return Response(status_code=404)
+    return Response(_icon_png(size), media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 # ── HTML / CSS / JS  (single-file, no build step) ────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
@@ -1195,7 +1254,15 @@ _HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0d1120">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Ender3">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<link rel="icon" type="image/png" href="/icon-192.png">
 <title>Ender3Monitor</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -1291,7 +1358,7 @@ header{
 }
 
 /* ── Camera ── */
-.cam-card{grid-row:1/3;display:flex;flex-direction:column;gap:14px}
+.cam-card{display:flex;flex-direction:column;gap:14px}
 #cam{
   width:100%;aspect-ratio:16/9;
   border-radius:8px;object-fit:cover;
@@ -1338,19 +1405,6 @@ header{
 .print-pills .pct .num{color:var(--blue)}
 .stat-chip{font-size:11px;color:var(--muted);background:var(--surf3);border-radius:999px;padding:4px 10px}
 
-/* ── Printer controls ── */
-.printer-controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
-.pbtn{
-  padding:9px 10px;border-radius:8px;
-  border:1px solid var(--border);background:var(--surf3);color:var(--text);
-  font-size:12.5px;font-weight:600;cursor:pointer;transition:all .15s;
-  justify-content:center;
-}
-.pbtn:hover{border-color:rgba(255,255,255,.16);background:#1d2336}
-.pbtn:active{transform:scale(.97)}
-.pbtn-stop{background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.3);color:var(--red)}
-.pbtn-stop:hover{background:rgba(248,113,113,.2)}
-
 /* ── Description ── */
 .desc-card{}
 #description{
@@ -1372,16 +1426,8 @@ header{
 #cam-select:disabled{opacity:.4;cursor:not-allowed}
 .btn-scan{background:var(--surf3);border-color:var(--border);color:var(--muted);padding:8px 12px}
 .btn-scan:hover{color:var(--text)}
-.autostart-toggle{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);
-  cursor:pointer;padding:0 6px;user-select:none}
-.autostart-toggle input{width:15px;height:15px;accent-color:var(--blue);cursor:pointer}
 
-/* ── Controls ── */
-.controls{
-  display:flex;gap:10px;flex-wrap:wrap;
-  padding:0 28px 4px;
-  max-width:1180px;width:100%;margin:0 auto;
-}
+/* ── Buttons ── */
 button{
   display:flex;align-items:center;gap:7px;
   padding:9px 18px;border-radius:9px;
@@ -1541,14 +1587,111 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
 .tgl input:checked + .track .knob{transform:translateX(18px);background:var(--blue)}
 .set-info-row{font-size:11.5px;color:var(--muted);padding:6px 0;display:flex;justify-content:space-between}
 
+/* ── Status headline ── */
+.headline{max-width:1180px;width:100%;margin:0 auto;padding:20px 28px 0}
+.hl-main{font-size:26px;font-weight:800;letter-spacing:-.5px;line-height:1.2;overflow-wrap:anywhere}
+.hl-sub{font-size:13.5px;color:#8291b3;margin-top:5px;display:flex;flex-wrap:wrap;gap:2px 0}
+.hl-sub span:not(:last-child)::after{content:'·';margin:0 7px;color:var(--muted)}
+.hl-sub .warn{color:var(--amber)}
+.hl-bar{height:4px;background:var(--surf3);border-radius:2px;overflow:hidden;margin-top:12px;display:none}
+.hl-bar div{height:100%;width:0;background:var(--blue);border-radius:2px;transition:width .7s}
+.headline.t-idle .hl-main{color:#8291b3}
+.headline.t-warn .hl-main{color:var(--amber)}
+.headline.t-warn .hl-bar div{background:var(--amber)}
+.headline.t-fail .hl-main{color:var(--red)}
+.headline.t-fail .hl-bar div{background:var(--red)}
+.headline.t-done .hl-main{color:var(--green)}
+.headline.t-done .hl-bar div{background:var(--green)}
+
+/* ── Details (collapsed secondary stats) ── */
+.details{border-top:1px solid var(--border);padding-top:14px}
+.details summary{
+  font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
+  color:var(--muted);cursor:pointer;list-style:none;
+  display:flex;justify-content:space-between;align-items:center;
+}
+.details summary::-webkit-details-marker{display:none}
+.details summary::after{content:'+';font-size:15px;line-height:1;font-weight:500}
+.details[open] summary::after{content:'–'}
+.details[open] summary{margin-bottom:12px}
+.details-meta{font-size:11px;color:var(--muted);margin-top:10px;display:flex;flex-direction:column;gap:4px}
+
+/* ── Sticky action bar ── */
+body{padding-bottom:calc(84px + env(safe-area-inset-bottom))}
+#toast{bottom:calc(96px + env(safe-area-inset-bottom));opacity:0;transition:transform .25s,opacity .25s}
+#toast.show{opacity:1}
+.actionbar{
+  position:fixed;left:0;right:0;bottom:0;z-index:50;
+  background:rgba(13,17,32,.94);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  border-top:1px solid var(--border);
+  padding:8px max(12px,env(safe-area-inset-right)) calc(8px + env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left));
+}
+.ab-inner{display:flex;gap:6px;max-width:560px;margin:0 auto}
+.ab-btn{
+  flex:1 1 0;min-width:0;min-height:54px;
+  flex-direction:column;justify-content:center;gap:3px;
+  padding:7px 4px;border-radius:11px;
+  background:var(--surf3);font-size:10.5px;font-weight:600;
+  position:relative;overflow:hidden;
+  touch-action:manipulation;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;
+}
+.ab-btn svg{width:18px;height:18px;flex:0 0 auto}
+.ab-btn:hover{background:#1d2336}
+.ab-monitor{flex-grow:1.25;color:var(--blue);background:rgba(79,142,247,.12);border-color:rgba(79,142,247,.3)}
+.ab-monitor:hover{background:rgba(79,142,247,.2)}
+.ab-monitor.on{color:var(--text);background:var(--surf3);border-color:var(--border)}
+.ab-monitor.on:hover{background:#1d2336}
+.ab-pause.resume{color:var(--green);background:rgba(34,197,94,.1);border-color:rgba(34,197,94,.3)}
+.ab-estop{color:var(--red);background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.3)}
+.ab-estop:hover{background:rgba(248,113,113,.16)}
+.ab-estop:active{transform:none}
+.ab-estop > *{position:relative}
+.ab-estop .hold-fill{
+  position:absolute;inset:0;background:rgba(248,113,113,.5);
+  transform:scaleX(0);transform-origin:left;pointer-events:none;
+}
+.ab-estop.holding .hold-fill{transform:scaleX(1);transition:transform 1.5s linear}
+.ab-printer{display:none}
+.actionbar.has-printer .ab-printer{display:flex}
+.ab-more{flex:0 0 50px}
+
+/* ── More sheet ── */
+.sheet-overlay{
+  position:fixed;inset:0;z-index:150;background:rgba(0,0,0,.55);
+  display:none;align-items:flex-end;justify-content:center;
+}
+.sheet-overlay.show{display:flex}
+.sheet{
+  background:var(--surf);border:1px solid var(--border);border-bottom:none;
+  border-radius:16px 16px 0 0;width:100%;max-width:560px;
+  padding:10px 18px calc(20px + env(safe-area-inset-bottom));
+  display:flex;flex-direction:column;gap:16px;max-height:85vh;overflow-y:auto;
+  box-shadow:var(--shadow);
+}
+.sheet-grip{width:36px;height:4px;border-radius:2px;background:var(--surf3);margin:0 auto}
+.sheet-label{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
+  color:var(--muted);margin-bottom:8px}
+.sheet-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.sheet-row .set-help{margin-top:2px}
+.sheet-wide{width:100%;justify-content:center;padding:13px 18px;font-size:14px}
+.sheet a{color:var(--blue);text-decoration:none;overflow-wrap:anywhere}
+
 /* ── Mobile / narrow screens ── */
 @media (max-width:760px){
+  .headline{padding:14px 16px 0}
+  .hl-main{font-size:22px}
+  /* Camera runs edge to edge: it is the thing you came to look at */
+  .card.cam-card{padding:0;overflow:hidden;gap:0}
+  .cam-card #cam{border-radius:0}
+  .cam-card #description{margin:14px 16px 16px}
   .modal-overlay{padding:0}
   .modal{max-width:none;border-radius:0;min-height:100vh;max-height:100vh}
   .set-control input[type=number],.set-control select{width:108px}
   header{padding:12px 16px}
   .logo{font-size:15px}
-  .pill{padding:5px 10px;font-size:10px}
+  /* The headline below already says the status in words; keep just the dot */
+  .pill{padding:7px}
+  #pill-text{display:none}
 
   /* Stack the two-column layout into one; camera no longer spans rows */
   .page{
@@ -1557,15 +1700,7 @@ button:disabled{opacity:.35;cursor:not-allowed;transform:none}
     gap:14px;
     padding:14px 14px;
   }
-  .cam-card{grid-row:auto}
   .card{padding:16px}
-
-  /* Controls: full-width camera picker, big tappable buttons */
-  .controls{padding:0 14px 4px;gap:8px}
-  .cam-select-row{flex:1 0 100%;min-width:0}
-  #cam-select{min-width:0}
-  .controls > button{flex:1 1 40%;justify-content:center;padding:12px 14px;font-size:14px}
-  .btn-scan{flex:0 0 auto}
 
   .log-section{padding:0 14px 22px}
 
@@ -1642,19 +1777,21 @@ button.busy { cursor: progress; opacity: .6; }
   </div>
 </div>
 
+<!-- Status headline: is it OK, and when is it done -->
+<div class="headline t-idle" id="headline" aria-live="polite">
+  <div class="hl-main" id="hl-main">Connecting…</div>
+  <div class="hl-sub" id="hl-sub"></div>
+  <div class="hl-bar" id="hl-bar"><div id="hl-bar-fill"></div></div>
+</div>
+
 <div class="page">
 
-  <!-- Camera -->
+  <!-- Camera, with the AI's latest observation as its caption -->
   <div class="card cam-card">
-    <div class="card-label">Camera Feed</div>
-    <img id="cam" src="/stream" alt="Camera preview">
-    <div class="cam-meta">
-      <span id="cam-label">—</span>
-      <span id="stream-link" style="font-size:11px;color:var(--muted)">
-        📱 <a id="stream-url" href="/stream" target="_blank"
-             style="color:var(--muted);text-decoration:none">/stream</a>
-      </span>
-    </div>
+    <img id="cam" src="/stream" alt="Live camera view of the printer">
+    <p id="description" style="color:var(--muted);font-style:italic">
+      Waiting for first analysis…
+    </p>
   </div>
 
   <!-- Stats -->
@@ -1675,24 +1812,9 @@ button.busy { cursor: progress; opacity: .6; }
       <div class="type-val type-ok" id="type-val">none</div>
     </div>
 
-    <div class="counts">
-      <div class="count-box">
-        <div class="lbl">Frames</div>
-        <div class="num" id="frames">0</div>
-      </div>
-      <div class="count-box">
-        <div class="lbl">Failures</div>
-        <div class="num" id="failures" style="color:var(--text)">0</div>
-      </div>
-    </div>
-
-    <div class="cost-line" id="cost-box" title="Estimated AI API cost for this print">
-      Est. AI cost · this print <span id="cost">$0.00</span>
-    </div>
-
     <!-- Printer (USB) — hidden until a printer is connected -->
     <div id="printer-block" style="display:none">
-      <div class="card-label" style="margin-top:18px">Printer</div>
+      <div class="card-label">Printer</div>
       <div class="counts">
         <div class="count-box">
           <div class="lbl">Nozzle</div>
@@ -1710,59 +1832,101 @@ button.busy { cursor: progress; opacity: .6; }
         <div id="pp-chips" style="grid-column:1/-1;display:flex;flex-wrap:wrap;gap:6px"></div>
       </div>
       <div style="font-size:11px;color:var(--muted);margin-top:8px" id="printer-progress"></div>
-      <div class="printer-controls">
-        <button class="pbtn" onclick="doPrinter('pause', this)">Pause</button>
-        <button class="pbtn" onclick="doPrinter('resume', this)">Resume</button>
-        <button class="pbtn" onclick="doPrinter('cooldown', this)">Cooldown</button>
-        <button class="pbtn pbtn-stop" onclick="doPrinter('estop', this)">E‑Stop</button>
-      </div>
     </div>
 
-    <div style="font-size:11px;color:var(--muted);border-top:1px solid var(--border);
-                padding-top:14px" id="backend-row"></div>
-  </div>
-
-  <!-- Description -->
-  <div class="card desc-card">
-    <div class="card-label">AI Observation</div>
-    <p id="description" style="color:var(--muted);font-style:italic">
-      Waiting for first analysis…
-    </p>
+    <details class="details" id="details">
+      <summary>Details</summary>
+      <div class="counts">
+        <div class="count-box">
+          <div class="lbl">Frames</div>
+          <div class="num" id="frames">0</div>
+        </div>
+        <div class="count-box">
+          <div class="lbl">Failures</div>
+          <div class="num" id="failures" style="color:var(--text)">0</div>
+        </div>
+      </div>
+      <div class="cost-line" id="cost-box" title="Estimated AI API cost for this print">
+        Est. AI cost · this print <span id="cost">$0.00</span>
+      </div>
+      <div class="details-meta">
+        <span id="backend-row"></span>
+        <span id="cam-label"></span>
+      </div>
+    </details>
   </div>
 
 </div>
 
-<!-- Controls -->
-<div class="controls">
-  <div class="cam-select-row">
-    <select id="cam-select" title="Select camera" onchange="previewCamera()">
-      <option value="">Scanning cameras…</option>
-    </select>
-    <button class="btn-scan" onclick="scanCameras(true)" title="Rescan all cameras">
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <polyline points="23 4 23 10 17 10"/>
-        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-      </svg>
+<!-- Sticky action bar: the controls you reach for mid-print -->
+<nav class="actionbar" id="actionbar" aria-label="Print controls">
+  <div class="ab-inner">
+    <button class="ab-btn ab-monitor" id="btn-monitor" onclick="toggleMonitor()">
+      <svg id="mon-icon" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20"/></svg>
+      <span id="mon-label">Start AI</span>
+    </button>
+    <button class="ab-btn ab-printer ab-pause" id="btn-pause" onclick="togglePause()">
+      <svg id="pause-icon" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+      <span id="pause-label">Pause</span>
+    </button>
+    <button class="ab-btn ab-printer" id="btn-cooldown" onclick="doCooldown()"
+            title="Pause the print and turn the heaters off">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2v20M4.9 6l14.2 12M19.1 6L4.9 18"/></svg>
+      <span>Cooldown</span>
+    </button>
+    <button class="ab-btn ab-printer ab-estop" id="btn-estop"
+            title="Hold to emergency stop" aria-label="Emergency stop — press and hold">
+      <span class="hold-fill"></span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="8 2 16 2 22 8 22 16 16 22 8 22 2 16 2 8"/><path d="M12 8v5M12 16.5v.01"/></svg>
+      <span>E‑Stop</span>
+    </button>
+    <button class="ab-btn ab-more" id="btn-more" onclick="openMore()" aria-label="More controls">
+      <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+      <span>More</span>
     </button>
   </div>
-  <button class="btn-start" id="btn-start" onclick="doStart()">
-    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21"/></svg>
-    Start
-  </button>
-  <button class="btn-stop" id="btn-stop" onclick="doStop()" disabled>
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
-    Stop
-  </button>
-  <button onclick="doTimelapse()" id="btn-timelapse">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/>
-    </svg>
-    Download Timelapse
-  </button>
-  <label class="autostart-toggle" title="Automatically start monitoring when the printer begins a print">
-    <input type="checkbox" id="autostart-cb" onchange="toggleAutoStart()">
-    <span>Auto-start</span>
-  </label>
+</nav>
+
+<!-- More sheet: the rarely-needed controls -->
+<div id="more-overlay" class="sheet-overlay" onclick="if(event.target===this)closeMore()">
+  <div class="sheet" role="dialog" aria-label="More controls">
+    <div class="sheet-grip"></div>
+    <div>
+      <div class="sheet-label">Camera</div>
+      <div class="cam-select-row">
+        <select id="cam-select" title="Select camera" onchange="previewCamera()">
+          <option value="">Scanning cameras…</option>
+        </select>
+        <button class="btn-scan" onclick="scanCameras(true)" title="Rescan all cameras">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="23 4 23 10 17 10"/>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div class="sheet-row">
+      <div>
+        <div>Auto-start</div>
+        <div class="set-help">Start AI monitoring when the printer begins a print</div>
+      </div>
+      <label class="tgl">
+        <input type="checkbox" id="autostart-cb" onchange="toggleAutoStart()">
+        <span class="track"><span class="knob"></span></span>
+      </label>
+    </div>
+    <button class="sheet-wide" onclick="doTimelapse()" id="btn-timelapse">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M5 21h14"/>
+      </svg>
+      Download Timelapse
+    </button>
+    <div>
+      <div class="sheet-label">Live stream link</div>
+      <a id="stream-url" href="/stream" target="_blank">/stream</a>
+    </div>
+    <button class="sheet-wide" onclick="closeMore()">Close</button>
+  </div>
 </div>
 
 <!-- Event log -->
@@ -1779,7 +1943,7 @@ button.busy { cursor: progress; opacity: .6; }
 <div id="toast"></div>
 
 <script>
-let ws, lastFrames = -1, camList = [], lastEventsKey = null, wsWasDown = false;
+let ws, lastFrames = -1, camList = [], lastState = {}, lastEventsKey = null, wsWasDown = false;
 
 // ── WebSocket ──────────────────────────────────────────────────────────────
 function connect() {
@@ -1835,6 +1999,9 @@ async function busy(id, fn) {
 
 // ── Render state ───────────────────────────────────────────────────────────
 function render(d) {
+  lastState = d;
+  renderHeadline(d);
+
   // Pill
   const pill = document.getElementById('pill');
   const s = d.status || '';
@@ -1944,13 +2111,140 @@ function render(d) {
     document.getElementById('cam-label').textContent = `Camera ${d.camera_index}`;
   }
 
-  // Buttons
-  document.getElementById('btn-start').disabled = !!d.is_running;
-  document.getElementById('btn-stop').disabled  = !d.is_running;
+  // Action bar
+  renderActionBar(d);
 
   // Event log — rendered from the server-side history so it survives reloads.
   if (Array.isArray(d.events)) renderEvents(d.events);
 }
+
+// ── Status headline ────────────────────────────────────────────────────────
+// One line that answers "is it OK, and when is it done" — worst news first.
+function renderHeadline(d) {
+  const p = d.printer || {};
+  const s = d.status || '';
+  const pctStr = p.progress != null ? Math.round(p.progress * 100) + '%' : '';
+  let tone = 'idle', main, sub = [], bar = false;
+
+  if (p.connected && p.filament_runout) {
+    tone = 'fail'; main = 'Paused — filament runout';
+  } else if (p.connected && p.filament_change_pause) {
+    tone = 'warn'; main = 'Paused — change filament';
+  } else if (d.is_running && d.failure_detected) {
+    tone = 'fail';
+    main = 'Possible failure: ' + String(d.failure_type || 'unknown').replace(/_/g, ' ');
+  } else if (/error/i.test(s)) {
+    tone = 'warn'; main = s;
+  } else if (p.connected && p.printing && p.paused) {
+    tone = 'warn'; main = 'Paused' + (pctStr ? ' · ' + pctStr : '');
+  } else if (p.connected && p.printing) {
+    tone = 'run'; main = 'Printing' + (pctStr ? ' · ' + pctStr : '');
+  } else if (/complete/i.test(s)) {
+    tone = 'done'; main = 'Print complete';
+  } else if (d.is_running) {
+    tone = 'run'; main = s || 'Monitoring…';
+  } else {
+    main = s === 'starting' ? 'Starting…' : p.connected ? 'Printer idle' : 'Idle';
+  }
+
+  if (p.connected && p.printing) {
+    bar = p.progress != null;
+    if (p.remaining_str) sub.push(['~' + p.remaining_str + ' left']);
+    if (p.layer_str) sub.push(['layer ' + p.layer_str]);
+    if (p.feature && tone === 'run') sub.push([p.feature]);
+    if (p.next_color_change_str) sub.push(['color change in ~' + p.next_color_change_str]);
+    // A print running with nobody watching is the thing worth shouting about.
+    if (!d.is_running) sub.push(['AI monitoring off', 'warn']);
+  } else if (d.is_running && tone !== 'run') {
+    sub.push([s]);
+  } else if (!d.is_running && tone === 'idle' && s !== 'starting') {
+    sub.push(['AI monitoring off']);
+  }
+
+  document.getElementById('headline').className = 'headline t-' + tone;
+  document.getElementById('hl-main').textContent = main;
+  const subEl = document.getElementById('hl-sub');
+  subEl.innerHTML = '';
+  sub.forEach(([text, cls]) => {
+    const el = document.createElement('span');
+    el.textContent = text; if (cls) el.className = cls;
+    subEl.appendChild(el);
+  });
+  document.getElementById('hl-bar').style.display = bar ? 'block' : 'none';
+  if (bar) document.getElementById('hl-bar-fill').style.width = (p.progress * 100) + '%';
+  document.title = (tone === 'fail' ? '⚠ ' : '') +
+    (p.connected && p.printing && pctStr ? pctStr + ' · ' : '') + 'Ender3Monitor';
+}
+
+// ── Action bar ─────────────────────────────────────────────────────────────
+const ICON_PLAY  = '<polygon points="6 4 20 12 6 20"/>';
+const ICON_STOP  = '<rect x="5" y="5" width="14" height="14" rx="2"/>';
+const ICON_PAUSE = '<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>';
+
+function renderActionBar(d) {
+  const p = d.printer || {};
+  document.getElementById('actionbar').classList.toggle('has-printer', !!p.connected);
+
+  const mon = document.getElementById('btn-monitor');
+  mon.classList.toggle('on', !!d.is_running);
+  document.getElementById('mon-label').textContent = d.is_running ? 'Stop AI' : 'Start AI';
+  document.getElementById('mon-icon').innerHTML = d.is_running ? ICON_STOP : ICON_PLAY;
+
+  const pb = document.getElementById('btn-pause');
+  pb.classList.toggle('resume', !!p.paused);
+  document.getElementById('pause-label').textContent = p.paused ? 'Resume' : 'Pause';
+  document.getElementById('pause-icon').innerHTML = p.paused ? ICON_PLAY : ICON_PAUSE;
+}
+
+function toggleMonitor() {
+  if (!lastState.is_running) return doStart();
+  const p = lastState.printer || {};
+  if (p.connected && p.printing &&
+      !confirm('Stop AI monitoring? The print keeps running, unwatched.')) return;
+  doStop();
+}
+
+function togglePause() {
+  doPrinter((lastState.printer || {}).paused ? 'resume' : 'pause');
+}
+
+function doCooldown() {
+  if (confirm('Pause the print and turn the heaters off?')) doPrinter('cooldown');
+}
+
+// E-Stop: press and hold, so a stray thumb can't brick a 10-hour print.
+(function() {
+  const btn = document.getElementById('btn-estop');
+  const HOLD_MS = 1500;
+  let timer = null;
+  const start = () => {
+    if (timer) return;
+    btn.classList.add('holding');
+    timer = setTimeout(() => {
+      timer = null;
+      btn.classList.remove('holding');
+      if (navigator.vibrate) navigator.vibrate(200);
+      doPrinter('estop');
+    }, HOLD_MS);
+  };
+  const cancel = () => {
+    if (!timer) return;
+    clearTimeout(timer); timer = null;
+    btn.classList.remove('holding');
+    toast('Hold for 1.5 s to emergency stop');
+  };
+  btn.addEventListener('pointerdown', e => { e.preventDefault(); start(); });
+  ['pointerup', 'pointerleave', 'pointercancel', 'blur'].forEach(ev =>
+    btn.addEventListener(ev, cancel));
+  btn.addEventListener('contextmenu', e => e.preventDefault());
+  const isKey = e => e.key === ' ' || e.key === 'Enter';
+  btn.addEventListener('keydown', e => { if (isKey(e)) { e.preventDefault(); start(); } });
+  btn.addEventListener('keyup',   e => { if (isKey(e)) cancel(); });
+})();
+
+// ── More sheet ─────────────────────────────────────────────────────────────
+function openMore()  { document.getElementById('more-overlay').classList.add('show'); }
+function closeMore() { document.getElementById('more-overlay').classList.remove('show'); }
 
 function pillClass(s) {
   const l = s.toLowerCase();
@@ -2020,11 +2314,11 @@ async function previewCamera() {
 async function doStart() {
   const cam = selectedCam();
   const body = cam !== null ? { camera_index: cam } : {};
-  const data = await busy('btn-start', () => api('start', body));
+  const data = await busy('btn-monitor', () => api('start', body));
   if (data) render(data);   // after busy() so render sets the final disabled state
 }
 async function doStop() {
-  const data = await busy('btn-stop', () => api('stop'));
+  const data = await busy('btn-monitor', () => api('stop'));
   if (data) render(data);
 }
 async function doTimelapse() {
@@ -2057,10 +2351,6 @@ async function toggleAutoStart() {
 
 // Manual printer control over USB
 async function doPrinter(action, btn) {
-  if (action === 'estop' &&
-      !confirm('Emergency stop halts the printer immediately and requires a power-cycle to recover. Continue?')) {
-    return;
-  }
   await busy(btn, async () => {
     try {
       const res = await fetch('/api/printer', {
@@ -2275,8 +2565,8 @@ async function saveSettings() {
   }
 }
 
-// Esc closes the modal
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSettings(); });
+// Esc closes the modal and the More sheet
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeSettings(); closeMore(); } });
 
 // ── Boot ───────────────────────────────────────────────────────────────────
 scanCameras();

@@ -1232,3 +1232,30 @@ def test_notification_toggles_mute_channels():
     assert p.channels() == ["telegram"] and p.enabled
     p.telegram_muted = True
     assert p.channels() == [] and not p.enabled
+
+
+# ── Pause/Resume toggle state ────────────────────────────────────────────────
+
+def test_paused_flag_follows_our_own_pause_resume_and_job_end():
+    from ender3monitor.printer import PrinterController
+    pc = PrinterController.__new__(PrinterController)
+    pc.status = PrinterStatus(connected=True, printing=True)
+    sent = []
+    pc.send = lambda gcode, **k: sent.append(gcode) or "ok"
+
+    pc.pause()
+    assert pc.status.paused and pc.status.as_dict()["paused"] is True
+    pc.resume()
+    assert not pc.status.paused
+    pc.cooldown()
+    assert pc.status.paused          # cooldown parks the print too
+    assert sent == ["M25", "M24", "M25", "M104 S0", "M140 S0", "M107"]
+
+
+def test_install_assets_are_served_and_skip_auth():
+    import web
+    assert "/manifest.webmanifest" in web._PUBLIC_PATHS
+    assert all(f"/icon-{n}.png" in web._PUBLIC_PATHS for n in web._ICON_SIZES)
+    png = web._icon_png(180)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert 'rel="manifest"' in web._HTML and 'id="btn-estop"' in web._HTML

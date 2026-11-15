@@ -113,6 +113,10 @@ class PrinterStatus:
     z_height: Optional[float] = None        # current nozzle Z (M114), for first-layer / layer-timelapse
     lifetime_print_seconds: Optional[int] = None  # firmware EEPROM total (M78)
     filament_change_pause: bool = False     # printer is blocked waiting on the user (M600 etc.)
+    # Latched by our own pause()/cooldown() and cleared by resume() or the job
+    # ending, so the UI can offer one Pause/Resume toggle. A pause made on the
+    # printer's own LCD is not visible over serial and is not reflected here.
+    paused: bool = False
 
     # ── Filament runout ──
     # `filament_present` is the runout sensor read over M119 and normalised for
@@ -157,6 +161,7 @@ class PrinterStatus:
             "z_height": self.z_height,
             "lifetime_print_seconds": self.lifetime_print_seconds,
             "filament_change_pause": self.filament_change_pause,
+            "paused": self.paused,
             "filament_present": self.filament_present,
             "filament_sensor_reported": self.filament_sensor_reported,
             "filament_runout": self.filament_runout,
@@ -463,6 +468,7 @@ class PrinterController:
             self.status.printing = "Done printing" not in resp
         elif "Not SD printing" in resp or "Done printing" in resp:
             self.status.printing = False
+            self.status.paused = False
             self.status.file_position = None
             self.status.file_size = None
             # No job, no runout — don't carry an announcement into the next print.
@@ -593,10 +599,12 @@ class PrinterController:
     def pause(self) -> None:
         """Pause an SD print (M25)."""
         self.send("M25")
+        self.status.paused = True
 
     def resume(self) -> None:
         """Resume a paused SD print (M24)."""
         self.send("M24")
+        self.status.paused = False
 
     def cooldown(self) -> None:
         """Pause, then turn off hotend and bed heaters and the part fan."""
@@ -604,6 +612,7 @@ class PrinterController:
         self.send("M104 S0")    # hotend off
         self.send("M140 S0")    # bed off
         self.send("M107")       # part fan off
+        self.status.paused = True
 
     def emergency_stop(self) -> None:
         """Hard halt (M112). The printer must be power-cycled/reset afterwards."""
