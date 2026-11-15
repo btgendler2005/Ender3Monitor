@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
+import hashlib
 import json
 import logging
 import multiprocessing as mp
@@ -735,6 +737,9 @@ async def api_autostart(body: AutoStartBody):
     return {"auto_start": _monitor.auto_start_enabled}
 
 
+_camera_cache: list = []   # last hardware scan result: [(index, w, h), ...]
+
+
 @app.get("/api/cameras")
 async def api_cameras(scan: bool = False):
     """Return available cameras.
@@ -747,11 +752,18 @@ async def api_cameras(scan: bool = False):
     try:
         configured = _config.camera_index if _config else -1
 
-        if configured >= 0 and not scan:
-            # Fast path — camera already chosen, no need to probe hardware
+        if not scan:
+            # Fast path — never probe hardware on a plain page load. A scan
+            # pauses the live capture and can take many seconds, which made
+            # every page load slow and left the preview stalled until a manual
+            # refresh. Return the last scan if we have one, otherwise just the
+            # camera the stream is already using. The Rescan button passes
+            # ?scan=true to force a real hardware scan.
+            current = configured if configured >= 0 else (_stream.index if _stream else 0)
+            cams = _camera_cache or [(current, 1280, 720)]
             return {
-                "cameras": [{"index": configured, "width": 1280, "height": 720}],
-                "configured": configured,
+                "cameras": [{"index": i, "width": w, "height": h} for i, w, h in cams],
+                "configured": current,
             }
 
         # Pause the persistent capture so the scan has exclusive access to the
@@ -771,9 +783,10 @@ async def api_cameras(scan: bool = False):
         finally:
             if _stream:
                 _stream.set_paused(False)
+        _camera_cache[:] = cameras
         return {
             "cameras": [{"index": i, "width": w, "height": h} for i, w, h in cameras],
-            "configured": configured,
+            "configured": configured if configured >= 0 else (_stream.index if _stream else 0),
         }
     except Exception:
         if _stream:
@@ -1042,8 +1055,24 @@ async def stream():
 # ── HTML / CSS / JS  (single-file, no build step) ────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTMLResponse(_HTML)
+async def index(request: Request):
+    # The page is a ~100 KB static string: compress it once and let the browser
+    # revalidate with an ETag instead of re-downloading it on every reload.
+    global _html_gz, _html_etag
+    if _html_gz is None:
+        _html_gz = gzip.compress(_HTML.encode("utf-8"), compresslevel=6)
+        _html_etag = '"%s"' % hashlib.md5(_HTML.encode("utf-8")).hexdigest()
+    headers = {"ETag": _html_etag, "Cache-Control": "no-cache", "Vary": "Accept-Encoding"}
+    if request.headers.get("if-none-match") == _html_etag:
+        return Response(status_code=304, headers=headers)
+    if "gzip" in request.headers.get("accept-encoding", ""):
+        return Response(_html_gz, media_type="text/html; charset=utf-8",
+                        headers={**headers, "Content-Encoding": "gzip"})
+    return HTMLResponse(_HTML, headers=headers)
+
+
+_html_gz: Optional[bytes] = None
+_html_etag = ""
 
 
 _HTML = r"""<!DOCTYPE html>
