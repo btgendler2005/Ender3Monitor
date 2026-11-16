@@ -49,6 +49,28 @@ class TimelapseManager:
         cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
         self._frame_count += 1
 
+    @property
+    def frame_count(self) -> int:
+        return self._frame_count
+
+    def discard_frames(self) -> int:
+        """Drop the frames saved so far this session (the session continues).
+
+        Used when head-parked capture kicks in: the few frames taken before the
+        first parked one have the head in shot and would open the video with a
+        jump. Returns how many were removed. Never raises.
+        """
+        removed = 0
+        try:
+            if self._session_dir is not None:
+                for f in self._session_dir.glob("frame_*.jpg"):
+                    f.unlink(missing_ok=True)
+                    removed += 1
+        except Exception as exc:
+            print(f"  [TIMELAPSE] Could not discard early frames (ignored): {exc}")
+        self._frame_count = 0
+        return removed
+
     def reset_session(self) -> None:
         self.prune()                 # bound disk use before starting a new print
         self._session_dir = None
@@ -107,17 +129,24 @@ class TimelapseManager:
 
     def compile(self, fps: int = 24, output_file: Optional[str] = None,
                 aspect: str = "native", fit: str = "pad_blur",
-                overlay_lines: Optional[list] = None) -> Optional[str]:
+                overlay_lines: Optional[list] = None,
+                hold_last_seconds: float = 0.0) -> Optional[str]:
         if self._session_dir is None:
             print("No timelapse session to compile.")
             return None
         return self.compile_session(self._session_dir, fps=fps, output_file=output_file,
-                                     aspect=aspect, fit=fit, overlay_lines=overlay_lines)
+                                     aspect=aspect, fit=fit, overlay_lines=overlay_lines,
+                                     hold_last_seconds=hold_last_seconds)
 
     def compile_session(self, session_dir, fps: int = 24, output_file: Optional[str] = None,
                          aspect: str = "native", fit: str = "pad_blur",
-                         overlay_lines: Optional[list] = None) -> Optional[str]:
-        """Compile a specific session folder (as returned by list_sessions())."""
+                         overlay_lines: Optional[list] = None,
+                         hold_last_seconds: float = 0.0) -> Optional[str]:
+        """Compile a specific session folder (as returned by list_sessions()).
+
+        `hold_last_seconds` repeats the final frame for that long, so the video
+        rests on the finished part instead of cutting off the instant it ends.
+        """
         session_dir = Path(session_dir)
         if not session_dir.is_dir():
             print(f"No such timelapse session: {session_dir}")
@@ -157,6 +186,7 @@ class TimelapseManager:
             print("Cannot open a video writer (no usable codec).")
             return None
 
+        last_img = None
         for f in frames:
             img = cv2.imread(str(f))
             if img is None:
@@ -169,6 +199,11 @@ class TimelapseManager:
             if img.shape[1] != w or img.shape[0] != h:
                 img = cv2.resize(img, (w, h))
             writer.write(img)
+            last_img = img
+
+        if last_img is not None:
+            for _ in range(max(0, int(round(hold_last_seconds * fps)))):
+                writer.write(last_img)
 
         writer.release()
 

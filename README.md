@@ -21,6 +21,7 @@ Supports two AI backends: **Claude** (Anthropic API) and **llava:7b** (Ollama, f
 - **Hands-off start** — auto-starts monitoring when the printer begins a print (USB), and gates warmup on real signals (waits until printing has started and heaters are at target) instead of a fixed timer; falls back to a timer without USB
 - **First-layer inspection** — analyzes more frequently with an adhesion/squish focus during the failure-prone first layer (uses USB Z height)
 - **Layer-synced timelapse** — captures one frame per layer (via USB Z) for a smooth, consistent timelapse; falls back to time-based without USB
+- **Head-parked timelapse** — add a few lines to your slicer and every frame is taken with the head parked in the same spot, so the video shows the part growing instead of the head jumping around (see [Smooth timelapses](#smooth-timelapses))
 - **Auto completion report** — on finish, sends stats + final photo + the timelapse video to Telegram
 - **Interactive Telegram bot** — two-way control and `/ask` natural-language questions about the live print ("is the first layer sticking?")
 - **Maintenance tracking** — cumulative print hours with upkeep reminders and a "possible clog" heads-up when stopped-extrusion recurs
@@ -496,6 +497,43 @@ Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `TELEGRAM_ALLOWED_CHATS` (chat
 On completion the bot also auto-sends a report: stats, final photo, and the timelapse video.
 
 ---
+
+## Smooth timelapses
+
+By default a frame is saved when the monitor notices the Z height step up. It
+polls the printer every 5 seconds, so the head and the bed are somewhere
+different in every frame and the video jitters.
+
+For a steady video, let the sliced file say when to take the photo. Each layer
+it parks the head at a fixed spot, waits until it has stopped, and announces it
+over USB; the monitor takes the frame at that moment. In OrcaSlicer put this in
+**Printer settings → Machine G-code → Layer change G-code**:
+
+```gcode
+; --- timelapse snapshot ---
+G1 E-1 F2400            ; retract so the parked nozzle does not ooze
+G1 X5 Y220 F9000        ; park: head to the left, bed pushed forward
+M400                    ; wait until the move has really finished
+M118 E1 TIMELAPSE_SNAP  ; tell Ender3Monitor to take the photo
+G4 P500                 ; hold still for the camera
+G1 E1 F2400             ; un-retract
+```
+
+Notes:
+
+- The retract lines assume relative extrusion (`M83`), which is OrcaSlicer's
+  default. If your profile uses absolute E, remove both `G1 E…` lines.
+- Pick a park spot where the head is out of the camera's view of the part, and
+  ideally the same spot your end G-code presents the print at, so the final
+  frame lines up with the rest.
+- It costs roughly 2–3 seconds per layer (travel there and back plus the hold).
+- No prime tower is needed.
+- Leave **Capture mode** on `auto` or `layer`. The first time the monitor sees
+  the marker in a print it logs `Head-parked capture active`, drops the frames
+  it had taken before that, and from then on saves only parked frames plus one
+  final frame of the finished part. Files without the snippet behave as before.
+- The firmware must support `M118` (standard in Marlin 2). If the log line
+  never appears, it does not, and capture stays Z-based.
 
 ## Project structure
 

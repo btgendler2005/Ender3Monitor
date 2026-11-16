@@ -21,7 +21,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 try:
     import serial  # pyserial
@@ -52,6 +52,15 @@ _M78_TOTAL_RE = re.compile(
 # poll command's reply window happens to be open when it's sent (see `send()`).
 # Mid-print, this is effectively always an embedded M600 color change.
 _PAUSED_FOR_USER_RE = re.compile(r"paused for user", re.IGNORECASE)
+
+# Timelapse snapshot marker. The sliced file parks the head at a fixed spot on
+# every layer change, waits for the move to finish (M400) and then announces it
+# with `M118 E1 TIMELAPSE_SNAP`, which the firmware echoes on the USB line. That
+# is the one moment the head is out of the shot and the bed is in the same place
+# as on every other layer, so the monitor photographs exactly then.
+SNAPSHOT_MARKER = b"TIMELAPSE_SNAP"
+# How often listen() looks at the idle line for that marker (seconds).
+_LISTEN_SLICE_SECONDS = 0.03
 
 # Explicit filament-runout announcements. There is no single universal line:
 # with Marlin's default FILAMENT_RUNOUT_SCRIPT ("M600") the firmware handles a
@@ -245,6 +254,10 @@ class PrinterController:
         # only arrives every ~2s, so a single reply window without it doesn't
         # prove the pause ended — require a couple of clean replies in a row.
         self._pause_clear_streak = 0
+        # Timelapse snapshot marker (see SNAPSHOT_MARKER). on_snapshot is called
+        # from whichever thread read the marker, the moment it is read.
+        self.on_snapshot: Optional[Callable[[], None]] = None
+        self._rx_tail = b""   # end of the last unsolicited chunk (split markers)
         # Runout-sensor polarity calibration (see _learn_sensor_polarity).
         self._sensor_present_state: Optional[bool] = None
         self._sensor_calibration_value: Optional[bool] = None
@@ -383,6 +396,9 @@ class PrinterController:
         self._call_started_at = time.time()   # cleared in `finally`; watchdog polls this
         try:
             with self._lock:
+                # Lines the firmware sent on its own since the last exchange
+                # would be thrown away by the reset — look at them first.
+                self._scan_unsolicited(self._read_pending())
                 self._serial.reset_input_buffer()
                 self._serial.write((gcode.strip() + "\n").encode("ascii", "ignore"))
                 self._serial.flush()
@@ -392,6 +408,10 @@ class PrinterController:
                     raw = self._serial.readline()
                     if not raw:
                         continue
+                    # Acted on here, not after the 'ok': while the head
+                    # dwells at the park spot the firmware holds our reply
+                    # back, and by then the head has moved on.
+                    self._scan_unsolicited(raw)
                     line = raw.decode("ascii", "ignore").strip()
                     if line:
                         lines.append(line)
@@ -412,6 +432,69 @@ class PrinterController:
             return ""
         finally:
             self._call_started_at = None
+
+    def _read_pending(self) -> bytes:
+        """Bytes already waiting on the port, without blocking. Lock held."""
+        ser = self._serial
+        n = getattr(ser, "in_waiting", 0) if ser is not None else 0
+        if not isinstance(n, int) or n <= 0:
+            return b""
+        return ser.read(n) or b""
+
+    def _scan_unsolicited(self, data: bytes) -> None:
+        """Look for the timelapse snapshot marker in raw bytes off the wire.
+
+        Keeps the tail of the previous chunk so a marker split across two reads
+        is still seen, and fires on_snapshot once per marker. Never raises.
+        """
+        if not data:
+            return
+        buf = self._rx_tail + data
+        hits = buf.count(SNAPSHOT_MARKER)
+        if hits:
+            buf = buf[buf.rfind(SNAPSHOT_MARKER) + len(SNAPSHOT_MARKER):]
+        self._rx_tail = buf[-(len(SNAPSHOT_MARKER) - 1):]
+        cb = self.on_snapshot
+        if hits and cb is not None:
+            try:
+                cb()
+            except Exception as exc:
+                print(f"\n  [PRINTER] snapshot callback failed: {exc}")
+
+    def listen(self, duration: float, stop: Optional[threading.Event] = None) -> None:
+        """Watch the idle serial line for `duration` seconds.
+
+        Used between polls while a print runs, so a snapshot marker is acted on
+        within a few hundredths of a second instead of at the next 5 s poll.
+        Only ever takes the serial lock for a non-blocking read, so commands
+        from other threads (pause, e-stop) are not held up. Never raises.
+        """
+        deadline = time.time() + duration
+        while self.connected:
+            remaining = deadline - time.time()
+            if remaining <= 0 or (stop is not None and stop.is_set()):
+                return
+            try:
+                with self._lock:
+                    data = self._read_pending()
+                    if data:
+                        self._scan_unsolicited(data)
+                        text = data.decode("ascii", "ignore")
+                        # Latch-only: an idle line can announce a pause or a
+                        # runout, but silence here proves nothing.
+                        if _PAUSED_FOR_USER_RE.search(text):
+                            self._note_pause_marker(text)
+                        self._note_runout_marker(text)
+            except Exception:
+                break   # send() owns error reporting; just stop listening
+            pause = min(_LISTEN_SLICE_SECONDS, remaining)
+            if stop is not None:
+                stop.wait(pause)
+            else:
+                time.sleep(pause)
+        remaining = deadline - time.time()
+        if remaining > 0:
+            stop.wait(remaining) if stop is not None else time.sleep(remaining)
 
     def _note_pause_marker(self, resp: str) -> None:
         """Latch/clear filament_change_pause from a raw serial reply.
