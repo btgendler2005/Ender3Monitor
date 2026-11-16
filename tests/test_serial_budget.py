@@ -33,6 +33,8 @@ class FakeMarlin:
         self.reply = deque()
         self.reply_delay = 0.0
         self.swallow_ok = False     # drop the next "ok" (simulate a timeout)
+        self.busy = False           # heating (M190/M109): replies are held back
+        self.held = []
 
     # pyserial surface
     @property
@@ -63,6 +65,9 @@ class FakeMarlin:
     def write(self, raw):
         cmd = raw.decode().strip()
         self.writes.append(cmd)
+        if self.busy:               # queued in the firmware; answered later
+            self.held.append(cmd)
+            return
         code = command_code(cmd)
         out = []
         if cmd.startswith("M155"):
@@ -97,11 +102,22 @@ class FakeMarlin:
     def push(self, text):
         self.pending += text.encode()
 
+    def finish_heating(self):
+        """Heating done: the held commands run and their replies arrive late."""
+        self.busy = False
+        for cmd in self.held:
+            self.write(cmd.encode())
+            self.writes.pop()
+        self.held = []
+        while self.reply:
+            self.pending += self.reply.popleft()
 
-def make(printing=True, supports=("M155", "M27S"), interval=5.0):
+
+def make(printing=True, supports=("M155", "M27S"), interval=5.0, sensor_poll=0.0):
     clock = [1000.0]
     pc = PrinterController(port="", min_command_interval=interval,
-                           ok_timeout=0.05, clock=lambda: clock[0])
+                           ok_timeout=0.05, clock=lambda: clock[0],
+                           sensor_poll_printing=sensor_poll)
     fake = FakeMarlin(clock, printing=printing, supports=supports)
     pc._serial = fake
     pc.status.connected = True
@@ -169,7 +185,7 @@ def test_m27_s_accepted_but_silent_falls_back_to_polling():
 # ── the traffic budget ───────────────────────────────────────────────────────
 
 def test_at_most_one_command_per_interval_while_printing():
-    pc, fake, clock = make(supports=())       # worst case: everything polled
+    pc, fake, clock = make(supports=(), sensor_poll=30)   # worst case: everything polled
     sent_at = []
     orig = fake.write
     fake.write = lambda raw: (sent_at.append(clock[0]), orig(raw))
@@ -243,6 +259,56 @@ def test_m114_is_polled_only_when_idle():
     assert pc.status.printing is False
     run(pc, clock, 60)
     assert "M114" in fake.writes and pc.status.z_height == 12.0
+
+
+def test_m119_is_not_polled_mid_print_by_default():
+    """M119 stalls motion ~1.3 s on a CR Touch printer (measured on the V3 SE)."""
+    pc, fake, clock = make(printing=False)
+    run(pc, clock, 70)
+    assert "M119" in fake.writes                # idle: still read
+    fake.printing = True
+    fake.push("SD printing byte 1/1000\n")
+    pc.listen(0, None)
+    assert pc.status.filament_present is None   # stale idle reading dropped
+    fake.writes.clear()
+    run(pc, clock, 300)
+    assert "M119" not in fake.writes
+
+
+def test_print_started_during_idle_polling_heats_without_queueing_commands():
+    """Seen on the printer: the monitor learns 'idle', then a print is started
+    from the screen. During heat-up the firmware answers nothing, so every
+    poll timed out — and, still believing 'idle', the monitor kept sending at
+    the idle pace, M114 included, piling commands into the firmware queue."""
+    pc, fake, clock = make(printing=False, supports=("M155",))
+    run(pc, clock, 40, step=0.5)
+    assert pc.status.printing is False and not pc.may_be_printing()
+    fake.writes.clear()
+    fake.printing = True
+    fake.busy = True
+    run(pc, clock, 150, step=0.5)               # a long heat-up
+    assert len(fake.writes) == 1                # the one that timed out; then nothing
+    assert not any(command_code(w) in MOTION_SYNC_COMMANDS for w in fake.writes)
+    assert pc.may_be_printing()                 # mid-print rules from the first timeout
+    fake.finish_heating()
+    pc.listen(0, None)                          # its late reply arrives
+    assert not pc.owes_ok()
+    # …and that late M27 reply is not mistaken for an SD auto-report.
+    assert pc._autoreport["sd"] is not True
+    fake.writes.clear()
+    run(pc, clock, 120)
+    assert pc.status.printing is True
+    assert "M27" in fake.writes
+    assert not any(command_code(w) in MOTION_SYNC_COMMANDS for w in fake.writes)
+
+
+def test_owed_ok_is_forgotten_if_it_never_arrives():
+    pc, fake, clock = make(printing=False)
+    fake.busy = True
+    run(pc, clock, 5)
+    assert pc.owes_ok()
+    clock[0] += 181
+    assert not pc.owes_ok() and pc.can_send()
 
 
 def test_print_start_clears_stale_idle_z():

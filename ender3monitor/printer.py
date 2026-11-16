@@ -80,7 +80,13 @@ FALLBACK_POLL_SECONDS = 10         # polling floor when an auto-report is missin
 AUTOREPORT_GRACE_INTERVALS = 3     # this many intervals without a report → poll
 AUTOREPORT_RETRY_SECONDS = 60      # re-arm a report that stopped (printer reset)
 PRINT_TIME_POLL_SECONDS = 60       # M31; elapsed time is extrapolated between
-SENSOR_POLL_PRINTING_SECONDS = 30  # M119 during a print
+# M119 during a print: off (0) by default. With a BLTouch/CR Touch probe (the
+# V3 SE has one) Marlin's M119 switches the probe into and out of its switch
+# mode first, each with a ~0.5 s blocking delay, so the main loop plans no
+# moves for over a second and short segments run the planner dry: a visible
+# stall. Measured on the printer: every M119 "ok" took ~1.3 s while M27/M31
+# answered in ~0.1 s. Opt in with PRINTER_RUNOUT_SENSOR_POLL_SECONDS.
+SENSOR_POLL_PRINTING_SECONDS = 0
 SENSOR_POLL_IDLE_SECONDS = 60
 POSITION_POLL_IDLE_SECONDS = 30    # M114 — idle only
 STATS_POLL_IDLE_SECONDS = 300      # M78 — idle only
@@ -89,8 +95,11 @@ IDLE_MIN_COMMAND_INTERVAL = 0.5
 DEFAULT_OK_TIMEOUT = 5.0
 SLOW_OK_SECONDS = 1.0              # an "ok" slower than this is counted as slow
 # A timed-out command's "ok" usually turns up later; it must not be mistaken
-# for the next command's. Forget the debt after this long in case it never does.
-OK_DEBT_EXPIRY_SECONDS = 30.0
+# for the next command's. A timeout usually means the firmware is busy (most
+# often heating in M190/M109 at the start of a print, which can take minutes),
+# so the command is still in flight and nothing routine is sent until its "ok"
+# arrives. Forget the debt after this long in case it never does.
+OK_DEBT_EXPIRY_SECONDS = 180.0
 
 # Commands after which Marlin finishes (or blocks on) the queued motion before
 # it replies, or that rewrite settings. Never sent while a print may be running.
@@ -379,7 +388,8 @@ class PrinterController:
     def __init__(self, port: str = "", baud: int = 115200,
                  min_command_interval: float = DEFAULT_MIN_COMMAND_INTERVAL,
                  ok_timeout: float = DEFAULT_OK_TIMEOUT,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 sensor_poll_printing: float = SENSOR_POLL_PRINTING_SECONDS) -> None:
         self._port_cfg = port
         self._baud = baud
         self._serial = None
@@ -388,11 +398,14 @@ class PrinterController:
         # Traffic budget (see the block above MOTION_SYNC_COMMANDS).
         self.min_command_interval = max(0.0, float(min_command_interval))
         self.ok_timeout = max(0.5, float(ok_timeout))
+        # 0 = never poll the runout sensor (M119) mid-print; see the constant.
+        self.sensor_poll_printing = max(0.0, float(sensor_poll_printing))
         self._clock = clock
         self._last_cmd_at: Optional[float] = None
         self._sent_times: deque = deque(maxlen=512)   # for commands/minute
         self._ok_debt = 0
         self._ok_debt_until = 0.0
+        self._owed_codes = deque(maxlen=3)   # timed-out commands, oldest first
         self._rx_buf = b""          # partial line from a passive read
         self._reset_link_state()
         # Rolling temperature history for the dashboard chart. Written by the
@@ -449,6 +462,7 @@ class PrinterController:
                 self._serial.reset_input_buffer()
                 self._rx_buf = b""
                 self._ok_debt = 0
+                self._owed_codes.clear()
             self._reset_link_state()
             self.status.connected = True
             self.status.port = port
@@ -568,9 +582,18 @@ class PrinterController:
         return (self.min_command_interval if self.may_be_printing()
                 else IDLE_MIN_COMMAND_INTERVAL)
 
+    def owes_ok(self, now: Optional[float] = None) -> bool:
+        """A timed-out command's "ok" hasn't arrived yet: it is still in flight."""
+        now = self._clock() if now is None else now
+        return self._ok_debt > 0 and now <= self._ok_debt_until
+
     def can_send(self, now: Optional[float] = None) -> bool:
         """Whether the rate limit allows a routine command right now."""
         now = self._clock() if now is None else now
+        if self.owes_ok(now):
+            # One command in flight includes one that timed out: anything sent
+            # now would only queue up behind it in the firmware's buffer.
+            return False
         last = self._last_cmd_at
         return last is None or (now - last) >= self._command_gap()
 
@@ -644,7 +667,13 @@ class PrinterController:
                 else:
                     _observe_ok_timeout(code)
                     self._ok_debt = min(self._ok_debt + 1, 3)
+                    self._owed_codes.append(code)
                     self._ok_debt_until = self._clock() + OK_DEBT_EXPIRY_SECONDS
+                    # The firmware is busy. A print started from the printer's
+                    # screen spends its first minutes heating and answers
+                    # nothing, so "idle" is no longer known: apply the
+                    # mid-print rules until an SD status says otherwise.
+                    self._print_state_known = False
             resp = "\n".join(lines)
             self._note_pause_marker(resp)
             self._note_runout_marker(resp)
@@ -699,8 +728,11 @@ class PrinterController:
             return False
         if self._clock() > self._ok_debt_until:
             self._ok_debt = 0       # never arrived; stop discarding real oks
+            self._owed_codes.clear()
             return False
         self._ok_debt -= 1
+        if self._owed_codes:
+            self._owed_codes.popleft()
         return True
 
     def _consume_passive(self, data: bytes) -> None:
@@ -724,7 +756,11 @@ class PrinterController:
             if line[:2].lower() == "ok":
                 self._take_ok_debt()
                 continue
-            self._handle_report_line(line)
+            # While a timed-out command is owed, a status line here is most
+            # likely its late reply, not proof that an auto-report works.
+            late_for = (self._owed_codes[0]
+                        if self._owed_codes and self.owes_ok() else None)
+            self._handle_report_line(line, solicited=late_for)
             # Latch-only: an idle line can announce a pause or a runout, but
             # silence here proves nothing.
             if _PAUSED_FOR_USER_RE.search(line):
@@ -922,6 +958,10 @@ class PrinterController:
             # The monitor fills in an estimate from the G-code index instead.
             self.status.z_height = None
             self.status.z_estimated = False
+            # Likewise the runout sensor's idle reading: it is not refreshed
+            # mid-print unless opted in, and a stale "no filament" from before
+            # loading must not raise a runout alert on the new job.
+            self.status.filament_present = None
 
     def query_print_time(self) -> None:
         """Update elapsed time via M31 and estimate remaining from progress."""
@@ -1093,9 +1133,13 @@ class PrinterController:
         # Runout sensor: skipped while blocked waiting on the user — the reply
         # would not reach us (see query_filament_sensor), and filament is
         # legitimately out of the sensor during a color-change swap.
+        # Mid-print only when opted in: M119 stalls motion on probe-equipped
+        # printers (see SENSOR_POLL_PRINTING_SECONDS).
         if not st.filament_change_pause and self._print_state_known:
-            polls.append(("M119", SENSOR_POLL_PRINTING_SECONDS if st.printing
-                          else SENSOR_POLL_IDLE_SECONDS, self.query_filament_sensor))
+            if not st.printing:
+                polls.append(("M119", SENSOR_POLL_IDLE_SECONDS, self.query_filament_sensor))
+            elif self.sensor_poll_printing > 0:
+                polls.append(("M119", self.sensor_poll_printing, self.query_filament_sensor))
         if not self.may_be_printing():
             polls.append(("M114", POSITION_POLL_IDLE_SECONDS, self.query_position))
             polls.append(("M78", STATS_POLL_IDLE_SECONDS, self.query_statistics))

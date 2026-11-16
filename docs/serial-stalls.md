@@ -77,14 +77,32 @@ head-parked timelapse marker does not depend on Z.
 **One command in flight, with a rate limit.** The serial lock covers write →
 `ok`. If a reply times out, the controller remembers that it is owed an `ok`
 and discards the next stray `ok` instead of reading it as the reply to the
-next command (the debt expires after 30 s). While a print may be running, routine commands go out
+next command. A timed-out command still counts as in flight: nothing routine
+is sent until its `ok` arrives (or 180 s pass), and the monitor stops assuming
+the printer is idle. That matters when a print is started from the printer's
+screen: during heat-up (M190/M109) the firmware answers nothing, and an
+earlier version kept polling at the idle pace, `M114` included, filling the
+firmware queue before the first move. While a print may be running, routine commands go out
 at most once per `PRINTER_MIN_COMMAND_INTERVAL_SECONDS` (default 5). When
 the budget is tight, the most overdue poll wins, so everything still gets a
 turn. Operator interventions (pause, resume, cool-down, e-stop) skip the rate limit
 but still wait their turn on the lock. Normal traffic mid-print is now about
-**3 commands per minute**: `M31` once a minute (elapsed time is extrapolated
-between readings) and `M119` every 30 s. If neither auto-report works, it rises
-to about 12 per minute, the cap at the default interval.
+**1 command per minute**: `M31` (elapsed time is extrapolated between
+readings). Firmware without SD auto-report (the stock V3 SE) adds `M27` every
+10 s, for about 7 per minute. If neither auto-report works, it rises to about
+12 per minute.
+
+**No `M119` mid-print.** The first connected test run showed every `M119`
+taking about 1.3 s to answer while `M27` and `M31` took about 0.1 s, so the
+time was spent executing it, not queueing. On a Marlin build with a
+BLTouch-type probe (the V3 SE's CR Touch), M119 puts the probe into switch
+mode and back before reporting, and each step has a blocking delay of about
+0.5 s. The main loop plans no new moves meanwhile, and with short segments
+the planner buffer runs dry: a stall. The original code sent M119 every 5 s,
+which fits the symptom well. M119 is now sent only while idle, unless
+`PRINTER_RUNOUT_SENSOR_POLL_SECONDS` is set. Without it, the runout alert
+relies on the firmware's own runout pause (an unplanned pause in the G-code
+index) rather than the sensor reading.
 
 **Passive reader.** `listen()` now runs whenever the printer is connected
 (30 ms slices while monitoring, for the timelapse marker; 250 ms otherwise to
@@ -132,7 +150,7 @@ visible), at least 30 minutes long. The file must contain the
    - Watch for freezes at line ends or before travels. Film a few minutes if
      you can.
    - In Grafana's "Serial link health" row, check:
-     - **Commands per minute** is about 3 (or about 12 if auto-reports are
+     - **Commands per minute** is about 1, or about 7 with M27 polled (or about 12 if auto-reports are
        unsupported).
      - **Auto-reports active** is 1 for temp and SD. If either is 0, your
        firmware is being polled, which is fine but is more traffic.

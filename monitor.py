@@ -262,7 +262,8 @@ class Monitor:
         # Optional printer USB control + push notifications
         self.printer = PrinterController(
             config.printer_port, config.printer_baud,
-            min_command_interval=getattr(config, "printer_min_command_interval", 5.0))
+            min_command_interval=getattr(config, "printer_min_command_interval", 5.0),
+            sensor_poll_printing=getattr(config, "printer_runout_sensor_poll_seconds", 0.0))
         self.push = PushNotifier(
             ntfy_topic=config.ntfy_topic,
             discord_webhook=config.discord_webhook,
