@@ -1841,3 +1841,20 @@ def test_compile_holds_the_last_frame(tmp_path):
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
     assert n == 13
+
+
+def test_dashboard_state_reports_the_timelapse_capture_mode(tmp_path, monkeypatch):
+    import web
+
+    class _M:
+        _timelapse_synced = False
+        _timelapse_layer_mode = True
+        timelapse = TimelapseManager(str(tmp_path))
+
+    monkeypatch.setattr(web, "_monitor", _M)
+    assert web._timelapse_state() == {"mode": "layer", "frames": 0}
+    _M.timelapse.save_frame(np.zeros((8, 8, 3), np.uint8))
+    _M._timelapse_synced = True
+    assert web._timelapse_state() == {"mode": "parked", "frames": 1}
+    _M._timelapse_synced = _M._timelapse_layer_mode = False
+    assert web._timelapse_state()["mode"] == "time"
