@@ -825,6 +825,21 @@ def _failure_review_state() -> Optional[dict]:
     }
 
 
+def _timelapse_state() -> dict:
+    """How this session's timelapse frames are being taken, for the dashboard.
+
+    mode: "parked" once the sliced file's snapshot marker has been seen (head
+    parked in the same spot every frame), else "layer" (Z-step) or "time".
+    """
+    if getattr(_monitor, "_timelapse_synced", False):
+        mode = "parked"
+    elif getattr(_monitor, "_timelapse_layer_mode", False):
+        mode = "layer"
+    else:
+        mode = "time"
+    return {"mode": mode, "frames": _monitor.timelapse.frame_count}
+
+
 def _state() -> dict:
     if _monitor is None:
         return {"status": "starting", "is_running": False}
@@ -849,6 +864,7 @@ def _state() -> dict:
         "failure_review": _failure_review_state(),
         "false_alarm_count": _monitor.false_alarm_count,
         "confidence_history": list(_monitor.confidence_history),
+        "timelapse": _timelapse_state(),
     }
 
 
@@ -2125,6 +2141,7 @@ button.busy { cursor: progress; opacity: .6; }
       <div class="cost-line" id="cost-box" title="Estimated AI API cost for this print">
         Est. AI cost · this print <span id="cost">$0.00</span>
       </div>
+      <div class="cost-line" id="tl-line"></div>
       <div class="details-meta">
         <span id="backend-row"></span>
         <span id="cam-label"></span>
@@ -2326,6 +2343,20 @@ function render(d) {
       '≈$' + d.cost_usd.toFixed(d.cost_usd < 1 ? 3 : 2);
   }
 
+  // Timelapse capture mode (Details)
+  const tl = d.timelapse;
+  const tlLine = document.getElementById('tl-line');
+  if (tl && d.is_running) {
+    const how = {parked: 'head-parked', layer: 'per layer (Z)', time: 'timed'}[tl.mode] || tl.mode;
+    tlLine.innerHTML = 'Timelapse · ' + how + ' <span>' + tl.frames +
+                       (tl.frames === 1 ? ' frame' : ' frames') + '</span>';
+    tlLine.title = tl.mode === 'parked'
+      ? 'The sliced file is parking the head for every frame.'
+      : 'No snapshot marker seen from the sliced file in this print.';
+  } else {
+    tlLine.textContent = '';
+  }
+
   // Description
   if (d.description) {
     const desc = document.getElementById('description');
@@ -2377,6 +2408,11 @@ function render(d) {
       if (p.layer_str) chips.push('Layer ' + p.layer_str);
       if (p.feature) chips.push(p.feature);
       if (p.next_color_change_str) chips.push('🎨 color change in ~' + p.next_color_change_str);
+      const tlc = d.timelapse;
+      if (d.is_running && tlc && tlc.mode === 'parked') {
+        chips.push('🎞 Head-parked timelapse · ' + tlc.frames +
+                   (tlc.frames === 1 ? ' frame' : ' frames'));
+      }
       const box = document.getElementById('pp-chips');
       box.innerHTML = '';
       chips.forEach(t => {
