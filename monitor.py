@@ -46,6 +46,13 @@ TIMELAPSE_INTERVAL = 30     # seconds between timelapse frames (time-based mode)
 
 # Layer-synced timelapse: capture when Z rises by at least this much (mm).
 LAYER_Z_THRESHOLD_MM = 0.04
+# Head-parked timelapse: the sliced file parks the head and announces it (see
+# printer.SNAPSHOT_MARKER). Wait this long after the announcement before taking
+# the photo, so the frame in hand was exposed after the head stopped — keep it
+# comfortably under the dwell (G4) that follows the announcement in the file.
+SNAPSHOT_SETTLE_SECONDS = 0.25
+# Rest on the finished part for this long at the end of a compiled timelapse.
+TIMELAPSE_HOLD_LAST_SECONDS = 2.0
 # A drop this large means the head re-homed / a new print began below the old
 # baseline — re-baseline instead of waiting for Z to exceed the stale high mark.
 LAYER_Z_RESET_MM = 1.0
@@ -335,6 +342,11 @@ class Monitor:
 
         # Layer-synced timelapse (driven by the printer Z poller)
         self._timelapse_layer_mode: bool = False
+        # Head-parked capture: set by the first snapshot marker of a session;
+        # from then on only marker frames are saved (see _on_snapshot_marker).
+        self._timelapse_synced: bool = False
+        self._snapshot_lock = threading.Lock()
+        self.printer.on_snapshot = self._on_snapshot_marker
         self._last_layer_z: Optional[float] = None
 
         # Per-run analysis stats (for the completion report)
@@ -602,7 +614,11 @@ class Monitor:
             was_connected = now_connected
 
             ticks += 1
-            self._printer_poll_stop.wait(timeout=PRINTER_POLL_INTERVAL)
+            if self._running and self.printer.connected and self.printer.status.printing:
+                # Same pause, but watching the line for the timelapse marker.
+                self.printer.listen(PRINTER_POLL_INTERVAL, self._printer_poll_stop)
+            else:
+                self._printer_poll_stop.wait(timeout=PRINTER_POLL_INTERVAL)
 
     def _note_history_job(self) -> None:
         """Remember the job name while it is known — the G-code context is
@@ -634,6 +650,8 @@ class Monitor:
         """
         if not (self._running and self._timelapse_layer_mode and self._frame_provider):
             return
+        if self._timelapse_synced:
+            return   # the sliced file is calling the shots (head-parked capture)
         if not self.printer.status.printing:
             return   # ignore homing/parking moves outside an active print
         z = self.printer.status.z_height
@@ -650,6 +668,31 @@ class Monitor:
             if frame is not None:
                 self.timelapse.save_frame(frame)
                 self._last_layer_z = z
+
+    def _on_snapshot_marker(self) -> None:
+        """Head-parked timelapse: the printer just announced that the head is
+        parked and still, so this is the frame to keep.
+
+        Called on the thread that read the marker off the serial line. Every
+        frame taken this way has the head and the bed in the same place, which
+        is what makes the compiled video look like the part growing rather than
+        the machine thrashing. The first marker of a session switches the
+        Z-/time-based capture off and drops the frames it had already saved.
+        """
+        if not (self._running and self._frame_provider):
+            return
+        if self.settings.get("timelapse_mode") == "time":
+            return   # explicitly asked for plain time-based capture
+        with self._snapshot_lock:
+            if not self._timelapse_synced:
+                self._timelapse_synced = True
+                dropped = self.timelapse.discard_frames()
+                print("\n  [TIMELAPSE] Head-parked capture active (snapshot marker "
+                      f"seen); dropped {dropped} earlier frame(s).")
+            time.sleep(SNAPSHOT_SETTLE_SECONDS)
+            frame = self._frame_provider()
+            if frame is not None:
+                self.timelapse.save_frame(frame)
 
     def _check_printer_completion(self) -> None:
         """Detect print completion from the printer's own state (falling edge).
@@ -699,6 +742,13 @@ class Monitor:
             frame = self.camera.snapshot()
         if frame is None:
             frame = self._prev_analysis_frame
+        # Head-parked frames are taken before each layer, so without this the
+        # video would end one layer short of the finished part.
+        if self._timelapse_synced and frame is not None:
+            try:
+                self.timelapse.save_frame(frame)
+            except Exception as exc:
+                print(f"\n  [TIMELAPSE] final frame not saved: {exc}")
 
         with self._lock:
             self.status = "Print Complete"
@@ -984,7 +1034,7 @@ class Monitor:
                 interval = (self.settings.get("first_layer_interval") if first_layer
                             else self.settings.get("capture_interval"))
                 # Time-based timelapse only when NOT in layer-synced mode.
-                time_timelapse = not self._timelapse_layer_mode
+                time_timelapse = not (self._timelapse_layer_mode or self._timelapse_synced)
 
                 # Sleep until the next event (analysis or, in time mode, timelapse).
                 now = time.time()
@@ -1474,6 +1524,7 @@ class Monitor:
         self._pending_failure_count = 0
         self._pending_failure_alerted = False
         self._last_layer_z = None
+        self._timelapse_synced = False
         self._conf_sum = 0.0
         self._conf_n = 0
         self._conf_peak = 0.0
@@ -1551,6 +1602,7 @@ class Monitor:
             "aspect": self.settings.get("camera_aspect"),
             "fit": self.settings.get("camera_fit"),
             "overlay_lines": self._timelapse_overlay_lines(),
+            "hold_last_seconds": TIMELAPSE_HOLD_LAST_SECONDS,
         }
 
     def compile_timelapse(self) -> Optional[str]:

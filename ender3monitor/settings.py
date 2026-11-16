@@ -83,7 +83,10 @@ SCHEMA: Dict[str, dict] = {
     "timelapse_mode": _field(
         "enum", "auto", "Timelapse", "Capture mode",
         choices=["auto", "layer", "time"],
-        help="auto = layer-synced when USB Z is available, else time-based."),
+        help="auto = layer-synced when USB Z is available, else time-based. "
+             "For the smoothest result add the head-park snippet from the "
+             "README to your slicer; auto and layer then capture only "
+             "while the head is parked."),
     "timelapse_max_sessions": _field(
         "int", 20, "Timelapse", "Keep recent sessions", min=1, max=1000,
         help="Prune to this many recent print folders."),

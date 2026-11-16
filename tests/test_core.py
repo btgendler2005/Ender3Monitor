@@ -1692,3 +1692,152 @@ def test_history_format_recent(tmp_path):
     text = format_recent(store, limit=5)
     assert text.count("job") == 5 and "job6.gcode" in text and "job1.gcode" not in text
     assert "completed" in text and "16m" in text and "$0.12" in text
+
+
+# ── timelapse: head-parked capture (snapshot marker) ─────────────────────────
+
+import monitor as _monitor_mod  # noqa: E402
+from ender3monitor.timelapse import TimelapseManager  # noqa: E402
+
+
+class _MarkerSerial:
+    """A port whose firmware speaks on its own: `pending` is what has arrived
+    unprompted, `reply` is what the next command is answered with."""
+
+    def __init__(self):
+        self.pending = b""
+        self.reply = deque()
+
+    @property
+    def in_waiting(self):
+        return len(self.pending)
+
+    def read(self, n):
+        out, self.pending = self.pending[:n], self.pending[n:]
+        return out
+
+    def reset_input_buffer(self):
+        self.pending = b""
+
+    def flush(self):
+        pass
+
+    def write(self, raw):
+        pass
+
+    def readline(self):
+        return self.reply.popleft() if self.reply else b""
+
+
+def _marker_controller():
+    pc = PrinterController(port="")
+    pc._serial = _MarkerSerial()
+    pc.status.connected = True
+    hits = []
+    pc.on_snapshot = lambda: hits.append(1)
+    return pc, hits
+
+
+def test_snapshot_marker_waiting_on_the_line_is_not_discarded_by_send():
+    pc, hits = _marker_controller()
+    pc._serial.pending = b"echo:TIMELAPSE_SNAP\n"
+    pc._serial.reply.append(b"ok\n")
+    pc.send("M105")
+    assert len(hits) == 1
+
+
+def test_snapshot_marker_inside_a_reply_fires_before_the_ok():
+    pc, hits = _marker_controller()
+    seen_at_ok = []
+
+    class _Reply(deque):
+        def popleft(self):
+            line = super().popleft()
+            if line.startswith(b"ok"):
+                seen_at_ok.append(len(hits))
+            return line
+
+    pc._serial.reply = _Reply([b"echo:TIMELAPSE_SNAP\n", b"ok T:200 /200\n"])
+    pc.send("M105")
+    assert len(hits) == 1
+    assert seen_at_ok == [1]   # acted on while the reply was still held back
+
+
+def test_snapshot_marker_split_across_two_reads_fires_once():
+    pc, hits = _marker_controller()
+    pc._scan_unsolicited(b"echo:TIMELA")
+    assert hits == []
+    pc._scan_unsolicited(b"PSE_SNAP\n")
+    assert len(hits) == 1
+    pc._scan_unsolicited(b"ok\n")
+    assert len(hits) == 1
+
+
+def test_listen_picks_up_a_marker_and_returns_on_stop():
+    pc, hits = _marker_controller()
+    pc._serial.pending = b"echo:TIMELAPSE_SNAP\necho:busy: paused for user\n"
+    stop = threading.Event()
+    pc.on_snapshot = lambda: (hits.append(1), stop.set())
+    started = time.time()
+    pc.listen(5.0, stop)
+    assert len(hits) == 1
+    assert time.time() - started < 1.0
+    assert pc.status.filament_change_pause is True   # idle-line pause latched too
+
+
+class _FakeMonitorForSnapshot:
+    def __init__(self, tmp_path, mode="auto"):
+        self._running = True
+        self._timelapse_layer_mode = True
+        self._timelapse_synced = False
+        self._snapshot_lock = threading.Lock()
+        self._last_layer_z = None
+        self.settings = _FakeSettings(timelapse_mode=mode)
+        self.timelapse = TimelapseManager(str(tmp_path))
+        self.printer = _FakePrinter()
+        self.printer.status.printing = True
+        self.printer.status.z_height = 0.2
+        self._frame_provider = lambda: np.zeros((8, 8, 3), np.uint8)
+
+
+def test_first_marker_drops_earlier_frames_and_takes_over_capture(tmp_path, monkeypatch):
+    monkeypatch.setattr(_monitor_mod, "SNAPSHOT_SETTLE_SECONDS", 0)
+    m = _FakeMonitorForSnapshot(tmp_path)
+    Monitor._maybe_capture_layer_frame(m)          # Z-based frame, head in shot
+    assert m.timelapse.frame_count == 1
+
+    Monitor._on_snapshot_marker(m)
+    assert m._timelapse_synced is True
+    assert m.timelapse.frame_count == 1            # the early one was replaced
+    Monitor._on_snapshot_marker(m)
+    assert m.timelapse.frame_count == 2
+
+    m.printer.status.z_height = 5.0                # a layer change the poller sees
+    Monitor._maybe_capture_layer_frame(m)
+    assert m.timelapse.frame_count == 2            # …no longer saves a frame
+    assert len(list(m.timelapse._session_dir.glob("frame_*.jpg"))) == 2
+
+
+def test_marker_is_ignored_in_time_mode_and_when_not_monitoring(tmp_path, monkeypatch):
+    monkeypatch.setattr(_monitor_mod, "SNAPSHOT_SETTLE_SECONDS", 0)
+    m = _FakeMonitorForSnapshot(tmp_path, mode="time")
+    Monitor._on_snapshot_marker(m)
+    assert m._timelapse_synced is False and m.timelapse.frame_count == 0
+
+    m = _FakeMonitorForSnapshot(tmp_path)
+    m._running = False
+    Monitor._on_snapshot_marker(m)
+    assert m.timelapse.frame_count == 0
+
+
+def test_compile_holds_the_last_frame(tmp_path):
+    import cv2
+    tl = TimelapseManager(str(tmp_path))
+    for _ in range(3):
+        tl.save_frame(np.zeros((48, 64, 3), np.uint8))
+    out = tl.compile(fps=10, hold_last_seconds=1.0)
+    assert out is not None
+    cap = cv2.VideoCapture(out)
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    assert n == 13
