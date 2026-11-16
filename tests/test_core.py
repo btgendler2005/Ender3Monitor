@@ -1177,10 +1177,11 @@ class _FakeSerial:
 
 def test_end_to_end_runout_from_serial_to_notification():
     """The whole path against stock-firmware-shaped output and no G-code index:
-    poll, learn the polarity, flip the switch, classify, notify."""
+    poll, learn the polarity, flip the switch, classify, notify. Mid-print
+    sensor polling is opt-in (it stalls motion on probe-equipped printers)."""
     m = _FakeMonitorForRunout(index=None)
     clock = [1000.0]
-    pc = PrinterController(port="", clock=lambda: clock[0])
+    pc = PrinterController(port="", clock=lambda: clock[0], sensor_poll_printing=30)
     pc._serial = _FakeSerial()
     pc.status.connected = True
     m.printer = pc

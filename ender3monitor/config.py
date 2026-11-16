@@ -79,6 +79,9 @@ class Config:
     # Serial traffic budget during a print: at most one command per this many
     # seconds (see printer.py). Temperatures/progress arrive as auto-reports.
     printer_min_command_interval: float
+    # Poll the runout sensor (M119) mid-print every N seconds; 0 = never.
+    # Off by default: on probe-equipped printers M119 stalls motion ~1 s.
+    printer_runout_sensor_poll_seconds: float
     auto_pause_on_failure: bool
     auto_pause_action: str       # "pause" | "cooldown" | "estop"
 
@@ -146,6 +149,8 @@ class Config:
             printer_baud=int(os.getenv("PRINTER_BAUD", "115200")),
             printer_min_command_interval=max(0.0, float(os.getenv(
                 "PRINTER_MIN_COMMAND_INTERVAL_SECONDS", "5"))),
+            printer_runout_sensor_poll_seconds=max(0.0, float(os.getenv(
+                "PRINTER_RUNOUT_SENSOR_POLL_SECONDS", "0"))),
             auto_pause_on_failure=os.getenv("AUTO_PAUSE_ON_FAILURE", "false").strip().lower()
                 in ("1", "true", "yes", "on"),
             auto_pause_action=os.getenv("AUTO_PAUSE_ACTION", "pause").strip().lower(),

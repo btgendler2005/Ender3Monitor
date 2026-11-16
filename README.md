@@ -188,7 +188,11 @@ So three signals are used, strongest first:
 1. **The sensor itself**, read over `M119` — Marlin reports the runout switch
    alongside the endstops (`filament: open` / `Filament: TRIGGERED`) whenever one
    is configured. This is the only unambiguous signal, and the only one that
-   catches a runout before the firmware reacts to it.
+   catches a runout before the firmware reacts to it. **Off during prints by
+   default:** on printers with a BLTouch/CR Touch probe (the V3 SE has one)
+   each `M119` blocks motion planning for about 1.3 s and causes a visible
+   stall. Set `PRINTER_RUNOUT_SENSOR_POLL_SECONDS=30` to turn it back on;
+   otherwise signal 3 still catches the firmware's own runout pause.
 2. **An explicit announcement** from the firmware — a host action or prompt
    (`//action:out_of_filament`, `//action:prompt_begin FilamentRunout`). Only
    host-handled configurations (`M412 H1`, `ACTION_ON_FILAMENT_RUNOUT`) emit one.
