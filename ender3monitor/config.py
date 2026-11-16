@@ -76,6 +76,9 @@ class Config:
     # Printer USB control (optional)
     printer_port: str           # serial device path; "" = disabled, "auto" = autodetect
     printer_baud: int
+    # Serial traffic budget during a print: at most one command per this many
+    # seconds (see printer.py). Temperatures/progress arrive as auto-reports.
+    printer_min_command_interval: float
     auto_pause_on_failure: bool
     auto_pause_action: str       # "pause" | "cooldown" | "estop"
 
@@ -141,6 +144,8 @@ class Config:
             maintenance_reminder_hours=int(os.getenv("MAINTENANCE_REMINDER_HOURS", "250")),
             printer_port=os.getenv("PRINTER_PORT", "").strip(),
             printer_baud=int(os.getenv("PRINTER_BAUD", "115200")),
+            printer_min_command_interval=max(0.0, float(os.getenv(
+                "PRINTER_MIN_COMMAND_INTERVAL_SECONDS", "5"))),
             auto_pause_on_failure=os.getenv("AUTO_PAUSE_ON_FAILURE", "false").strip().lower()
                 in ("1", "true", "yes", "on"),
             auto_pause_action=os.getenv("AUTO_PAUSE_ACTION", "pause").strip().lower(),
