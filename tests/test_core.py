@@ -1179,21 +1179,31 @@ def test_end_to_end_runout_from_serial_to_notification():
     """The whole path against stock-firmware-shaped output and no G-code index:
     poll, learn the polarity, flip the switch, classify, notify."""
     m = _FakeMonitorForRunout(index=None)
-    pc = PrinterController(port="")
+    clock = [1000.0]
+    pc = PrinterController(port="", clock=lambda: clock[0])
     pc._serial = _FakeSerial()
     pc.status.connected = True
     m.printer = pc
 
-    for _ in range(SENSOR_CALIBRATION_POLLS):
+    def tick():                                  # one 5 s poll-loop tick
+        clock[0] += 5
         pc.refresh_status()
         Monitor._check_filament_runout(m)
+
+    # The sensor is read every 30 s mid-print now (one command per 5 s at most).
+    for _ in range(80):
+        tick()
+        if pc.status.filament_present is not None:
+            break
     assert pc.status.printing is True
     assert pc.status.filament_present is True
     assert m.push.sent == []                     # a healthy print stays quiet
 
     pc._serial.filament = False                  # the spool runs out
-    pc.refresh_status()
-    Monitor._check_filament_runout(m)
+    for _ in range(8):
+        tick()
+        if pc.status.filament_runout:
+            break
 
     assert pc.status.filament_runout is True
     assert pc.status.runout_source == "sensor"

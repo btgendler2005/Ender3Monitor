@@ -38,7 +38,12 @@ from ender3monitor import ops_metrics as ops
 _FLIP_STR_TO_CODE = {"none": None, "180": -1, "vertical": 0, "horizontal": 1}
 _FLIP_CODE_TO_STR = {None: "none", -1: "180", 0: "vertical", 1: "horizontal"}
 
-PRINTER_POLL_INTERVAL = 5        # seconds between temperature polls over USB
+PRINTER_POLL_INTERVAL = 5        # seconds per printer tick (status checks; at most
+                                 # one command per tick mid-print — see printer.py)
+# How often the idle serial line is read. Short while a timelapse may need the
+# snapshot marker promptly; longer otherwise to save CPU (the OS buffers bytes).
+PRINTER_LISTEN_SLICE_ACTIVE = 0.03
+PRINTER_LISTEN_SLICE_IDLE = 0.25
 PRINTER_RECONNECT_INTERVAL = 10  # seconds between reconnect attempts when dropped
 
 # Analysis cadence comes from config.capture_interval (CAPTURE_INTERVAL_SECONDS).
@@ -255,7 +260,9 @@ class Monitor:
         self._init_gcode_index()
 
         # Optional printer USB control + push notifications
-        self.printer = PrinterController(config.printer_port, config.printer_baud)
+        self.printer = PrinterController(
+            config.printer_port, config.printer_baud,
+            min_command_interval=getattr(config, "printer_min_command_interval", 5.0))
         self.push = PushNotifier(
             ntfy_topic=config.ntfy_topic,
             discord_webhook=config.discord_webhook,
@@ -432,6 +439,7 @@ class Monitor:
                 st.clear_gcode_context()
             self._gcode_index = None
             self._gcode_z_mismatches = 0
+            self._clear_estimated_z()
             return
 
         idx = self._gcode_store.match(st.file_size)
@@ -439,13 +447,17 @@ class Monitor:
             if st.job_name is not None:
                 st.clear_gcode_context()
             self._gcode_index = None
+            self._clear_estimated_z()
             return
 
         # Confirm the size match against Z before trusting it. Skipped while
         # parked for a filament change, where the head sits at an arbitrary
         # height that has nothing to do with the file position.
+        # Only a *measured* Z is evidence; mid-print Z is usually our own
+        # estimate from this very index, which would always agree with itself.
+        live_z = None if st.z_estimated else st.z_height
         if not st.filament_change_pause:
-            if idx.confirm_z(st.file_position, st.z_height):
+            if idx.confirm_z(st.file_position, live_z):
                 self._gcode_z_mismatches = 0
             else:
                 self._gcode_z_mismatches += 1
@@ -455,6 +467,7 @@ class Monitor:
                               "falling back to byte progress.")
                         st.clear_gcode_context()
                     self._gcode_index = None
+                    self._clear_estimated_z()
                     return
 
         self._gcode_index = idx
@@ -462,7 +475,13 @@ class Monitor:
         st.total_layers = idx.total_layers or None
         # Z is what the nozzle is *actually* doing; the SD read pointer runs
         # ahead of it by the planner queue depth, so prefer Z for the layer.
-        st.layer = idx.layer_at_z(st.z_height) or idx.layer_at_offset(st.file_position)
+        st.layer = idx.layer_at_z(live_z) or idx.layer_at_offset(st.file_position)
+        # Mid-print Z without M114 (which would stall motion): the Z of the
+        # layer the SD read pointer is in. Feeds first-layer mode, layer-synced
+        # timelapse and the Z gauge.
+        if live_z is None and st.layer and idx.layer_z:
+            st.z_height = idx.layer_z[min(st.layer, len(idx.layer_z)) - 1]
+            st.z_estimated = True
         st.feature = idx.feature_at_offset(st.file_position)
         st.color_change_marks = idx.color_change_marks()
 
@@ -493,6 +512,12 @@ class Monitor:
             if at_change is not None:
                 st.next_color_change_seconds = int(
                     max(0.0, (remaining - at_change) * scale))
+
+    def _clear_estimated_z(self) -> None:
+        st = self.printer.status
+        if st.z_estimated:
+            st.z_height = None
+            st.z_estimated = False
 
     def _gcode_context_note(self) -> Optional[str]:
         """Prompt text telling the vision model what feature is being printed."""
@@ -599,6 +624,7 @@ class Monitor:
 
             # Mirror live telemetry into Prometheus gauges each poll.
             ops.update_printer(self.printer.status)
+            ops.printer_commands_per_minute.set(self.printer.commands_last_minute())
 
             # Log + clean up on connect/disconnect transitions
             now_connected = self.printer.connected
@@ -614,9 +640,12 @@ class Monitor:
             was_connected = now_connected
 
             ticks += 1
-            if self._running and self.printer.connected and self.printer.status.printing:
-                # Same pause, but watching the line for the timelapse marker.
-                self.printer.listen(PRINTER_POLL_INTERVAL, self._printer_poll_stop)
+            if self.printer.connected:
+                # Always read the line between ticks: auto-reports (temps, SD
+                # progress) and the timelapse marker arrive here, unprompted.
+                slice_s = (PRINTER_LISTEN_SLICE_ACTIVE if self._running
+                           else PRINTER_LISTEN_SLICE_IDLE)
+                self.printer.listen(PRINTER_POLL_INTERVAL, self._printer_poll_stop, slice_s)
             else:
                 self._printer_poll_stop.wait(timeout=PRINTER_POLL_INTERVAL)
 
@@ -1033,8 +1062,12 @@ class Monitor:
                 first_layer = self._in_first_layer()
                 interval = (self.settings.get("first_layer_interval") if first_layer
                             else self.settings.get("capture_interval"))
-                # Time-based timelapse only when NOT in layer-synced mode.
-                time_timelapse = not (self._timelapse_layer_mode or self._timelapse_synced)
+                # Time-based timelapse only when NOT in layer-synced mode — or
+                # when layer mode has no Z to follow (Z is no longer polled
+                # mid-print; it is estimated only when a G-code index matches).
+                layer_ok = (self._timelapse_layer_mode
+                            and self.printer.status.z_height is not None)
+                time_timelapse = not (layer_ok or self._timelapse_synced)
 
                 # Sleep until the next event (analysis or, in time mode, timelapse).
                 now = time.time()

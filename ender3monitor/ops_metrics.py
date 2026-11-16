@@ -51,6 +51,33 @@ printer_watchdog_stalls_total = Counter(
     "e3m_printer_watchdog_stalls_total",
     "Times the watchdog force-closed a serial port stuck in a blocking read past its timeout",
 )
+# Serial traffic — how much the monitor asks of the printer, and how long the
+# printer takes to answer. A slow "ok" means the command sat in the firmware's
+# queue behind motion; a burst of them is what a print stall looks like from
+# the host's side. `command` is the bare G-code word (M105, M27, …).
+printer_commands_sent_total = Counter(
+    "e3m_printer_commands_sent_total", "G-code commands written to the printer", ["command"])
+printer_commands_per_minute = Gauge(
+    "e3m_printer_commands_per_minute", "Commands written to the printer in the last 60 s")
+printer_ok_wait_seconds = Histogram(
+    "e3m_printer_ok_wait_seconds", "Time from writing a command to its \"ok\" (seconds)",
+    ["command"],
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5),
+)
+printer_slow_ok_total = Counter(
+    "e3m_printer_slow_ok_total",
+    "Commands whose \"ok\" took longer than 1 s, including timeouts", ["command"])
+printer_ok_timeouts_total = Counter(
+    "e3m_printer_ok_timeouts_total", "Commands that got no \"ok\" before the timeout", ["command"])
+printer_commands_suppressed_total = Counter(
+    "e3m_printer_commands_suppressed_total",
+    "Commands not sent: motion_sync = would drain the motion queue mid-print, "
+    "rate_limit = over the per-print command budget",
+    ["command", "reason"])
+printer_autoreport_active = Gauge(
+    "e3m_printer_autoreport_active",
+    "1 when the firmware is pushing this report on its own (M155 / M27 S), "
+    "0 when it is unsupported and polled instead", ["report"])
 
 # ── Printer telemetry (physical state, updated each poll) ─────────────────────
 printer_nozzle_temp = Gauge("e3m_printer_nozzle_temp_celsius", "Nozzle temperature (°C)")

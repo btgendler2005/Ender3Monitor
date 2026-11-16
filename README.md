@@ -441,7 +441,7 @@ Updated every poll while the printer is connected over USB (NaN when unknown), v
 |---|---|---|
 | `e3m_printer_nozzle_temp_celsius` / `e3m_printer_nozzle_target_celsius` | Gauge | Nozzle actual / target temp |
 | `e3m_printer_bed_temp_celsius` / `e3m_printer_bed_target_celsius` | Gauge | Bed actual / target temp |
-| `e3m_printer_z_height_mm` | Gauge | Current nozzle Z height |
+| `e3m_printer_z_height_mm` | Gauge | Nozzle Z height. Measured (M114) only while idle; mid-print it is the Z of the current layer from the matched G-code index, and absent when no index matches (M114 would stall motion) |
 | `e3m_printer_progress_ratio` | Gauge | Print progress (0..1) |
 | `e3m_printer_printing` | Gauge | `1` while a print is active |
 | `e3m_printer_elapsed_seconds` / `e3m_printer_remaining_seconds` | Gauge | Elapsed / estimated remaining print time |
@@ -467,6 +467,15 @@ Served from the same `:8000/metrics` endpoint, visualised by `web_dashboard.json
 | `e3m_printer_connected` | Gauge | `1` if the printer is connected over USB |
 | `e3m_printer_reconnects_total` / `e3m_printer_serial_errors_total` | Counter | USB reconnects / serial errors |
 | `e3m_printer_watchdog_stalls_total` | Counter | Times the watchdog force-closed a port stuck in a blocking read past its timeout |
+| `e3m_printer_commands_sent_total{command}` | Counter | G-code commands written to the printer |
+| `e3m_printer_commands_per_minute` | Gauge | Commands written in the last 60 s |
+| `e3m_printer_ok_wait_seconds{command}` | Histogram | Time from writing a command to its `ok` |
+| `e3m_printer_slow_ok_total{command}` | Counter | `ok` replies slower than 1 s (timeouts included) — the stall detector |
+| `e3m_printer_ok_timeouts_total{command}` | Counter | Commands that got no `ok` before the timeout |
+| `e3m_printer_commands_suppressed_total{command,reason}` | Counter | Commands not sent: `motion_sync` (would drain the motion queue mid-print) or `rate_limit` |
+| `e3m_printer_autoreport_active{report}` | Gauge | `1` when the firmware pushes `temp` / `sd` reports itself, `0` when they are polled instead |
+
+The serial metrics are explained in [docs/serial-stalls.md](docs/serial-stalls.md).
 | `e3m_ws_clients` | Gauge | Connected dashboard websocket clients |
 | `e3m_telegram_commands_total{command}` | Counter | Telegram commands handled |
 | `e3m_push_notifications_total{channel,result}` | Counter | Push notifications sent |
@@ -500,9 +509,12 @@ On completion the bot also auto-sends a report: stats, final photo, and the time
 
 ## Smooth timelapses
 
-By default a frame is saved when the monitor notices the Z height step up. It
-polls the printer every 5 seconds, so the head and the bed are somewhere
-different in every frame and the video jitters.
+By default a frame is saved when the monitor notices the Z height step up.
+Mid-print that Z comes from the matched G-code index (the monitor no longer
+asks the printer for its position while printing, because that can stall
+motion), and without an index it falls back to a frame every 30 seconds. Either
+way the head and the bed are somewhere different in every frame and the video
+jitters.
 
 For a steady video, let the sliced file say when to take the photo. Each layer
 it parks the head at a fixed spot, waits until it has stopped, and announces it
